@@ -7,7 +7,7 @@ Vue → FastAPI → Service / Repository → MongoDB
 ```
 
 - 项目：`<安装目录>\app`
-- MongoDB：`mongodb://127.0.0.1:27017`，数据库 `autoregister`
+- MongoDB：默认读取项目 `.env`，数据库名为 `autoregister`
 - FastAPI：`http://127.0.0.1:8000`
 - Vite：`http://127.0.0.1:5173`
 - 执行设置：`<安装目录>\data\settings.json`

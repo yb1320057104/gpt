@@ -162,6 +162,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.
 
 不要把 `.env`、`data/settings.json` 或浏览器导出的凭据文件提交到仓库。
 
+新克隆首次运行 `app\setup.ps1` 时，会把 `.env.example` 复制为本机
+`app\.env`。填写远程 `AUTOREGISTER_MONGO_URI` 后，安装脚本会跳过本机
+MongoDB 安装。云服务器安全组需要允许运行电脑访问 TCP `37017`。
+
 ## 开发
 
 安装依赖：
