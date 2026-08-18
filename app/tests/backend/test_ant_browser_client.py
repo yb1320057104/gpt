@@ -6,7 +6,11 @@ import json
 import httpx
 from pydantic import SecretStr
 
-from backend.ant_browser_client import ANT_BROWSER_WINDOW_SIZE, AntBrowserClient
+from backend.ant_browser_client import (
+    ANT_BROWSER_LAUNCH_ARGS,
+    ANT_BROWSER_WINDOW_SIZE,
+    AntBrowserClient,
+)
 from backend.probe_store import ProxyLease
 
 
@@ -49,10 +53,11 @@ async def _exercise_ant_profile_lifecycle() -> None:
             assert "--timezone=America/New_York" in fingerprint_args
             assert f"--window-size={ANT_BROWSER_WINDOW_SIZE}" in fingerprint_args
             assert any(value.startswith("--fingerprint=") for value in fingerprint_args)
+            assert body["profile"]["launchArgs"] == list(ANT_BROWSER_LAUNCH_ARGS)
             return httpx.Response(201, json={"ok": True, "profileId": "profile-1"})
         if request.url.path == "/api/runtime/session":
             body = json.loads(request.content)
-            assert f"--window-size={ANT_BROWSER_WINDOW_SIZE}" in body["launchArgs"]
+            assert body["launchArgs"] == list(ANT_BROWSER_LAUNCH_ARGS)
             return httpx.Response(
                 200,
                 json={

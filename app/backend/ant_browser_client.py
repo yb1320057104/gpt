@@ -22,6 +22,11 @@ from .roxy_client import (
 
 
 ANT_BROWSER_WINDOW_SIZE = "1000,1000"
+ANT_BROWSER_LAUNCH_ARGS = (
+    "--disable-sync",
+    "--no-first-run",
+    f"--window-size={ANT_BROWSER_WINDOW_SIZE}",
+)
 
 
 class AntBrowserClient:
@@ -203,7 +208,7 @@ class AntBrowserClient:
                     "profileName": f"{MANAGED_BROWSER_PREFIX}{probe_id[:8]}",
                     "proxyConfig": self._proxy_url(proxy),
                     "fingerprintArgs": self._fingerprint_args(proxy),
-                    "launchArgs": ["--disable-sync", "--no-first-run"],
+                    "launchArgs": list(ANT_BROWSER_LAUNCH_ARGS),
                     "tags": ["autoregister"],
                     "keywords": [probe_id],
                 },
@@ -222,7 +227,10 @@ class AntBrowserClient:
     async def open_browser(
         self, _workspace_id: int, dir_id: str, *, headless: bool
     ) -> RoxyOpenResult:
-        launch_args = [f"--window-size={ANT_BROWSER_WINDOW_SIZE}"]
+        # Ant treats runtime launchArgs as an override of the profile's saved
+        # launchArgs.  Always send the complete saved set so opening a profile
+        # cannot silently drop session-stability options.
+        launch_args = list(ANT_BROWSER_LAUNCH_ARGS)
         if headless:
             launch_args.append("--headless=new")
         payload = await self._request(

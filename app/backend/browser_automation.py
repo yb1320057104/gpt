@@ -1632,6 +1632,11 @@ class CdpBrowserAutomation:
                 timeout_ms=10_000,
             ) from None
 
+        # Fresh anti-detect profiles do not have ChatGPT's consent cookie yet.
+        # Clear the consent layer before interacting with the auth form so its
+        # state update cannot rebuild and empty the form during submission.
+        await self._dismiss_cookie_banner(page)
+
         final_url = sanitize_url(page.url)
 
         email_fill_attempts = 0
@@ -1965,7 +1970,7 @@ class CdpBrowserAutomation:
                 elif reconciled_step == "email_form_reset":
                     email_post_submit_reset_count += 1
                     email_continue_recovery_state = "form_reset"
-                if fill_attempt >= 2 or email_continue_attempts >= 2:
+                if reconciled_step == "email_form_reset" or fill_attempt >= 2 or email_continue_attempts >= 2:
                     screenshot_captured = await self._safe_screenshot_after_settle(page)
                     raise EmailStepError(
                         "email_post_submit_reset"
@@ -2026,27 +2031,25 @@ class CdpBrowserAutomation:
                 email_continue_recovery_state = "form_reset"
                 if email_continue_recovery_started_at is None:
                     email_continue_recovery_started_at = monotonic()
-                if fill_attempt == 2 or email_continue_attempts >= 2:
-                    screenshot_captured = await self._safe_screenshot_after_settle(page)
-                    raise EmailStepError(
-                        "email_post_submit_reset",
-                        "邮箱提交后被网页重复重置",
-                        click_attempts=email_continue_attempts,
-                        click_failures=email_continue_click_failures,
-                        recovery_state="form_reset",
-                        attempt_states=tuple(email_continue_attempt_states),
-                        dispatch_observed=email_continue_dispatch_observed,
-                        exception_types=tuple(email_continue_click_exception_types),
-                        recovery_elapsed_ms=int(
-                            round(
-                                (monotonic() - email_continue_recovery_started_at)
-                                * 1000
-                            )
-                        ),
-                        screenshot_captured=screenshot_captured,
-                        **stability_diagnostics(),
-                    )
-                continue
+                screenshot_captured = await self._safe_screenshot_after_settle(page)
+                raise EmailStepError(
+                    "email_post_submit_reset",
+                    "邮箱提交后被网页重置，已停止重复提交",
+                    click_attempts=email_continue_attempts,
+                    click_failures=email_continue_click_failures,
+                    recovery_state="form_reset",
+                    attempt_states=tuple(email_continue_attempt_states),
+                    dispatch_observed=email_continue_dispatch_observed,
+                    exception_types=tuple(email_continue_click_exception_types),
+                    recovery_elapsed_ms=int(
+                        round(
+                            (monotonic() - email_continue_recovery_started_at)
+                            * 1000
+                        )
+                    ),
+                    screenshot_captured=screenshot_captured,
+                    **stability_diagnostics(),
+                )
 
             if email_continue_recovery_state is None:
                 email_continue_recovery_state = "next_step"
@@ -4845,6 +4848,20 @@ class CdpBrowserAutomation:
     @staticmethod
     async def _is_visible(locator: Any) -> bool:
         return await locator.count() > 0 and await locator.first.is_visible()
+
+    async def _dismiss_cookie_banner(self, page: Any) -> bool:
+        consent_button = page.locator(
+            'button:has-text("Reject non-essential"), '
+            'button:has-text("Accept all")'
+        )
+        try:
+            if not await self._is_visible(consent_button):
+                return False
+            await consent_button.first.click(timeout=3_000)
+            await asyncio.sleep(self.poll_interval_seconds)
+            return True
+        except Exception:
+            return False
 
     async def _safe_screenshot_after_settle(self, page: Any) -> bool:
         for attempt in range(3):
