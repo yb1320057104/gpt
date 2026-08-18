@@ -18,6 +18,9 @@ import type {
   ProxyRecord,
   ProxyCountrySummary,
   ProxyGroupSummary,
+  ProxySubscriptionImportInput,
+  ProxySubscriptionImportResult,
+  ProxyTestResult,
   PaymentExtractorBulkDeleteResult,
   PaymentExtractorConcurrency,
   PaymentExtractorDefaults,
@@ -50,6 +53,15 @@ async function parseResponse<T>(response: Response): Promise<T> {
     const body = await response.json()
     if (typeof body.detail === 'string') message = body.detail
     if (body.detail?.message) message = body.detail.message
+    if (Array.isArray(body.detail)) {
+      const issues = body.detail
+        .map((item: { loc?: unknown[]; msg?: string }) => {
+          const field = Array.isArray(item.loc) ? item.loc.slice(1).join('.') : ''
+          return `${field ? `${field}: ` : ''}${item.msg || ''}`.trim()
+        })
+        .filter(Boolean)
+      if (issues.length) message = issues.join('；')
+    }
     if (typeof body.error === 'string') message = body.error
   } catch {
     // Keep the stable fallback above.
@@ -504,6 +516,18 @@ export const dataGateway = {
     )
   },
 
+  async importProxySubscription(
+    payload: ProxySubscriptionImportInput,
+  ): Promise<ProxySubscriptionImportResult> {
+    return parseResponse(
+      await fetch('/api/proxies/import-subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+    )
+  },
+
   async deleteAccounts(ids: string[]): Promise<number> {
     const result = await parseResponse<{ deleted: number }>(
       await fetch('/api/accounts/bulk-delete', {
@@ -515,12 +539,12 @@ export const dataGateway = {
     return result.deleted
   },
 
-  async checkAccountPromotions(ids: string[]): Promise<AccountPlanCheckResult> {
+  async checkAccountPromotions(ids: string[], proxyId?: string): Promise<AccountPlanCheckResult> {
     return parseResponse(
       await fetch('/api/accounts/check-promotion', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids }),
+        body: JSON.stringify({ ids, ...(proxyId ? { proxyId } : {}) }),
       }),
     )
   },
@@ -582,6 +606,18 @@ export const dataGateway = {
 
   async listProxyCountries(): Promise<ProxyCountrySummary[]> {
     return parseResponse(await fetch('/api/proxies/countries'))
+  },
+
+  async testProxies(country?: string, group?: string): Promise<ProxyTestResult> {
+    return parseResponse(await fetch('/api/proxies/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...(country ? { country } : {}),
+        ...(group ? { group } : {}),
+        timeoutSeconds: 12,
+      }),
+    }))
   },
 
   async listProxyGroups(): Promise<ProxyGroupSummary[]> {

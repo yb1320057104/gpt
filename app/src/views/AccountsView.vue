@@ -2,10 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { CopyDocument, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
-import type { AccountRecord, ExportFormat, ExportScope, ResourceQuery } from '@/types'
+import type { AccountRecord, ExportFormat, ExportScope, ProxyRecord, ResourceQuery } from '@/types'
 import { useAppStore } from '@/stores/app'
 import { dataGateway } from '@/services/dataGateway'
-import { countryLabel } from '@/services/countries'
+import { COMMON_REGISTRATION_COUNTRIES, countryLabel } from '@/services/countries'
 import { copyText } from '@/services/exporter'
 import ExportDialog from '@/components/ExportDialog.vue'
 import AccessTokenGroupsDialog from '@/components/AccessTokenGroupsDialog.vue'
@@ -16,11 +16,14 @@ const store = useAppStore()
 const tableRef = ref<TableInstance>()
 const search = ref('')
 const promotionFilter = ref<ResourceQuery['promotion']>('')
+const countryFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref<ResourceQuery['pageSize']>(10)
 const pageSizeOptions = [10, 20, 50, 100]
 const loading = ref(false)
 const promotionChecking = ref(false)
+const promotionProxyId = ref('')
+const promotionProxies = ref<ProxyRecord[]>([])
 const checkingAccountIds = ref<string[]>([])
 const selectedIds = ref<string[]>([])
 const exportOpen = ref(false)
@@ -89,7 +92,14 @@ function promotionTooltip(account: AccountRecord) {
 function checkoutTypeLabel(account: AccountRecord) {
   if (account.checkoutType === 'oaics') return 'OAICS'
   if (account.checkoutType === 'cs') return 'CS'
-  return '待判断'
+  if (account.checkoutTypeErrorCode) return '检测失败'
+  return '未检测'
+}
+
+function checkoutTypeTooltip(account: AccountRecord) {
+  if (account.checkoutTypeErrorCode) return `错误码：${account.checkoutTypeErrorCode}`
+  if (account.checkoutTypeCheckedAt) return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}`
+  return '点击“检测选中资格”时会同时检测结账类型'
 }
 
 async function checkPromotions(ids: string[]) {
@@ -101,7 +111,9 @@ async function checkPromotions(ids: string[]) {
   promotionChecking.value = true
   checkingAccountIds.value = [...ids]
   try {
-    const result = await store.checkAccountPromotions(ids)
+    const result = promotionProxyId.value
+      ? await store.checkAccountPromotions(ids, promotionProxyId.value)
+      : await store.checkAccountPromotions(ids)
     if (result.failed || result.skipped) {
       ElMessage.warning(
         `资格查询完成：成功 ${result.succeeded}，失败 ${result.failed}，跳过 ${result.skipped}`,
@@ -165,6 +177,7 @@ async function loadPage() {
       pageSize: pageSize.value,
       q: search.value,
       promotion: promotionFilter.value,
+      country: countryFilter.value,
     })
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
@@ -209,6 +222,12 @@ function openAccessTokenExport(scope: 'single' | 'selected', account?: AccountRe
 
 function changePromotionFilter(value: string | number | boolean | undefined) {
   promotionFilter.value = String(value || '') as ResourceQuery['promotion']
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeCountryFilter(value: string | number | boolean | undefined) {
+  countryFilter.value = String(value || '').trim().toUpperCase()
   currentPage.value = 1
   void loadPage()
 }
@@ -287,7 +306,14 @@ async function deleteSelected() {
 
 watch(pageAccounts, () => void syncPageSelection(), { flush: 'post', immediate: true })
 watch([currentPage, pageSize], () => void loadPage())
-onMounted(() => void loadPage())
+onMounted(() => {
+  void loadPage()
+  void dataGateway.listProxies({ page: 1, pageSize: 100, q: '' }).then((page) => {
+    promotionProxies.value = page.items.filter((proxy) => proxy.enabled)
+  }).catch(() => {
+    promotionProxies.value = []
+  })
+})
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
 })
@@ -323,6 +349,20 @@ onBeforeUnmount(() => {
           <span class="muted">已选择 {{ selectedIds.length }} 条</span>
         </div>
         <div class="toolbar-group">
+          <el-select
+            v-model="promotionProxyId"
+            clearable
+            filterable
+            placeholder="资格检测代理（自动匹配）"
+            style="width: 260px"
+          >
+            <el-option
+              v-for="proxy in promotionProxies"
+              :key="proxy.id"
+              :label="`${proxy.country} · ${proxy.host}:${proxy.port} · ${proxy.group}`"
+              :value="proxy.id"
+            />
+          </el-select>
           <el-button
             type="warning"
             plain
@@ -392,6 +432,24 @@ onBeforeUnmount(() => {
             <el-option label="不可试用" value="ineligible" />
             <el-option label="未查询" value="unchecked" />
           </el-select>
+          <el-select
+            :model-value="countryFilter"
+            clearable
+            filterable
+            allow-create
+            default-first-option
+            placeholder="筛选注册国家"
+            style="width: 180px"
+            @change="changeCountryFilter"
+          >
+            <el-option
+              v-for="country in COMMON_REGISTRATION_COUNTRIES"
+              :key="country.value"
+              :label="`${country.label} · ${country.value}`"
+              :value="country.value"
+            />
+            <el-option label="历史账号 / 未识别" value="ZZ" />
+          </el-select>
           <el-button type="primary" plain :disabled="store.accountTotal === 0" @click="openExport('all')">导出全部</el-button>
         </div>
       </div>
@@ -413,13 +471,17 @@ onBeforeUnmount(() => {
               <div>
                 <div class="account-email-line">
                   <strong>{{ row.email }}</strong>
-                  <el-tag size="small" effect="plain" :type="row.registrationCountry ? 'success' : 'info'">
-                    {{ row.registrationCountry ? countryLabel(row.registrationCountry) : '历史账号' }}
-                  </el-tag>
                 </div>
                 <small>ID {{ row.id }}</small>
               </div>
             </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="注册国家" width="150">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.registrationCountry ? 'success' : 'info'">
+              {{ row.registrationCountry ? countryLabel(row.registrationCountry) : '历史账号 / 未识别' }}
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="账号类型" width="96">
@@ -431,13 +493,15 @@ onBeforeUnmount(() => {
         </el-table-column>
         <el-table-column label="结账类型" width="105">
           <template #default="{ row }">
-            <el-tag
-              :type="row.checkoutType === 'oaics' ? 'success' : row.checkoutType === 'cs' ? 'warning' : 'info'"
-              effect="plain"
-              round
-            >
-              {{ checkoutTypeLabel(row) }}
-            </el-tag>
+            <el-tooltip :content="checkoutTypeTooltip(row)">
+              <el-tag
+                :type="row.checkoutType === 'oaics' ? 'success' : row.checkoutType === 'cs' ? 'warning' : row.checkoutTypeErrorCode ? 'danger' : 'info'"
+                effect="plain"
+                round
+              >
+                {{ checkoutTypeLabel(row) }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="手机号状态" width="128">

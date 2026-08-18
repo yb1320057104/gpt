@@ -2,9 +2,13 @@ import type { ExecutionSettings, ExecutionSettingsInput } from '@/types'
 
 const DEFAULT_SETTINGS: ExecutionSettings = {
   schemaVersion: 2,
+  browserProvider: 'roxy',
   browserExecutablePath: 'D:\\RoxyBrowser\\RoxyBrowser.exe',
   roxyApiKey: '',
   roxyApiPort: 50000,
+  antBrowserExecutablePath: 'D:\\AntBrowser\\AntBrowser.exe',
+  antApiKey: '',
+  antApiPort: 19876,
   headless: false,
   proxyRetryCount: 1,
   concurrency: 2,

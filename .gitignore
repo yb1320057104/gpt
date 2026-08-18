@@ -67,3 +67,9 @@ Thumbs.db
 /mailcom-manager/data/*
 !/mailcom-manager/data/.gitkeep
 /app/mongodb/mongod.yml
+
+# Embedded proxy engines: local binaries, subscriptions and generated nodes
+/app/proxy-engines/bin/
+/app/proxy-engines/easy-proxies.yaml
+/app/proxy-engines/managed_nodes.json
+/app/proxy-engines/nodes.txt

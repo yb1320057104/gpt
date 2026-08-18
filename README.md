@@ -10,6 +10,7 @@
 
 - 邮箱池、代理池与账号池管理
 - 代理按国家和分组管理，可供不同工作流选择
+- Easy Proxies / Resin 节点订阅转换并导入现有代理池
 - RoxyBrowser 临时指纹窗口调度、并发控制、清理和故障熔断
 - 多种邮箱验证码接口与 MailCom Hub 对接
 - 注册后套餐和 Plus 试用资格查询
@@ -154,6 +155,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.
 | `PAP_PORT` | 协议授权 sidecar 端口 |
 | `PAYPAL_PROXY_POOL` | 协议授权代理池 |
 | `AUTOREGISTER_MONGO_URI` | 覆盖 MongoDB URI |
+| `EASY_PROXIES_ROOT` | Easy Proxies 项目目录，默认 `D:\baiduProject\代理池\easy-proxies` |
+| `RESIN_ROOT` | Resin 项目目录，默认 `D:\baiduProject\代理池\Resin` |
+| `AUTOREGISTER_RESIN_ADMIN_TOKEN` | 本机 Resin 管理令牌，首次启动自动生成 |
+| `AUTOREGISTER_RESIN_PROXY_TOKEN` | 本机 Resin 代理令牌，首次启动自动生成 |
 
 不要把 `.env`、`data/settings.json` 或浏览器导出的凭据文件提交到仓库。
 

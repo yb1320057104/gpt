@@ -35,6 +35,64 @@ describe('dataGateway proxy deletion', () => {
   })
 })
 
+describe('dataGateway validation errors', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  it('shows the field and message returned by FastAPI 422 validation', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({
+        detail: [{ loc: ['body', 'country'], msg: 'country must be a two-letter code' }],
+      }), { status: 422, headers: { 'Content-Type': 'application/json' } }),
+    )
+
+    await expect(dataGateway.setProxyCountry('proxy-1', 'x')).rejects.toThrow(
+      'country: country must be a two-letter code',
+    )
+  })
+})
+
+describe('dataGateway proxy subscriptions', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  it('sends subscription manager settings to the adapter endpoint', async () => {
+    vi.mocked(fetch).mockResolvedValue(
+      new Response(JSON.stringify({
+        provider: 'easy-proxies',
+        subscriptionName: 'AutoRegister',
+        nodeCount: 2,
+        generatedProxyCount: 2,
+        testedProxyCount: 2,
+        usableProxyCount: 2,
+        rejectedProxyCount: 0,
+        countries: [{ country: 'JP', count: 2, averageLatencyMs: 120 }],
+        importResult: { total: 2, imported: 2, duplicateCount: 0, errorCount: 0 },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    )
+    const payload = {
+      provider: 'easy-proxies' as const,
+      subscriptionUrl: 'https://example.test/sub',
+      managerUrl: 'http://127.0.0.1:9091',
+      adminToken: '',
+      proxyToken: '',
+      name: 'AutoRegister',
+      group: '订阅代理',
+      probeTimeoutSeconds: 12,
+    }
+
+    await dataGateway.importProxySubscription(payload)
+
+    expect(fetch).toHaveBeenCalledWith('/api/proxies/import-subscription', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+  })
+})
+
 describe('dataGateway access token export', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn())

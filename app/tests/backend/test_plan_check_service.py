@@ -3,7 +3,12 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from backend.chatgpt_plan import AccountPlanResult, PlanCheckError
-from backend.plan_check_service import AccountPlanCheckService, proxy_url
+from backend.checkout_type import CheckoutTypeResult
+from backend.plan_check_service import (
+    AccountPlanCheckService,
+    proxy_url,
+    timezone_offset_for_country,
+)
 from backend.probe_store import ProxyLease
 
 
@@ -12,6 +17,8 @@ class FakeResources:
         self.documents = documents
         self.results: list[tuple[str, AccountPlanResult]] = []
         self.failures: list[tuple[str, str]] = []
+        self.checkout_results: list[tuple[str, CheckoutTypeResult]] = []
+        self.checkout_failures: list[tuple[str, str]] = []
 
     async def claim_account_plan_check(self, account_id: str):
         return self.documents.get(account_id)
@@ -30,6 +37,12 @@ class FakeResources:
     ) -> None:
         self.failures.append((account_id, error.code))
 
+    async def store_account_checkout_type(self, account_id, result) -> None:
+        self.checkout_results.append((account_id, result))
+
+    async def store_account_checkout_type_failure(self, account_id, error) -> None:
+        self.checkout_failures.append((account_id, error.code))
+
 
 class FakeProxies:
     def __init__(self, lease: ProxyLease | None) -> None:
@@ -37,12 +50,19 @@ class FakeProxies:
         self.acquired: list[str] = []
         self.released: list[tuple[str, str]] = []
         self.successes: list[tuple[str, int]] = []
+        self.acquire_options: list[dict[str, object]] = []
 
     async def count_eligible_proxies(self) -> int:
         return int(self.lease is not None)
 
-    async def acquire_proxy(self, owner: str, **_kwargs: object):
+    async def acquire_proxy(self, owner: str, **kwargs: object):
         self.acquired.append(owner)
+        self.acquire_options.append(kwargs)
+        return self.lease
+
+    async def acquire_proxy_by_id(self, proxy_id: str, owner: str, **kwargs: object):
+        self.acquired.append(owner)
+        self.acquire_options.append({"proxy_id": proxy_id, **kwargs})
         return self.lease
 
     async def release_proxy(self, proxy_id: str, owner: str) -> None:
@@ -97,11 +117,17 @@ def test_regular_plan_proxy_keeps_direct_route(monkeypatch) -> None:
 
 
 def test_manual_plan_check_persists_success_and_releases_proxy(monkeypatch) -> None:
-    resources = FakeResources({"account": {"accessToken": "TEST_AT"}})
+    resources = FakeResources({"account": {"accessToken": "TEST_AT", "registrationCountry": "TR"}})
     proxies = FakeProxies(ProxyLease("proxy", "proxy.test", 10000, "user", "secret"))
     monkeypatch.setattr(
         "backend.plan_check_service.check_account_plan_curl",
         lambda *_args, **_kwargs: plan_result(),
+    )
+    monkeypatch.setattr(
+        "backend.plan_check_service.check_checkout_type_curl",
+        lambda *_args, **_kwargs: CheckoutTypeResult(
+            "oaics", datetime(2026, 8, 12, tzinfo=timezone.utc)
+        ),
     )
 
     result = asyncio.run(
@@ -112,6 +138,14 @@ def test_manual_plan_check_persists_success_and_releases_proxy(monkeypatch) -> N
     assert resources.results[0][0] == "account"
     assert proxies.successes == [("proxy", 321)]
     assert proxies.released == [("proxy", proxies.acquired[0])]
+    assert proxies.acquire_options[0]["country"] == "TR"
+    assert resources.checkout_results[0][1].checkout_type == "oaics"
+
+
+def test_country_timezone_offsets_are_consistent() -> None:
+    assert timezone_offset_for_country("JP") == "-540"
+    assert timezone_offset_for_country("TR") == "-180"
+    assert timezone_offset_for_country("US") == "300"
 
 
 def test_manual_plan_check_401_persists_failure_and_releases_proxy(monkeypatch) -> None:

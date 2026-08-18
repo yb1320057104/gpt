@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from backend.probe_store import ProxyLease
+from backend.browser_automation import IP_CHECK_URL
 from backend.roxy_client import (
     RoxyApiError,
     RoxyBrowserRecord,
@@ -205,9 +206,7 @@ def test_roxy_client_uses_token_and_expected_window_contract() -> None:
     open_body = next(item[2] for item in requests if item[1] == "/browser/open")
     assert open_body is not None
     assert open_body["headless"] is True
-    assert create_body["defaultOpenUrl"] == [
-        "https://api64.ipify.org?format=json"
-    ]
+    assert create_body["defaultOpenUrl"] == [IP_CHECK_URL]
     assert connection_queries == ["dirIds=dir-1"]
     assert any(item[1] == "/browser/list" for item in requests)
 

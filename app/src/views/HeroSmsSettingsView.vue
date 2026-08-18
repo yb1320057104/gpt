@@ -11,6 +11,7 @@ const saving = ref(false)
 const testing = ref(false)
 const balance = ref<number | null>(null)
 const countries = ref<HeroSmsCountry[]>([])
+const apiKey = ref('')
 const settings = reactive<HeroSmsSettings>({
   enabled: false,
   countryId: 182,
@@ -27,15 +28,19 @@ const selectedCountry = computed(() =>
   countries.value.find((item) => item.id === settings.countryId)?.name || `国家 ID ${settings.countryId}`,
 )
 
+async function loadCountries() {
+  if (!settings.apiKeyConfigured) {
+    countries.value = []
+    return
+  }
+  countries.value = await dataGateway.heroSmsCountries()
+}
+
 async function load() {
   loading.value = true
   try {
-    const [current, available] = await Promise.all([
-      dataGateway.heroSmsSettings(),
-      dataGateway.heroSmsCountries(),
-    ])
-    Object.assign(settings, current)
-    countries.value = available
+    Object.assign(settings, await dataGateway.heroSmsSettings())
+    await loadCountries()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : 'HeroSMS 配置读取失败')
   } finally {
@@ -47,6 +52,7 @@ async function save() {
   saving.value = true
   try {
     const result = await dataGateway.updateHeroSmsSettings({
+      apiKey: apiKey.value.trim() || undefined,
       enabled: settings.enabled,
       countryId: settings.countryId,
       maxPrice: settings.maxPrice,
@@ -55,6 +61,8 @@ async function save() {
       agreementAutoSmsEnabled: settings.agreementAutoSmsEnabled,
     })
     Object.assign(settings, result)
+    apiKey.value = ''
+    await loadCountries()
     ElMessage.success('HeroSMS 接码配置已保存')
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : 'HeroSMS 配置保存失败')
@@ -66,6 +74,7 @@ async function save() {
 async function testConnection() {
   testing.value = true
   try {
+    if (apiKey.value.trim()) await save()
     const result = await dataGateway.heroSmsTest()
     balance.value = result.balance
     ElMessage.success(`HeroSMS 连接成功，余额 ${result.balance.toFixed(4)}`)
@@ -88,17 +97,17 @@ onMounted(() => void load())
   <section class="hero-page" v-loading="loading">
     <div class="page-heading hero-heading">
       <div>
-        <h2>HeroSMS PP 接码配置</h2>
-        <p>流水线与协议授权共用这一套国家、价格、换号和等待时间。</p>
+        <h2>HeroSMS PayPal 接码配置</h2>
+        <p>流水线与协议授权共用这套 API Key、国家、价格、换号和等待时间设置。</p>
       </div>
       <div class="heading-actions">
-        <el-button :icon="Refresh" :loading="loading" @click="load">刷新国家</el-button>
+        <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
         <el-button type="primary" :icon="Setting" :loading="saving" @click="save">保存配置</el-button>
       </div>
     </div>
 
     <div class="stats-grid hero-stats">
-      <StatCard label="API Key" :value="settings.apiKeyConfigured ? '已配置' : '未配置'" note="仅保存在后端环境" :icon="Connection" :tone="settings.apiKeyConfigured ? 'green' : 'amber'" />
+      <StatCard label="API Key" :value="settings.apiKeyConfigured ? '已配置' : '未配置'" note="密钥不会返回浏览器" :icon="Connection" :tone="settings.apiKeyConfigured ? 'green' : 'amber'" />
       <StatCard label="接码国家" :value="selectedCountry" :note="`HeroSMS ID ${settings.countryId}`" :icon="Message" tone="green" />
       <StatCard label="当前状态" :value="settings.enabled ? '运行' : '暂停'" note="流水线与协议授权共享" :icon="Setting" :tone="settings.enabled ? 'green' : 'amber'" />
       <StatCard label="账户余额" :value="balance == null ? '未测试' : balance.toFixed(4)" note="点击测试连接刷新" :icon="Refresh" />
@@ -107,14 +116,24 @@ onMounted(() => void load())
     <article class="panel hero-config-panel">
       <div class="section-heading">
         <div class="section-icon"><el-icon><Message /></el-icon></div>
-        <div><h3>PayPal 接码参数</h3><p>国家目录实时从 HeroSMS 获取，API Key 不下发到浏览器。</p></div>
+        <div><h3>PayPal 接码参数</h3><p>保存 API Key 后可读取 HeroSMS 国家目录并测试余额。</p></div>
       </div>
       <el-form label-position="top">
+        <el-form-item label="HeroSMS API Key">
+          <el-input
+            v-model="apiKey"
+            type="password"
+            show-password
+            autocomplete="off"
+            :placeholder="settings.apiKeyConfigured ? '已配置；留空表示不修改' : '请输入 HeroSMS API Key'"
+          />
+          <small class="field-note">仅写入后端配置，读取页面时不会回显密钥。</small>
+        </el-form-item>
         <el-form-item label="启用 HeroSMS">
           <el-switch :model-value="settings.enabled" active-text="自动购买 PayPal 号码" @change="toggleEnabled" />
         </el-form-item>
         <el-form-item label="接码国家">
-          <el-select v-model="settings.countryId" filterable placeholder="选择 HeroSMS 国家" style="width:100%">
+          <el-select v-model="settings.countryId" filterable :disabled="!settings.apiKeyConfigured" placeholder="先保存 API Key" style="width:100%">
             <el-option v-for="country in countries" :key="country.id" :label="`${country.name} · ${country.id}`" :value="country.id" />
           </el-select>
         </el-form-item>
@@ -135,7 +154,7 @@ onMounted(() => void load())
           :title="settings.pipelineAutoPaymentEnabled ? '流水线自动支付已开启，将使用这里的接码配置。' : '流水线自动支付当前关闭，可在流水线配置中开启。'"
         />
         <div class="hero-actions">
-          <el-button :loading="testing" :disabled="!settings.apiKeyConfigured" @click="testConnection">测试连接</el-button>
+          <el-button :loading="testing" :disabled="!settings.apiKeyConfigured && !apiKey.trim()" @click="testConnection">测试连接</el-button>
           <el-button type="primary" :loading="saving" @click="save">保存配置</el-button>
         </div>
       </el-form>
@@ -144,5 +163,5 @@ onMounted(() => void load())
 </template>
 
 <style scoped>
-.hero-page{min-width:0}.hero-heading{align-items:center}.heading-actions,.hero-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hero-stats{margin-bottom:14px}.hero-config-panel{max-width:820px;padding:20px}.hero-number-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.hero-number-grid .el-input-number{width:100%}.hero-actions{justify-content:flex-end;margin-top:18px}@media(max-width:760px){.hero-heading{align-items:flex-start}.hero-number-grid{grid-template-columns:1fr}}
+.hero-page{min-width:0}.hero-heading{align-items:center}.heading-actions,.hero-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.hero-stats{margin-bottom:14px}.hero-config-panel{max-width:820px;padding:20px}.hero-number-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.hero-number-grid .el-input-number{width:100%}.hero-actions{justify-content:flex-end;margin-top:18px}.field-note{color:var(--text-soft);margin-top:6px}@media(max-width:760px){.hero-heading{align-items:flex-start}.hero-number-grid{grid-template-columns:1fr}}
 </style>

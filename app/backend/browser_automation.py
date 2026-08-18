@@ -33,7 +33,7 @@ from .checkout_type import (
 from .totp import TotpSecretError, generate_totp, normalize_totp_secret
 
 
-IP_CHECK_URL = "https://api64.ipify.org?format=json"
+IP_CHECK_URL = "https://ipwho.is/?fields=success,ip,country_code"
 CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login?openaicom_referred=true"
 CHATGPT_HOME_URL = "https://chatgpt.com/"
 CHATGPT_SESSION_URL = "https://chatgpt.com/api/auth/session"
@@ -486,6 +486,7 @@ class AutomationResult:
     # Kept out of repr and public probe artifacts. The controller forwards it
     # only to the worker snapshot endpoint requested by the local UI.
     egress_ip: str | None = field(default=None, repr=False)
+    egress_country: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,7 +851,7 @@ class CdpBrowserAutomation:
             (
                 page
                 for page in pages
-                if "api64.ipify.org" in str(getattr(page, "url", ""))
+                if "ipwho.is" in str(getattr(page, "url", ""))
             ),
             pages[0],
         )
@@ -1582,7 +1583,12 @@ class CdpBrowserAutomation:
         stage_started = monotonic()
         try:
             ip_payload = json.loads(body)
+            if ip_payload.get("success") is False:
+                raise ValueError("IP geolocation lookup failed")
             egress_ip = str(ip_payload["ip"])
+            egress_country = str(ip_payload["country_code"]).strip().upper()
+            if not re.fullmatch(r"[A-Z]{2}", egress_country):
+                raise ValueError("IP geolocation country code is invalid")
             masked_ip = mask_ip(egress_ip)
         except Exception as exc:
             raise _stage_failure(
@@ -1704,6 +1710,7 @@ class CdpBrowserAutomation:
                     email_form_stability_reset_count
                 ),
                 egress_ip=egress_ip,
+                egress_country=egress_country,
             )
 
         for fill_attempt in range(1, 3):

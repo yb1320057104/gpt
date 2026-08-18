@@ -23,6 +23,7 @@ export interface AccountRecord {
   promotionCampaignId?: string | null
   checkoutType?: 'oaics' | 'cs' | null
   checkoutTypeCheckedAt?: string | null
+  checkoutTypeErrorCode?: string | null
   registrationCountry?: string | null
 }
 
@@ -87,6 +88,14 @@ export interface ProxyGroupSummary {
   schemes: ProxyScheme[]
 }
 
+export interface ProxyTestResult {
+  tested: number
+  available: number
+  failed: number
+  averageLatencyMs: number | null
+  countries: Array<{ country: string; count: number }>
+}
+
 export interface ParsedEmail {
   email: string
   accessUrl: string
@@ -120,11 +129,40 @@ export interface ImportResult {
   errorCount: number
 }
 
+export type ProxySubscriptionProvider = 'easy-proxies' | 'resin'
+
+export interface ProxySubscriptionImportInput {
+  provider: ProxySubscriptionProvider
+  subscriptionUrl: string
+  managerUrl: string
+  adminToken: string
+  proxyToken: string
+  name: string
+  group?: string
+  probeTimeoutSeconds?: number
+}
+
+export interface ProxySubscriptionImportResult {
+  provider: ProxySubscriptionProvider
+  subscriptionName: string
+  nodeCount: number
+  generatedProxyCount: number
+  testedProxyCount: number
+  usableProxyCount: number
+  rejectedProxyCount: number
+  countries: Array<{ country: string; count: number; averageLatencyMs: number }>
+  importResult: ImportResult
+}
+
 export interface ExecutionSettings {
   schemaVersion: 2
+  browserProvider: 'roxy' | 'ant'
   browserExecutablePath: string
   roxyApiKey: string
   roxyApiPort: number
+  antBrowserExecutablePath: string
+  antApiKey: string
+  antApiPort: number
   headless: boolean
   proxyRetryCount: number
   concurrency: number
@@ -133,9 +171,13 @@ export interface ExecutionSettings {
 }
 
 export interface ExecutionSettingsInput {
+  browserProvider: 'roxy' | 'ant'
   browserExecutablePath: string
   roxyApiKey: string
   roxyApiPort: number
+  antBrowserExecutablePath: string
+  antApiKey: string
+  antApiPort: number
   headless: boolean
   proxyRetryCount: number
   concurrency: number
@@ -616,6 +658,7 @@ export interface HeroSmsCountry {
 }
 
 export interface HeroSmsSettings {
+  apiKey?: string
   enabled: boolean
   countryId: number
   maxPrice: number

@@ -29,8 +29,13 @@ const formatHint = computed(() =>
 const placeholder = computed(() =>
   isEmail.value
     ? 'demo@example.com----https://example.invalid/inbox/demo\nuser@gardener.com----mail.com-password'
-    : 'socks5://demo-user:demo-password@proxy.example.com:10000',
+    : 'socks5://demo-user:demo-password@proxy.example.com:10000\n\n或粘贴 proxies: 开头的 YAML',
 )
+const yamlProxyCount = computed(() => {
+  if (isEmail.value || !/^\s*proxies\s*:/m.test(rawText.value)) return 0
+  const named = rawText.value.match(/^\s*-\s*name\s*:/gm)?.length || 0
+  return named || (/^\s*-\s*(?:type|server|host)\s*:/m.test(rawText.value) ? 1 : 0)
+})
 const preview = computed(() =>
   isEmail.value
     ? parseEmailImport(rawText.value, props.existingKeys)
@@ -54,7 +59,7 @@ async function readUpload(file: UploadFile) {
 }
 
 async function submit() {
-  if (!preview.value.accepted.length || submitting.value) return
+  if ((!preview.value.accepted.length && !yamlProxyCount.value) || submitting.value) return
   submitting.value = true
   try {
     const result = await props.submitHandler(rawText.value)
@@ -81,7 +86,7 @@ async function submit() {
       <el-icon><DocumentAdd /></el-icon>
       <div>
         <strong>一行一条，格式：<code>{{ formatHint }}</code></strong>
-        <p>支持直接粘贴或选择 UTF-8 TXT；重复行将跳过，其他有效行继续导入。</p>
+        <p>代理同时支持 proxies: 列表 YAML；可粘贴或选择 UTF-8 TXT/YAML 文件。</p>
       </div>
     </div>
 
@@ -96,17 +101,22 @@ async function submit() {
 
     <div class="import-controls">
       <el-upload
-        accept=".txt,text/plain"
+        :accept="isEmail ? '.txt,text/plain' : '.txt,.yaml,.yml,text/plain,application/x-yaml'"
         :auto-upload="false"
         :show-file-list="false"
         :on-change="readUpload"
       >
-        <el-button :icon="UploadFilled">选择 TXT 文件</el-button>
+        <el-button :icon="UploadFilled">选择 {{ isEmail ? 'TXT' : 'TXT / YAML' }} 文件</el-button>
       </el-upload>
       <span>空行、BOM 与两端空格会被自动清理</span>
     </div>
 
-    <div v-if="preview.total" class="import-preview">
+    <div v-if="yamlProxyCount" class="import-preview">
+      <div class="preview-count preview-count--ok">
+        <strong>{{ yamlProxyCount }}</strong><span>YAML 节点</span>
+      </div>
+    </div>
+    <div v-else-if="preview.total" class="import-preview">
       <div class="preview-count preview-count--ok">
         <strong>{{ preview.accepted.length }}</strong><span>有效</span>
       </div>
@@ -121,7 +131,7 @@ async function submit() {
       </div>
     </div>
 
-    <div v-if="preview.duplicates.length || preview.errors.length" class="issue-list">
+    <div v-if="!yamlProxyCount && (preview.duplicates.length || preview.errors.length)" class="issue-list">
       <div v-for="issue in [...preview.errors, ...preview.duplicates].slice(0, 6)" :key="`${issue.line}-${issue.reason}`">
         <span>第 {{ issue.line }} 行</span>
         <strong>{{ issue.reason }}</strong>
@@ -136,11 +146,11 @@ async function submit() {
       <el-button @click="emit('update:modelValue', false)">取消</el-button>
       <el-button
         type="primary"
-        :disabled="preview.accepted.length === 0"
+        :disabled="preview.accepted.length === 0 && yamlProxyCount === 0"
         :loading="submitting"
         @click="submit"
       >
-        确认导入 {{ preview.accepted.length }} 条
+        确认导入 {{ yamlProxyCount || preview.accepted.length }} 条
       </el-button>
     </template>
   </el-dialog>

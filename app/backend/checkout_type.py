@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
+from uuid import uuid4
 
 
 CheckoutType = Literal["oaics", "cs"]
@@ -73,3 +74,53 @@ def parse_checkout_type_response(payload: Any) -> CheckoutTypeResult:
     if checkout_type is None:
         raise CheckoutTypeCheckError("checkout_session_id_missing")
     return CheckoutTypeResult(checkout_type, datetime.now(timezone.utc))
+
+
+def check_checkout_type_curl(
+    access_token: str,
+    *,
+    proxy_url: str,
+    country: str,
+    timeout_seconds: float = 15.0,
+) -> CheckoutTypeResult:
+    from curl_cffi.requests import Session
+
+    normalized_country = str(country or "").strip().upper()
+    if len(normalized_country) != 2:
+        raise CheckoutTypeCheckError("checkout_country_missing")
+    session = Session(impersonate="chrome")
+    session.proxies = {"http": proxy_url, "https": proxy_url}
+    try:
+        try:
+            response = session.post(
+                "https://chatgpt.com/backend-api/payments/checkout",
+                headers={
+                    "accept": "application/json",
+                    "authorization": f"Bearer {str(access_token).strip()}",
+                    "content-type": "application/json",
+                    "oai-device-id": str(uuid4()),
+                    "oai-language": "en-US",
+                },
+                json={
+                    "entry_point": "all_plans_pricing_modal",
+                    "plan_name": "chatgptplusplan",
+                    "billing_details": {"country": normalized_country},
+                    "checkout_ui_mode": "custom",
+                },
+                allow_redirects=False,
+                timeout=max(1.0, min(60.0, float(timeout_seconds))),
+            )
+        except Exception:
+            raise CheckoutTypeCheckError("checkout_type_request_failed") from None
+        status = int(response.status_code)
+        if not 200 <= status < 300:
+            raise CheckoutTypeCheckError(
+                "checkout_type_http_failed", http_status=status
+            )
+        try:
+            payload = response.json()
+        except Exception:
+            raise CheckoutTypeCheckError("checkout_type_response_invalid") from None
+        return parse_checkout_type_response(payload)
+    finally:
+        session.close()

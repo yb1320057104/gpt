@@ -99,12 +99,19 @@ class PipelineSettingsUpdate(PipelineModel):
 
 
 class HeroSmsSettingsUpdate(PipelineModel):
+    apiKey: str | None = Field(default=None, max_length=512)
     enabled: bool = False
     countryId: int = Field(default=182, ge=0, le=9999)
     maxPrice: float = Field(default=1.0, gt=0, le=100)
     changeNumberRetries: int = Field(default=2, ge=0, le=10)
     numberWaitSeconds: int = Field(default=120, ge=30, le=1200)
     agreementAutoSmsEnabled: bool = False
+
+    @field_validator("apiKey")
+    @classmethod
+    def normalize_api_key(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None
 
 
 class PipelineBatchInput(PipelineModel):
@@ -300,7 +307,13 @@ class AccountPipelineService:
 
     async def settings(self) -> dict[str, Any]:
         document = await self._guard(self.settings_collection.find_one({"_id": "default"}))
+        self._sync_hero_sms_key(document or {})
         return self._public_settings(document or {})
+
+    def _sync_hero_sms_key(self, document: dict[str, Any]) -> None:
+        stored_key = str(document.get("heroSmsApiKey") or "").strip()
+        if stored_key:
+            self.hero_sms.api_key = stored_key
 
     async def sms_receiver_settings(self) -> dict[str, Any]:
         document = await self._guard(self.settings_collection.find_one({"_id": "default"})) or {}
@@ -606,6 +619,7 @@ class AccountPipelineService:
         current = await self._guard(
             self.settings_collection.find_one({"_id": "default"})
         ) or {}
+        self._sync_hero_sms_key(current)
         hero_enabled = (
             payload.heroSmsEnabled
             if payload.heroSmsEnabled is not None
@@ -1651,6 +1665,12 @@ class AccountPipelineService:
         self,
         payload: HeroSmsSettingsUpdate,
     ) -> dict[str, Any]:
+        current = await self._guard(
+            self.settings_collection.find_one({"_id": "default"})
+        ) or {}
+        self._sync_hero_sms_key(current)
+        if payload.apiKey:
+            self.hero_sms.api_key = payload.apiKey
         if payload.enabled and not self.hero_sms.configured:
             raise PipelineServiceError("herosms_api_key_missing", "HeroSMS API Key 未配置")
         if payload.agreementAutoSmsEnabled and not payload.enabled:
@@ -1664,6 +1684,8 @@ class AccountPipelineService:
             "agreementAutoSmsEnabled": payload.agreementAutoSmsEnabled,
             "updatedAt": utc_now(),
         }
+        if payload.apiKey:
+            updates["heroSmsApiKey"] = payload.apiKey
         if not payload.enabled:
             updates["autoPaymentEnabled"] = False
             updates["agreementAutoSmsEnabled"] = False

@@ -13,7 +13,7 @@ import {
 import { ElMessage } from 'element-plus'
 import { copyText, downloadTextFile } from '@/services/exporter'
 import { useAppStore } from '@/stores/app'
-import { countryLabel } from '@/services/countries'
+import { COMMON_REGISTRATION_COUNTRIES, countryLabel } from '@/services/countries'
 import type { EmailSource } from '@/types'
 
 const store = useAppStore()
@@ -58,13 +58,11 @@ const countValid = computed(
   () =>
     Number.isInteger(requestedCount.value) &&
     Number(requestedCount.value) >= 1 &&
-    Number(requestedCount.value) <= availableForSource.value &&
     Boolean(selectedCountry.value) &&
-    Boolean(selectedGroup.value) &&
-    (store.proxyGroups.find(
+    (!selectedGroup.value || (store.proxyGroups.find(
       (item) => item.country === selectedCountry.value && item.group === selectedGroup.value,
     )?.enabled || 0) >=
-      Math.min(Number(requestedCount.value) || 1, store.settings.concurrency) &&
+      1) &&
     store.mongoHealth.status === 'online',
 )
 const groupOptions = computed(() =>
@@ -73,16 +71,19 @@ const groupOptions = computed(() =>
     .map((item) => ({ ...item, label: `${item.group} · ${item.enabled} 条启用代理` })),
 )
 const countryOptions = computed(() =>
-  store.proxyCountries
-    .filter((item) => item.country !== 'ZZ' && item.enabled > 0)
-    .map((item) => ({
-      ...item,
-      label: `${countryLabel(item.country)} · ${item.enabled} 条启用代理`,
-    })),
+  COMMON_REGISTRATION_COUNTRIES.map((country) => {
+    const summary = store.proxyCountries.find((item) => item.country === country.value)
+    return {
+      country: country.value,
+      total: summary?.total || 0,
+      enabled: summary?.enabled || 0,
+      label: `${countryLabel(country.value)} · ${summary?.enabled || 0} 条池代理`,
+    }
+  }),
 )
 const progress = computed(() =>
   store.runState.requested
-    ? Math.round((store.runState.processed / store.runState.requested) * 100)
+    ? Math.min(100, Math.max(0, Math.round((store.runState.processed / store.runState.requested) * 100)))
     : 0,
 )
 const successRate = computed(() =>
@@ -128,7 +129,7 @@ watch(
   (available) => {
     if (running.value) return
     if (available === 0) requestedCount.value = undefined
-    else if (!requestedCount.value || requestedCount.value > available) requestedCount.value = 1
+    else if (!requestedCount.value) requestedCount.value = 1
   },
   { immediate: true },
 )
@@ -154,8 +155,8 @@ watch(selectedCountry, (value) => {
 watch(
   groupOptions,
   (options) => {
-    if (!options.some((item) => item.group === selectedGroup.value)) {
-      selectedGroup.value = options[0]?.group || ''
+    if (selectedGroup.value && !options.some((item) => item.group === selectedGroup.value)) {
+      selectedGroup.value = ''
     }
   },
   { immediate: true },
@@ -248,7 +249,7 @@ function formatElapsed(milliseconds: number) {
 
 async function startRun() {
   if (!countValid.value || requestedCount.value === undefined) {
-    ElMessage.warning('请输入不超过当前可用邮箱数的正整数')
+    ElMessage.warning('请输入 1 到 10000 的正整数并选择注册国家')
     return
   }
   try {
@@ -399,10 +400,12 @@ function downloadLogs() {
           <label>代理分组</label>
           <el-select
             v-model="selectedGroup"
+            clearable
             filterable
-            placeholder="请选择代理分组"
+            placeholder="不选择则使用 127.0.0.1:7890"
             :disabled="running || !selectedCountry"
           >
+            <el-option label="本机代理 · 127.0.0.1:7890" value="" />
             <el-option
               v-for="option in groupOptions"
               :key="`${option.country}-${option.group}`"
@@ -414,7 +417,7 @@ function downloadLogs() {
           <el-input-number
             v-model="requestedCount"
             :min="1"
-            :max="Math.max(1, availableForSource)"
+            :max="10000"
             :step="1"
             :disabled="running || availableForSource === 0 || store.mongoHealth.status !== 'online'"
             controls-position="right"
@@ -424,7 +427,7 @@ function downloadLogs() {
             <span>邮箱来源 {{ selectedEmailSource === 'mailcom_alias' ? '分裂邮箱' : selectedEmailSource === 'standard' ? '普通邮箱' : '全部' }}</span>
             <span>并发 {{ store.settings.concurrency }}</span>
             <span>注册国家 {{ selectedCountry ? countryLabel(selectedCountry) : '未选择' }}</span>
-            <span>代理分组 {{ selectedGroup || '未选择' }}</span>
+            <span>代理 {{ selectedGroup || '127.0.0.1:7890' }}</span>
             <span>需要 workspace {{ workspaceRequired }}</span>
             <span>类型 Free</span>
           </div>
@@ -458,13 +461,6 @@ function downloadLogs() {
             type="warning"
             :closable="false"
             :title="selectedEmailSource === 'mailcom_alias' ? '分裂邮箱池为空，请先同步 MailCom Hub' : selectedEmailSource === 'standard' ? '普通邮箱池为空，请先导入邮箱' : '邮箱池为空，请先导入邮箱'"
-            show-icon
-          />
-          <el-alert
-            v-else-if="countryOptions.length === 0"
-            type="warning"
-            :closable="false"
-            title="没有已分类且启用的注册代理，请先到配置栏设置代理国家"
             show-icon
           />
           <el-alert

@@ -365,6 +365,64 @@ def test_json_and_plain_text_responses_use_the_same_parser() -> None:
     assert text_snapshot.verification_code == "654321"
 
 
+def test_structured_code_is_parsed_when_subject_follows_code_field() -> None:
+    snapshot = parse_mailbox_snapshot(
+        """{
+          "code": "582178",
+          "confidence": 100,
+          "received_at": "2026-08-18 14:05",
+          "subject": "Your temporary ChatGPT verification code",
+          "success": true
+        }""",
+        "application/json; charset=utf-8",
+    )
+
+    assert snapshot.verification_code == "582178"
+    assert snapshot.received_at_utc == datetime(2026, 8, 18, 6, 5, tzinfo=UTC)
+    assert snapshot.received_offset == "+08:00"
+
+
+def test_icloud_privacy_mail_japanese_code_field_needs_no_keyword_match() -> None:
+    snapshot = parse_mailbox_snapshot(
+        """{
+          "code": "669211",
+          "confidence": 99,
+          "email": "apply-trees8j@icloud.com",
+          "matched_language": "ja",
+          "matched_rule": "验证码关键词附近的6位数字",
+          "message_id": "msg_081762",
+          "received_at": "2026-08-18 15:04",
+          "recognizer_version": "otp-v3",
+          "source": "plain_text",
+          "subject": "ChatGPT 用の一時ログインコード",
+          "success": true
+        }""",
+        "application/json; charset=utf-8",
+    )
+
+    assert snapshot.verification_code == "669211"
+    assert snapshot.service_code == "669211"
+    assert snapshot.service_success is True
+    assert snapshot.received_at_utc == datetime(2026, 8, 18, 7, 4, tzinfo=UTC)
+    assert snapshot.received_precision_seconds == 60
+
+
+def test_minute_precision_code_is_not_rejected_as_older_than_submission() -> None:
+    submitted = datetime(2026, 8, 18, 7, 9, 29, tzinfo=UTC)
+    candidate = MailboxSnapshot(
+        fingerprint="new",
+        verification_code="053779",
+        received_at_utc=datetime(2026, 8, 18, 7, 9, tzinfo=UTC),
+        received_offset="+08:00",
+        received_precision_seconds=60,
+    )
+
+    result = run_poll([candidate], submitted)
+
+    assert result.verification_code == "053779"
+    assert result.poll_count == 1
+
+
 def test_real_mailbox_msg_and_time_shape_is_parsed() -> None:
     snapshot = parse_mailbox_snapshot(
         """{
@@ -763,7 +821,7 @@ def run_poll(
     responses: list[MailboxSnapshot | MailboxClientError],
     submitted_at: datetime,
     *,
-    timeout_seconds: float = 6,
+    timeout_seconds: float = 300,
     baseline: MailboxSnapshot | None = None,
 ):
     client = MailboxClient(session=FakeSession([]), resolver=public_resolver)
@@ -784,7 +842,7 @@ def run_poll(
             EMAIL,
             submitted_at,
             timeout_seconds=timeout_seconds,
-            poll_interval_seconds=2,
+            poll_interval_seconds=5,
             baseline=baseline,
             sleep=clock.sleep,
             utc_now=clock.utc_now,
@@ -803,8 +861,64 @@ def test_poll_ignores_stale_mail_then_accepts_fresh_timestamped_code() -> None:
     assert result.verification_code == "222222"
     assert result.received_at_utc == submitted + timedelta(seconds=1)
     assert result.received_offset == "+08:00"
-    assert result.wait_ms == 2_000
-    assert result.mail_age_ms == 1_000
+    assert result.wait_ms == 5_000
+    assert result.mail_age_ms == 4_000
+    assert result.poll_count == 2
+
+
+def test_poll_can_receive_code_after_previous_two_minute_limit() -> None:
+    submitted = datetime(2026, 8, 9, 1, 30, tzinfo=UTC)
+    empty = snapshot("empty", None, None)
+    fresh = snapshot("new", "222222", submitted + timedelta(seconds=225), "+00:00")
+
+    result = run_poll([empty] * 45 + [fresh], submitted)
+
+    assert result.verification_code == "222222"
+    assert result.wait_ms == 225_000
+    assert result.poll_count == 46
+
+
+def test_icloud_privacy_mail_uses_original_json_url_and_content_fallback() -> None:
+    submitted = datetime(2026, 8, 18, 5, 30, tzinfo=UTC)
+    client = MailboxClient(session=FakeSession([]), resolver=public_resolver)
+    requested_urls: list[str] = []
+
+    async def get_snapshot(url: str, _email: str) -> MailboxSnapshot:
+        requested_urls.append(url)
+        if url.endswith("/code"):
+            raise MailboxClientError(
+                "mailbox_unavailable",
+                "upstream unavailable",
+                retryable=True,
+            )
+        return snapshot(
+            "content-message",
+            "582178",
+            submitted + timedelta(seconds=2),
+            "+08:00",
+        )
+
+    client.get_snapshot = get_snapshot  # type: ignore[method-assign]
+    clock = FakeClock(submitted + timedelta(seconds=3))
+    result = asyncio.run(
+        client.wait_for_new_code(
+            "https://mail.sayt.cloud/api/v1/access/TOKEN/mailboxes/person%40example.com/code",
+            EMAIL,
+            submitted,
+            sleep=clock.sleep,
+            utc_now=clock.utc_now,
+            monotonic_now=clock.monotonic,
+        )
+    )
+
+    assert result.verification_code == "582178"
+    assert result.poll_count == 1
+    assert requested_urls[0] == (
+        "https://mail.sayt.cloud/api/v1/access/TOKEN/"
+        "mailboxes/person%40example.com/code"
+    )
+    assert "/content?" in requested_urls[1]
+    assert "cache=1" in requested_urls[1]
 
 
 @pytest.mark.parametrize(
@@ -894,7 +1008,7 @@ def test_poll_accepts_stable_undated_code_only_after_baseline_changes() -> None:
     assert result.received_at_utc is None
     assert result.received_offset is None
     assert result.mail_age_ms is None
-    assert result.wait_ms == 2_000
+    assert result.wait_ms == 5_000
 
 
 def test_poll_rejects_unchanged_undated_baseline_code() -> None:

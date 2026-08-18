@@ -15,6 +15,7 @@ from typing import Any, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 from .errors import (
+    LocalProxyUnavailableError,
     MongoUnavailableError,
     ProxyCountryUnavailableError,
     RoxyWorkspaceMissingError,
@@ -25,7 +26,7 @@ from .browser_automation import mask_ip
 from .browser_probe import DEFAULT_ARTIFACT_DIR
 from .browser_worker import WindowsChildJob, worker_process_main
 from .mongo_manager import MongoManager
-from .probe_store import MongoProbeStore
+from .probe_store import LOCAL_PROXY_GROUP, MongoProbeStore
 from .resource_models import RunState, WorkerSnapshot
 from .resource_service import MongoResourceStore
 from .run_log_store import (
@@ -526,6 +527,91 @@ class BrowserProbeRunExecutor:
                 )
                 return
 
+            if event.get("type") == "mailbox_poll":
+                poll_details = event.get("details")
+                if not isinstance(poll_details, dict):
+                    poll_details = {}
+                safe_details = {
+                    key: poll_details[key]
+                    for key in (
+                        "attempt",
+                        "flow",
+                        "channel",
+                        "status",
+                        "errorCode",
+                        "retryable",
+                        "codePresent",
+                        "codeLength",
+                        "apiCode",
+                        "apiSuccess",
+                        "responseBody",
+                        "receivedAtPresent",
+                        "elapsedMs",
+                    )
+                    if key in poll_details
+                }
+                context.append_log(
+                    context.state.runId,
+                    "info" if safe_details.get("status") == "ok" else "warning",
+                    "mailbox_poll_result",
+                    (
+                        f"邮箱取码调用 #{safe_details.get('attempt', '?')} "
+                        f"[{safe_details.get('flow', 'unknown')}] "
+                        f"[{safe_details.get('channel', 'unknown')}]："
+                        f"{safe_details.get('status', 'unknown')}，"
+                        f"apiCode={safe_details.get('apiCode', '-')}，"
+                        f"发现验证码={bool(safe_details.get('codePresent', False))}，"
+                        f"原始响应={safe_details.get('responseBody', '')}"
+                    ),
+                    email=handle.email,
+                    sequence=handle.sequence,
+                    details={
+                        **RunManager.details(context.state),
+                        "stage": "verification",
+                        **safe_details,
+                    },
+                )
+                return
+
+            if event.get("type") == "verification_fill":
+                fill_details = event.get("details")
+                if not isinstance(fill_details, dict):
+                    fill_details = {}
+                safe_details = {
+                    key: fill_details[key]
+                    for key in (
+                        "flow",
+                        "status",
+                        "pollCount",
+                        "errorCode",
+                        "nextStep",
+                    )
+                    if key in fill_details
+                }
+                status = str(safe_details.get("status") or "unknown")
+                context.append_log(
+                    context.state.runId,
+                    "error" if status == "failed" else "info",
+                    "verification_fill_result",
+                    (
+                        f"验证码填写 [{safe_details.get('flow', 'unknown')}]："
+                        f"{status}"
+                        + (
+                            f"，errorCode={safe_details['errorCode']}"
+                            if safe_details.get("errorCode")
+                            else ""
+                        )
+                    ),
+                    email=handle.email,
+                    sequence=handle.sequence,
+                    details={
+                        **RunManager.details(context.state),
+                        "stage": str(safe_details.get("flow") or "verification"),
+                        **safe_details,
+                    },
+                )
+                return
+
             if event.get("type") != "final" or handle.final_received:
                 return
             status = str(event.get("status") or "failed")
@@ -974,7 +1060,7 @@ class RunManager:
                 self._execute(
                     state,
                     reserved,
-                    settings.concurrency,
+                    required,
                     settings.taskTimeoutSeconds,
                     cancel_event,
                 ),
@@ -988,7 +1074,7 @@ class RunManager:
         self,
         count: int,
         country: str = "JP",
-        group: str = "默认组",
+        group: str = "",
         email_source: str = "all",
     ) -> RunState:
         async with self._start_lock:
@@ -1001,14 +1087,19 @@ class RunManager:
                 raise RunConflictError("已有任务正在运行")
 
             settings = self.settings.load()
-            required = min(count, settings.concurrency)
-            available_proxies = await self.probe_store.count_eligible_proxies(country, group)
-            if available_proxies < required:
+            effective_group = group or LOCAL_PROXY_GROUP
+            if effective_group == LOCAL_PROXY_GROUP:
+                await self._preflight_local_proxy()
+            available_proxies = await self.probe_store.count_eligible_proxies(
+                country, effective_group
+            )
+            if available_proxies < 1:
                 raise ProxyCountryUnavailableError(
                     country,
-                    required,
+                    1,
                     available_proxies,
                 )
+            required = min(count, settings.concurrency)
             workspaces = await self._preflight_workspaces(settings)
             if not workspaces:
                 raise RoxyWorkspaceMissingError()
@@ -1056,7 +1147,7 @@ class RunManager:
                 logPersisted=True,
                 cancelRequested=False,
                 registrationCountry=country,
-                registrationProxyGroup=group,
+                registrationProxyGroup=effective_group,
                 emailSource=email_source,
             )
             created = False
@@ -1133,6 +1224,35 @@ class RunManager:
             self._tasks[run_id] = task
             task.add_done_callback(lambda _: self._task_finished(run_id))
             return state.model_copy(deep=True)
+
+    @staticmethod
+    async def _preflight_local_proxy() -> None:
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 7890), timeout=3
+            )
+            writer.write(
+                b"CONNECT www.gstatic.com:443 HTTP/1.1\r\n"
+                b"Host: www.gstatic.com:443\r\n"
+                b"Proxy-Connection: close\r\n\r\n"
+            )
+            await asyncio.wait_for(writer.drain(), timeout=2)
+            status_line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if not status_line.startswith(b"HTTP/1.1 200") and not status_line.startswith(
+                b"HTTP/1.0 200"
+            ):
+                status = status_line.decode("ascii", errors="replace").strip()
+                raise LocalProxyUnavailableError(status or "代理未返回响应")
+        except LocalProxyUnavailableError:
+            raise
+        except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            raise LocalProxyUnavailableError(type(exc).__name__) from exc
+        finally:
+            if writer is not None:
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
 
     async def workers(self, run_id: str) -> list[WorkerSnapshot]:
         await self.get(run_id)

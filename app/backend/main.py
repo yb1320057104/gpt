@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from .errors import (
+    LocalProxyUnavailableError,
     DuplicateResourceError,
     InsufficientEmailsError,
     MongoUnavailableError,
@@ -63,6 +64,11 @@ from .pipeline_service import (
 )
 from .probe_store import MongoProbeStore
 from .plan_check_service import AccountPlanCheckService
+from .proxy_subscription_service import (
+    ProxySubscriptionError,
+    ProxySubscriptionService,
+)
+from .proxy_health_scheduler import ProxyHealthScheduler
 from .resource_models import (
     AccountCreate,
     AccountExportInput,
@@ -84,6 +90,10 @@ from .resource_models import (
     ProxyGroupSummary,
     ProxyGroupUpdate,
     ProxyImportInput,
+    ProxySubscriptionImportInput,
+    ProxySubscriptionImportResult,
+    ProxyTestInput,
+    ProxyTestResult,
     ProxyUpdate,
     RawImportInput,
     RunState,
@@ -182,6 +192,8 @@ def create_app(
     mongo = mongo_manager or MongoManager()
     resource_store = MongoResourceStore(mongo)
     resource_service = ResourceService(resource_store)
+    proxy_subscription_service = ProxySubscriptionService(resource_service)
+    proxy_health_scheduler = ProxyHealthScheduler(proxy_subscription_service)
     probe_store = MongoProbeStore(mongo)
     plan_check_service = AccountPlanCheckService(resource_store, probe_store)
     extractor_service = payment_extractor_service or PaymentExtractorService()
@@ -211,9 +223,11 @@ def create_app(
         run_log_store.prune_terminal_runs()
         await mongo.start()
         await account_pipeline.start()
+        await proxy_health_scheduler.start()
         try:
             yield
         finally:
+            await proxy_health_scheduler.stop()
             await run_manager.shutdown()
             await account_pipeline.stop()
             extractor_service.close()
@@ -253,6 +267,8 @@ def create_app(
     app.state.mongo_manager = mongo
     app.state.resource_store = resource_store
     app.state.resource_service = resource_service
+    app.state.proxy_subscription_service = proxy_subscription_service
+    app.state.proxy_health_scheduler = proxy_health_scheduler
     app.state.probe_store = probe_store
     app.state.plan_check_service = plan_check_service
     app.state.payment_extractor_service = extractor_service
@@ -914,9 +930,10 @@ def create_app(
         page_size: PageSizeOption = Query(PageSizeOption.TEN, alias="pageSize"),
         q: SearchQuery = "",
         promotion: Annotated[str, Query(max_length=32)] = "",
+        country: Annotated[str, Query(max_length=2)] = "",
     ) -> Page[AccountRecord]:
         mongo.require_online()
-        return await resource_store.list_accounts(page, int(page_size), q, promotion)  # type: ignore[arg-type]
+        return await resource_store.list_accounts(page, int(page_size), q, promotion, country)  # type: ignore[arg-type]
 
     @app.post("/api/accounts", response_model=AccountRecord, status_code=201)
     async def create_account(payload: AccountCreate) -> AccountRecord:
@@ -940,7 +957,9 @@ def create_app(
         payload: AccountPlanCheckInput,
     ) -> AccountPlanCheckResult:
         mongo.require_online()
-        return await request.app.state.plan_check_service.check_accounts(payload.ids)
+        return await request.app.state.plan_check_service.check_accounts(
+            payload.ids, proxy_id=payload.proxyId
+        )
 
     @app.post("/api/accounts/export", response_model=TextExport)
     async def export_accounts(payload: AccountExportInput) -> TextExport:
@@ -1020,10 +1039,35 @@ def create_app(
         mongo.require_online()
         return await resource_service.import_proxies(payload.rawText, payload.country, payload.group)
 
+    @app.post(
+        "/api/proxies/import-subscription",
+        response_model=ProxySubscriptionImportResult,
+    )
+    async def import_proxy_subscription(
+        payload: ProxySubscriptionImportInput,
+    ) -> ProxySubscriptionImportResult:
+        mongo.require_online()
+        try:
+            return await proxy_subscription_service.import_subscription(payload)
+        except ProxySubscriptionError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
+
     @app.get("/api/proxies/countries", response_model=list[ProxyCountrySummary])
     async def proxy_countries() -> list[ProxyCountrySummary]:
         mongo.require_online()
         return await resource_store.proxy_country_summaries()
+
+    @app.post("/api/proxies/test", response_model=ProxyTestResult)
+    async def test_proxies(payload: ProxyTestInput) -> ProxyTestResult:
+        mongo.require_online()
+        return await proxy_subscription_service.test_stored_proxies(
+            country=payload.country,
+            group=payload.group,
+            timeout_seconds=payload.timeoutSeconds,
+        )
 
     @app.get("/api/proxies/groups", response_model=list[ProxyGroupSummary])
     async def proxy_groups() -> list[ProxyGroupSummary]:
@@ -1122,6 +1166,16 @@ def create_app(
                     "country": exc.country,
                     "required": exc.required,
                     "available": exc.available,
+                },
+            ) from exc
+        except LocalProxyUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "local_proxy_unavailable",
+                    "message": str(exc),
+                    "host": "127.0.0.1",
+                    "port": 7890,
                 },
             ) from exc
         except RoxyWorkspaceMissingError as exc:

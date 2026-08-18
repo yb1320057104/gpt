@@ -37,6 +37,7 @@ from .browser_automation import (
     TotpEnrollmentError,
     TotpEnrollmentResult,
 )
+from .ant_browser_client import AntBrowserClient
 from .chatgpt_plan import AccountPlanResult, PlanCheckError
 from .errors import InsufficientEmailsError, MongoUnavailableError, ResourceNotFoundError
 from .mailbox_client import (
@@ -222,6 +223,7 @@ class BrowserProbeRunner:
         max_registration_proxy_rotations: int = 9,
         registration_country: str | None = None,
         registration_proxy_group: str | None = None,
+        two_factor_delay_seconds: float = 0,
     ) -> None:
         self.settings = settings
         self.requested_workspace_id = workspace_id
@@ -230,7 +232,11 @@ class BrowserProbeRunner:
         self.mongo = mongo_manager or MongoManager()
         self.store = MongoProbeStore(self.mongo)
         self.resources = MongoResourceStore(self.mongo)
-        self.roxy_factory = roxy_factory
+        self.roxy_factory = (
+            AntBrowserClient
+            if settings.browserProvider == "ant" and roxy_factory is RoxyClient
+            else roxy_factory
+        )
         self.automation_factory = automation_factory
         self.mailbox = mailbox_client or MailboxClient()
         self.debug_show_code = debug_show_code
@@ -275,6 +281,7 @@ class BrowserProbeRunner:
         self.registration_proxy_group = " ".join(
             str(registration_proxy_group or "").split()
         ) or None
+        self.two_factor_delay_seconds = max(0, float(two_factor_delay_seconds))
         self.email_id: str | None = None
         self.email_consumed = False
         self.egress_ip: str | None = None
@@ -315,14 +322,23 @@ class BrowserProbeRunner:
             )
 
             async with self.roxy_factory(
-                self.settings.roxyApiPort,
-                self.settings.roxyApiKey,
+                (
+                    self.settings.antApiPort
+                    if self.settings.browserProvider == "ant"
+                    else self.settings.roxyApiPort
+                ),
+                (
+                    self.settings.antApiKey
+                    if self.settings.browserProvider == "ant"
+                    else self.settings.roxyApiKey
+                ),
             ) as roxy:
                 await self._emit_progress("roxy_starting")
                 await self._ensure_roxy_online(roxy)
                 workspace = await self._wait_for_workspace_ready(roxy)
                 pool_size = await self.store.count_eligible_proxies(
-                    self.registration_country
+                    self.registration_country,
+                    self.registration_proxy_group,
                 )
                 if pool_size < 1:
                     return self._failure(
@@ -394,6 +410,20 @@ class BrowserProbeRunner:
                                 break
                             except (EmailStepError, VerificationStepError) as exc:
                                 if exc.code not in TRANSIENT_REGISTRATION_PROXY_ERRORS:
+                                    if (
+                                        isinstance(exc, EmailStepError)
+                                        and exc.code == "existing_account_totp_required"
+                                    ):
+                                        discarded = await self.resources.discard_reserved_email(
+                                            str(reserved_email["_id"]),
+                                            self.reservation_owner,
+                                        )
+                                        self.email_consumed = discarded
+                                        await self._emit_progress(
+                                            "email",
+                                            emailDiscarded=discarded,
+                                            discardReason=exc.code,
+                                        )
                                     raise
                                 self.attempt_errors.append(
                                     {
@@ -520,7 +550,7 @@ class BrowserProbeRunner:
                                 "roxyOpenRecoveryMs": roxy_open_recovery_ms,
                                 "attempts": total_attempts,
                                 "attemptErrors": list(self.attempt_errors),
-                                "registrationCountry": self.registration_country,
+                                "registrationCountry": automation_result.egress_country,
                                 "egressIpMasked": automation_result.egress_ip_masked,
                                 "finalUrl": (
                                     security_navigation.final_url
@@ -596,6 +626,7 @@ class BrowserProbeRunner:
                                             verification.verification_code
                                         ),
                                         "verificationWaitMs": verification.wait_ms,
+                                        "verificationPollCount": verification.poll_count,
                                         "mailReceivedAtUtc": (
                                             verification.received_at_utc.isoformat()
                                             if verification.received_at_utc is not None
@@ -899,13 +930,21 @@ class BrowserProbeRunner:
             await self.mongo.stop()
 
     def _validate_settings(self) -> None:
-        if not self.settings.roxyApiKey.get_secret_value():
+        if (
+            self.settings.browserProvider == "roxy"
+            and not self.settings.roxyApiKey.get_secret_value()
+        ):
             raise ProbeFailure(
                 "roxy_api_key_missing",
                 "请先在设置页填写 Roxy API Key",
                 2,
             )
-        if not self.settings.browserExecutablePath.strip():
+        executable_path = (
+            self.settings.antBrowserExecutablePath
+            if self.settings.browserProvider == "ant"
+            else self.settings.browserExecutablePath
+        )
+        if not executable_path.strip():
             raise ProbeFailure(
                 "browser_path_missing",
                 "请先配置指纹浏览器地址",
@@ -958,7 +997,11 @@ class BrowserProbeRunner:
                 ) from None
             last_error = exc
 
-        executable = Path(self.settings.browserExecutablePath)
+        executable = Path(
+            self.settings.antBrowserExecutablePath
+            if self.settings.browserProvider == "ant"
+            else self.settings.browserExecutablePath
+        )
         if not executable.is_file():
             raise ProbeFailure(
                 "browser_executable_missing",
@@ -1159,6 +1202,14 @@ class BrowserProbeRunner:
         )
 
     def _select_workspace(self, workspaces: list[RoxyWorkspace]) -> RoxyWorkspace:
+        if self.settings.browserProvider == "ant":
+            if not workspaces:
+                raise ProbeFailure(
+                    "workspace_missing",
+                    "Ant Browser 本地 API 当前不可用",
+                    4,
+                )
+            return workspaces[0]
         if self.requested_workspace_id is not None:
             for workspace in workspaces:
                 if workspace.id == self.requested_workspace_id:
@@ -1600,16 +1651,53 @@ class BrowserProbeRunner:
                     wait_options: dict[str, Any] = {}
                     if mailbox_baseline is not None:
                         wait_options["baseline"] = mailbox_baseline
+                    if isinstance(self.mailbox, MailboxClient):
+                        async def report_mailbox_poll(details: dict[str, Any]) -> None:
+                            await self._emit_progress(
+                                "verification",
+                                mailboxPoll={**details, "flow": "registration"},
+                            )
+
+                        wait_options["poll_observer"] = report_mailbox_poll
                     verification = await self.mailbox.wait_for_new_code(
                         access_url,
                         email,
                         verification_requested_at,
                         **wait_options,
                     )
-                    verification_submission = (
-                        await automation.submit_verification_code_and_continue(
-                            verification.verification_code
+                    await self._emit_progress(
+                        "verification",
+                        verificationFill={
+                            "flow": "registration",
+                            "status": "starting",
+                            "pollCount": verification.poll_count,
+                        },
+                    )
+                    try:
+                        verification_submission = (
+                            await automation.submit_verification_code_and_continue(
+                                verification.verification_code
+                            )
                         )
+                    except Exception as exc:
+                        await self._emit_progress(
+                            "verification",
+                            verificationFill={
+                                "flow": "registration",
+                                "status": "failed",
+                                "errorCode": str(
+                                    getattr(exc, "code", type(exc).__name__)
+                                ),
+                            },
+                        )
+                        raise
+                    await self._emit_progress(
+                        "verification",
+                        verificationFill={
+                            "flow": "registration",
+                            "status": "submitted",
+                            "nextStep": verification_submission.next_step,
+                        },
                     )
                     await self._emit_progress("profile", dirId=dir_id)
                     profile_completion = await automation.complete_profile_if_needed()
@@ -1617,7 +1705,7 @@ class BrowserProbeRunner:
                         email_source,
                         self.reservation_owner,
                         account_password,
-                        self.registration_country,
+                        result.egress_country,
                     )
                     account_id = account.id
                     self.email_consumed = True
@@ -1713,6 +1801,8 @@ class BrowserProbeRunner:
                             getattr(self.resources, "store_account_totp", None)
                         )
                     ):
+                        if self.two_factor_delay_seconds:
+                            await self.hold_sleep(self.two_factor_delay_seconds)
                         await self._emit_progress(
                             "two_factor",
                             dirId=dir_id,
@@ -1731,16 +1821,56 @@ class BrowserProbeRunner:
                             wait_options = {}
                             if totp_baseline is not None:
                                 wait_options["baseline"] = totp_baseline
+                            if isinstance(self.mailbox, MailboxClient):
+                                async def report_totp_mailbox_poll(
+                                    details: dict[str, Any],
+                                ) -> None:
+                                    await self._emit_progress(
+                                        "two_factor",
+                                        mailboxPoll={**details, "flow": "two_factor"},
+                                    )
+
+                                wait_options["poll_observer"] = (
+                                    report_totp_mailbox_poll
+                                )
                             totp_verification = await self.mailbox.wait_for_new_code(
                                 access_url,
                                 email,
                                 challenge.requested_at_utc,
                                 **wait_options,
                             )
-                            totp_enrollment = (
-                                await automation.complete_totp_enrollment(
-                                    totp_verification.verification_code
+                            await self._emit_progress(
+                                "two_factor",
+                                verificationFill={
+                                    "flow": "two_factor",
+                                    "status": "starting",
+                                    "pollCount": totp_verification.poll_count,
+                                },
+                            )
+                            try:
+                                totp_enrollment = (
+                                    await automation.complete_totp_enrollment(
+                                        totp_verification.verification_code
+                                    )
                                 )
+                            except Exception as exc:
+                                await self._emit_progress(
+                                    "two_factor",
+                                    verificationFill={
+                                        "flow": "two_factor",
+                                        "status": "failed",
+                                        "errorCode": str(
+                                            getattr(exc, "code", type(exc).__name__)
+                                        ),
+                                    },
+                                )
+                                raise
+                            await self._emit_progress(
+                                "two_factor",
+                                verificationFill={
+                                    "flow": "two_factor",
+                                    "status": "submitted",
+                                },
                             )
                             access_token_updated_at = (
                                 await self.resources.store_account_totp(
@@ -1753,7 +1883,13 @@ class BrowserProbeRunner:
                             )
                         except TotpEnrollmentError as exc:
                             totp_error = exc
-                        except (MailboxClientError, MongoUnavailableError, ResourceNotFoundError, OSError, ValueError) as exc:
+                        except MailboxClientError as exc:
+                            totp_error = TotpEnrollmentError(
+                                "totp_mailbox",
+                                exc.code,
+                                exc.message,
+                            )
+                        except (MongoUnavailableError, ResourceNotFoundError, OSError, ValueError) as exc:
                             totp_error = TotpEnrollmentError(
                                 "totp_store",
                                 "totp_setup_or_store_failed",
@@ -1784,6 +1920,21 @@ class BrowserProbeRunner:
                                 options: dict[str, Any] = {}
                                 if password_baseline is not None:
                                     options["baseline"] = password_baseline
+                                if isinstance(self.mailbox, MailboxClient):
+                                    async def report_password_mailbox_poll(
+                                        details: dict[str, Any],
+                                    ) -> None:
+                                        await self._emit_progress(
+                                            "password_setup",
+                                            mailboxPoll={
+                                                **details,
+                                                "flow": "password_setup",
+                                            },
+                                        )
+
+                                    options["poll_observer"] = (
+                                        report_password_mailbox_poll
+                                    )
                                 try:
                                     code = await self.mailbox.wait_for_new_code(
                                         access_url,
@@ -1975,6 +2126,7 @@ async def async_main(args: argparse.Namespace) -> int:
             workspace_id=args.workspace_id,
             hold_seconds=args.hold_seconds,
             debug_show_code=args.debug_show_code,
+            two_factor_delay_seconds=20,
         )
         result, exit_code = await runner.run()
     except CorruptSettingsError:

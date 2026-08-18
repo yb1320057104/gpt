@@ -17,6 +17,7 @@ from .browser_automation import (
     PasswordStepError,
     TotpEnrollmentError,
 )
+from .ant_browser_client import AntBrowserClient
 from .browser_probe import DEFAULT_ARTIFACT_DIR
 from .browser_probe import generate_account_password
 from .mailbox_client import MailboxClient, MailboxClientError, mailbox_source_for_document
@@ -199,7 +200,9 @@ class PaidAccountMfaBackfill:
         local_totp_secret = str(account.get("totpSecret") or "")
         local_password = str(account.get("chatgptPassword") or "")
         settings = self.settings_store.load()
-        api_key = settings.roxyApiKey
+        browser_client = AntBrowserClient if settings.browserProvider == "ant" else RoxyClient
+        api_key = settings.antApiKey if settings.browserProvider == "ant" else settings.roxyApiKey
+        api_port = settings.antApiPort if settings.browserProvider == "ant" else settings.roxyApiPort
         owner = f"probe:mfa:{account_id}:{uuid4().hex[:8]}"
         workspace_id: int | None = None
         proxy_id: str | None = None
@@ -214,11 +217,11 @@ class PaidAccountMfaBackfill:
             )
             if not lock_acquired:
                 raise RuntimeError("真实浏览器控制器正在运行")
-            async with RoxyClient(settings.roxyApiPort, api_key) as roxy:
+            async with browser_client(api_port, api_key) as roxy:
                 await roxy.health()
                 workspaces = await roxy.workspaces()
                 if not workspaces:
-                    raise RuntimeError("Roxy workspace 不存在")
+                    raise RuntimeError("指纹浏览器运行环境不存在")
                 workspace_id = workspaces[0].id
                 workspace_acquired = await self.probes.acquire_workspace(
                     workspace_id,
@@ -226,7 +229,7 @@ class PaidAccountMfaBackfill:
                     lease_seconds=600,
                 )
                 if not workspace_acquired:
-                    raise RuntimeError("Roxy workspace 正在使用")
+                    raise RuntimeError("指纹浏览器运行环境正在使用")
                 proxy = await self.probes.acquire_proxy(
                     owner,
                     lease_seconds=600,
@@ -343,8 +346,8 @@ class PaidAccountMfaBackfill:
         finally:
             if dir_id is not None and workspace_id is not None:
                 with suppress(RoxyApiError):
-                    async with RoxyClient(
-                        settings.roxyApiPort,
+                    async with browser_client(
+                        api_port,
                         api_key,
                     ) as cleanup_roxy:
                         with suppress(RoxyApiError):

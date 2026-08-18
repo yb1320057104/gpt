@@ -14,6 +14,7 @@ PlanCheckStatus = Literal["running", "success", "failed"]
 AccountExportFormat = Literal["credentials", "mail-links", "access-tokens"]
 ProxyStatus = Literal["available", "unknown", "quarantined"]
 ProxyScheme = Literal["http", "https", "socks5", "socks5h"]
+ProxySubscriptionProvider = Literal["easy-proxies", "resin"]
 EmailSource = Literal["all", "standard", "mailcom_alias"]
 EmailSourceType = Literal["manual", "mailcom_alias"]
 RunStatus = Literal[
@@ -83,6 +84,7 @@ class AccountRecord(ApiModel):
     promotionCampaignId: str | None = None
     checkoutType: CheckoutType | None = None
     checkoutTypeCheckedAt: datetime | None = None
+    checkoutTypeErrorCode: str | None = None
     registrationCountry: str | None = None
 
 
@@ -169,12 +171,50 @@ class ImportResult(ApiModel):
     errorCount: int
 
 
+class ProxySubscriptionImportInput(ApiModel):
+    provider: ProxySubscriptionProvider
+    subscriptionUrl: str = Field(min_length=8, max_length=4096)
+    managerUrl: str = Field(min_length=8, max_length=320)
+    adminToken: str = Field(default="", max_length=512)
+    proxyToken: str = Field(default="", max_length=512)
+    name: str = Field(default="AutoRegister", min_length=1, max_length=128)
+    group: str | None = Field(default=None, max_length=64)
+    probeTimeoutSeconds: float = Field(default=12, ge=3, le=30)
+
+    @field_validator("subscriptionUrl")
+    @classmethod
+    def validate_subscription_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.lower().startswith(("http://", "https://")):
+            raise ValueError("subscriptionUrl must be HTTP or HTTPS")
+        return normalized
+
+    @field_validator("group", "name")
+    @classmethod
+    def normalize_subscription_labels(cls, value: str | None) -> str | None:
+        normalized = " ".join(str(value or "").split())
+        return normalized or None
+
+
+class ProxySubscriptionImportResult(ApiModel):
+    provider: ProxySubscriptionProvider
+    subscriptionName: str
+    nodeCount: int
+    generatedProxyCount: int
+    testedProxyCount: int
+    usableProxyCount: int
+    rejectedProxyCount: int
+    countries: list[dict[str, int | str]] = Field(default_factory=list)
+    importResult: ImportResult
+
+
 class BulkIdsInput(ApiModel):
     ids: list[str] = Field(min_length=1, max_length=10000)
 
 
 class AccountPlanCheckInput(ApiModel):
     ids: list[str] = Field(min_length=1, max_length=100)
+    proxyId: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class AccountPlanCheckItem(ApiModel):
@@ -263,6 +303,25 @@ class ProxyGroupSummary(ApiModel):
     schemes: list[ProxyScheme] = Field(default_factory=list)
 
 
+class ProxyTestInput(ApiModel):
+    country: str | None = Field(default=None, min_length=2, max_length=2)
+    group: str | None = Field(default=None, min_length=1, max_length=64)
+    timeoutSeconds: float = Field(default=12, ge=3, le=30)
+
+    @field_validator("country")
+    @classmethod
+    def normalize_test_country(cls, value: str | None) -> str | None:
+        return value.strip().upper() if value is not None else None
+
+
+class ProxyTestResult(ApiModel):
+    tested: int
+    available: int
+    failed: int
+    averageLatencyMs: int | None = None
+    countries: list[dict[str, int | str]] = Field(default_factory=list)
+
+
 class ProxyGroupUpdate(ApiModel):
     country: str = Field(min_length=2, max_length=2)
     group: str = Field(min_length=1, max_length=64)
@@ -270,9 +329,17 @@ class ProxyGroupUpdate(ApiModel):
     newGroup: str | None = Field(default=None, min_length=1, max_length=64)
     enabled: bool | None = None
 
-    @field_validator("country", "newCountry")
+    @field_validator("country")
     @classmethod
-    def normalize_countries(cls, value: str | None) -> str | None:
+    def normalize_source_country(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", normalized):
+            raise ValueError("country must be a two-letter code")
+        return normalized
+
+    @field_validator("newCountry")
+    @classmethod
+    def normalize_target_country(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = value.strip().upper()
@@ -342,7 +409,7 @@ class MockRunCreate(ApiModel):
 class BrowserProbeRunCreate(ApiModel):
     count: int = Field(ge=1, strict=True)
     country: str = Field(min_length=2, max_length=2)
-    group: str = Field(default="默认组", min_length=1, max_length=64)
+    group: str = Field(default="", max_length=64)
     emailSource: EmailSource = "all"
 
     @field_validator("country")
@@ -357,8 +424,6 @@ class BrowserProbeRunCreate(ApiModel):
     @classmethod
     def normalize_group(cls, value: str) -> str:
         normalized = " ".join(value.split())
-        if not normalized:
-            raise ValueError("group is required")
         return normalized
 
 

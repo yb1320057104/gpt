@@ -20,8 +20,9 @@ from backend.pipeline_service import (
     PipelinePaymentInput,
     PipelineServiceError,
     PipelineSettingsUpdate,
+    HeroSmsSettingsUpdate,
 )
-from backend.hero_sms_service import HeroSmsActivation, HeroSmsStatus
+from backend.hero_sms_service import HeroSmsActivation, HeroSmsClient, HeroSmsStatus
 from backend.paid_mail_service import PaidMailCheckResult
 
 
@@ -409,6 +410,25 @@ def test_pipeline_save_preserves_shared_hero_sms_settings_when_omitted() -> None
         assert stored["agreementAutoSmsEnabled"] is True
         assert result["heroSmsEnabled"] is True
         assert result["heroSmsCountryId"] == 62
+
+    asyncio.run(exercise())
+
+
+def test_hero_sms_api_key_can_be_saved_without_being_returned() -> None:
+    async def exercise() -> None:
+        service, _, _ = pipeline_service(eligible_account(), eligible_item())
+        service.hero_sms = HeroSmsClient("")
+        service.settings_collection.documents["default"] = {"_id": "default"}
+
+        result = await service.update_hero_sms_settings(
+            HeroSmsSettingsUpdate(apiKey="  TEST_SAVED_KEY  ")
+        )
+
+        stored = service.settings_collection.documents["default"]
+        assert stored["heroSmsApiKey"] == "TEST_SAVED_KEY"
+        assert result["apiKeyConfigured"] is True
+        assert "apiKey" not in result
+        assert "heroSmsApiKey" not in result
 
     asyncio.run(exercise())
 

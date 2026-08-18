@@ -26,6 +26,17 @@ class ProxyCountryUnavailableError(RuntimeError):
         )
 
 
+class LocalProxyUnavailableError(RuntimeError):
+    """Raised when the local fallback proxy cannot establish an HTTP tunnel."""
+
+    def __init__(self, reason: str = "") -> None:
+        self.reason = reason
+        message = "本机代理 127.0.0.1:7890 无法建立 HTTPS 隧道，请先确认 Clash/Mihomo 节点可用"
+        if reason:
+            message = f"{message}（{reason}）"
+        super().__init__(message)
+
+
 class RunConflictError(RuntimeError):
     """Raised when another run is already active."""
 

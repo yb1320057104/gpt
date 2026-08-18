@@ -309,6 +309,7 @@ class FakeResourceStore:
         self.released: list[tuple[str, str]] = []
         self.completed: list[tuple[str, str]] = []
         self.completed_countries: list[str | None] = []
+        self.discarded: list[tuple[str, str]] = []
         self.stored_tokens: list[tuple[str, str, datetime]] = []
         self.stored_plans: list[tuple[str, AccountPlanResult]] = []
         self.plan_failures: list[tuple[str, str]] = []
@@ -322,6 +323,10 @@ class FakeResourceStore:
 
     async def release_email(self, email_id: str, owner: str) -> None:
         self.released.append((email_id, owner))
+
+    async def discard_reserved_email(self, email_id: str, owner: str) -> bool:
+        self.discarded.append((email_id, owner))
+        return True
 
     async def complete_probe_profile_success(
         self,
@@ -392,6 +397,7 @@ class FakeMailboxClient:
         submitted_at_utc: datetime,
         *,
         baseline=None,
+        poll_observer=None,
     ) -> VerificationCodeResult:
         if self.events is not None:
             self.events.append("mailbox_request")
@@ -431,6 +437,7 @@ class MsgTimeMailboxClient(MailboxClient):
         submitted_at_utc: datetime,
         *,
         baseline=None,
+        poll_observer=None,
     ) -> VerificationCodeResult:
         self.events.append("mailbox_request")
         self.wait_calls.append((access_url, email, submitted_at_utc))
@@ -439,6 +446,7 @@ class MsgTimeMailboxClient(MailboxClient):
             email,
             submitted_at_utc,
             baseline=baseline,
+            poll_observer=poll_observer,
             utc_now=lambda: FIXED_RECEIVED_AT + timedelta(seconds=1),
             monotonic_now=lambda: 0.0,
         )
@@ -735,6 +743,7 @@ def test_runner_retries_same_proxy_then_rotates_and_cleans_every_window(tmp_path
                 2_250,
                 FIXED_SUBMITTED_AT,
                 email_pre_fill_delays_ms=(1_500,),
+                egress_country="TR",
             ),
         ]
     )
@@ -1123,6 +1132,11 @@ def test_registration_enables_and_persists_totp(tmp_path: Path) -> None:
         [],
         events,
     )
+    stage_delays: list[float] = []
+
+    async def record_stage_delay(seconds: float) -> None:
+        stage_delays.append(seconds)
+
     runner = BrowserProbeRunner(
         settings(),
         workspace_id=None,
@@ -1132,6 +1146,8 @@ def test_registration_enables_and_persists_totp(tmp_path: Path) -> None:
         mailbox_client=fake_mailbox,  # type: ignore[arg-type]
         roxy_factory=lambda *_args, **_kwargs: fake_roxy,  # type: ignore[arg-type]
         automation_factory=lambda *_args, **_kwargs: fake_automation,  # type: ignore[arg-type]
+        hold_sleep=record_stage_delay,
+        two_factor_delay_seconds=20,
     )
     runner.store = fake_store  # type: ignore[assignment]
     runner.resources = fake_resources  # type: ignore[assignment]
@@ -1157,6 +1173,7 @@ def test_registration_enables_and_persists_totp(tmp_path: Path) -> None:
     assert "JBSWY3DPEHPK3PXP" not in raw
     assert "REFRESHED_TOKEN_DO_NOT_LOG" not in raw
     assert len(fake_mailbox.wait_calls) == 2
+    assert stage_delays == [20]
 
 
 def test_existing_profile_is_skipped_persisted_and_holds_on_home_page(
@@ -2570,6 +2587,42 @@ def test_email_step_failure_does_not_rotate_proxy_and_releases_email(
     assert fake_resources.released == [("email-id", runner.owner)]
     assert fake_mailbox.wait_calls == []
     assert fake_store.lock_released is True
+
+
+def test_existing_account_email_is_deleted_instead_of_released(tmp_path: Path) -> None:
+    fake_store = FakeStore([proxy("p1")])
+    fake_resources = FakeResourceStore()
+    fake_roxy = FakeRoxy()
+    runner = BrowserProbeRunner(
+        settings(),
+        workspace_id=None,
+        hold_seconds=0,
+        artifact_writer=ArtifactWriter(tmp_path),
+        mongo_manager=FakeMongo(),  # type: ignore[arg-type]
+        mailbox_client=FakeMailboxClient(),  # type: ignore[arg-type]
+        roxy_factory=lambda *_args, **_kwargs: fake_roxy,  # type: ignore[arg-type]
+        automation_factory=lambda *_args, **_kwargs: FakeAutomation(
+            AutomationResult(
+                "203.0.*.*",
+                "https://chatgpt.com/auth/login",
+                123,
+                "totp",
+                1_500,
+                FIXED_SUBMITTED_AT,
+            ),
+            [],
+        ),  # type: ignore[arg-type]
+    )
+    runner.store = fake_store  # type: ignore[assignment]
+    runner.resources = fake_resources  # type: ignore[assignment]
+
+    with pytest.raises(EmailStepError) as exc_info:
+        asyncio.run(runner.run())
+
+    assert exc_info.value.code == "existing_account_totp_required"
+    assert fake_resources.discarded == [("email-id", runner.owner)]
+    assert fake_resources.released == []
+    assert runner.email_consumed is True
 
 
 def test_cancellation_cleans_browser_proxy_email_and_lock(tmp_path: Path) -> None:

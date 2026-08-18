@@ -281,6 +281,28 @@ async def _run_worker(
 
     async def progress(stage: str, details: dict[str, Any]) -> None:
         nonlocal current_stage
+        mailbox_poll = details.get("mailboxPoll")
+        if isinstance(mailbox_poll, dict):
+            event_queue.put(
+                {
+                    "type": "mailbox_poll",
+                    "runId": config["runId"],
+                    "workerId": config["workerId"],
+                    "details": dict(mailbox_poll),
+                }
+            )
+            return
+        verification_fill = details.get("verificationFill")
+        if isinstance(verification_fill, dict):
+            event_queue.put(
+                {
+                    "type": "verification_fill",
+                    "runId": config["runId"],
+                    "workerId": config["workerId"],
+                    "details": dict(verification_fill),
+                }
+            )
+            return
         if stage != "cleanup":
             current_stage = stage
         event: dict[str, Any] = {
@@ -333,6 +355,7 @@ async def _run_worker(
         progress_callback=progress,
         registration_country=str(config.get("registrationCountry") or "") or None,
         registration_proxy_group=str(config.get("registrationProxyGroup") or "") or None,
+        two_factor_delay_seconds=20,
     )
     task = asyncio.create_task(runner.run(), name=f"probe-{config['workerId']}")
     cancelled = False

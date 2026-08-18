@@ -23,20 +23,25 @@ DEFAULT_SETTINGS_PATH = Path(
 )
 LEGACY_BROWSER_PATH = r"D:\ImRun Browser\ImRun Browser.exe"
 DEFAULT_BROWSER_PATH = r"D:\RoxyBrowser\RoxyBrowser.exe"
+DEFAULT_ANT_BROWSER_PATH = r"D:\AntBrowser\AntBrowser.exe"
 
 
 class ExecutionSettingsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    browserProvider: Literal["roxy", "ant"] = "roxy"
     browserExecutablePath: str = Field(min_length=1)
     roxyApiKey: SecretStr
     roxyApiPort: int = Field(ge=1, le=65535, strict=True)
+    antBrowserExecutablePath: str = DEFAULT_ANT_BROWSER_PATH
+    antApiKey: SecretStr = SecretStr("")
+    antApiPort: int = Field(default=19876, ge=1, le=65535, strict=True)
     headless: bool = Field(strict=True)
     proxyRetryCount: int = Field(ge=0, le=5, strict=True)
     concurrency: int = Field(ge=1, le=12, strict=True)
     taskTimeoutSeconds: int = Field(ge=0, strict=True)
 
-    @field_validator("browserExecutablePath")
+    @field_validator("browserExecutablePath", "antBrowserExecutablePath")
     @classmethod
     def validate_browser_path(cls, value: str) -> str:
         stripped = value.strip()
@@ -54,16 +59,20 @@ class StoredExecutionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schemaVersion: Literal[2] = 2
+    browserProvider: Literal["roxy", "ant"] = "roxy"
     browserExecutablePath: str
     roxyApiKey: SecretStr = SecretStr("")
     roxyApiPort: int = Field(ge=1, le=65535, strict=True)
+    antBrowserExecutablePath: str = DEFAULT_ANT_BROWSER_PATH
+    antApiKey: SecretStr = SecretStr("")
+    antApiPort: int = Field(default=19876, ge=1, le=65535, strict=True)
     headless: bool = Field(strict=True)
     proxyRetryCount: int = Field(ge=0, le=5, strict=True)
     concurrency: int = Field(ge=1, le=12, strict=True)
     taskTimeoutSeconds: int = Field(ge=0, strict=True)
     updatedAt: datetime | None = None
 
-    @field_validator("browserExecutablePath")
+    @field_validator("browserExecutablePath", "antBrowserExecutablePath")
     @classmethod
     def validate_browser_path(cls, value: str) -> str:
         stripped = value.strip()
@@ -76,9 +85,13 @@ class ExecutionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schemaVersion: Literal[2] = 2
+    browserProvider: Literal["roxy", "ant"]
     browserExecutablePath: str
     roxyApiKey: str
     roxyApiPort: int
+    antBrowserExecutablePath: str
+    antApiKey: str
+    antApiPort: int
     headless: bool
     proxyRetryCount: int
     concurrency: int
@@ -89,9 +102,13 @@ class ExecutionSettings(BaseModel):
     def from_stored(cls, settings: StoredExecutionSettings) -> "ExecutionSettings":
         return cls(
             schemaVersion=2,
+            browserProvider=settings.browserProvider,
             browserExecutablePath=settings.browserExecutablePath,
             roxyApiKey=settings.roxyApiKey.get_secret_value(),
             roxyApiPort=settings.roxyApiPort,
+            antBrowserExecutablePath=settings.antBrowserExecutablePath,
+            antApiKey=settings.antApiKey.get_secret_value(),
+            antApiPort=settings.antApiPort,
             headless=settings.headless,
             proxyRetryCount=settings.proxyRetryCount,
             concurrency=settings.concurrency,
@@ -116,9 +133,13 @@ class CorruptSettingsError(RuntimeError):
 
 def default_settings() -> StoredExecutionSettings:
     return StoredExecutionSettings(
+        browserProvider="roxy",
         browserExecutablePath=DEFAULT_BROWSER_PATH,
         roxyApiKey=SecretStr(""),
         roxyApiPort=50000,
+        antBrowserExecutablePath=DEFAULT_ANT_BROWSER_PATH,
+        antApiKey=SecretStr(""),
+        antApiPort=19876,
         headless=False,
         proxyRetryCount=1,
         concurrency=2,
@@ -181,9 +202,13 @@ class SettingsStore:
         with self._lock:
             existing = self._load_existing() if self.path.exists() else default_settings()
             settings = StoredExecutionSettings(
+                browserProvider=incoming.browserProvider,
                 browserExecutablePath=incoming.browserExecutablePath,
                 roxyApiKey=incoming.roxyApiKey,
                 roxyApiPort=incoming.roxyApiPort,
+                antBrowserExecutablePath=incoming.antBrowserExecutablePath,
+                antApiKey=incoming.antApiKey,
+                antApiPort=incoming.antApiPort,
                 headless=incoming.headless,
                 proxyRetryCount=incoming.proxyRetryCount,
                 concurrency=incoming.concurrency,
@@ -195,6 +220,7 @@ class SettingsStore:
 
             payload = settings.model_dump(mode="json")
             payload["roxyApiKey"] = settings.roxyApiKey.get_secret_value()
+            payload["antApiKey"] = settings.antApiKey.get_secret_value()
             try:
                 with self.temp_path.open("w", encoding="utf-8", newline="\n") as handle:
                     json.dump(payload, handle, ensure_ascii=False, indent=2)

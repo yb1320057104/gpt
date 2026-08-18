@@ -244,8 +244,8 @@ export const useAppStore = defineStore('app', {
       return deleted
     },
 
-    async checkAccountPromotions(ids: string[]) {
-      const result = await dataGateway.checkAccountPromotions(ids)
+    async checkAccountPromotions(ids: string[], proxyId?: string) {
+      const result = await dataGateway.checkAccountPromotions(ids, proxyId)
       await Promise.all([this.refreshAccounts(), this.refreshStats()])
       return result
     },

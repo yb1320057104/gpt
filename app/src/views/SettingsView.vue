@@ -18,11 +18,19 @@ import {
 } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import { proxyKey } from '@/services/parsers'
+import { dataGateway } from '@/services/dataGateway'
 import { COMMON_REGISTRATION_COUNTRIES, countryLabel, normalizeCountryCode } from '@/services/countries'
 import ImportDialog from '@/components/ImportDialog.vue'
 import SecretCell from '@/components/SecretCell.vue'
 import StatCard from '@/components/StatCard.vue'
-import type { ExecutionSettingsInput, ImportResult, ProxyGroupSummary, ProxyRecord, ResourceQuery } from '@/types'
+import type {
+  ExecutionSettingsInput,
+  ImportResult,
+  ProxyGroupSummary,
+  ProxyRecord,
+  ProxySubscriptionProvider,
+  ResourceQuery,
+} from '@/types'
 
 const store = useAppStore()
 const formRef = ref<FormInstance>()
@@ -37,11 +45,23 @@ const selectedProxyIds = ref<string[]>([])
 const proxyCountryFilter = ref('')
 const importCountry = ref('')
 const importGroup = ref('默认组')
+const subscriptionProvider = ref<ProxySubscriptionProvider>('easy-proxies')
+const subscriptionUrl = ref('')
+const subscriptionManagerUrl = ref('http://127.0.0.1:9091')
+const subscriptionAdminToken = ref('')
+const subscriptionProxyToken = ref('')
+const subscriptionName = ref('AutoRegister')
+const subscriptionImporting = ref(false)
 const proxyMutation = ref<'selected' | 'all' | `single:${string}` | null>(null)
+const proxyTesting = ref<'all' | string | null>(null)
 const form = reactive<ExecutionSettingsInput>({
+  browserProvider: store.settings.browserProvider,
   browserExecutablePath: store.settings.browserExecutablePath,
   roxyApiKey: store.settings.roxyApiKey,
   roxyApiPort: store.settings.roxyApiPort,
+  antBrowserExecutablePath: store.settings.antBrowserExecutablePath,
+  antApiKey: store.settings.antApiKey,
+  antApiPort: store.settings.antApiPort,
   headless: store.settings.headless,
   proxyRetryCount: store.settings.proxyRetryCount,
   concurrency: store.settings.concurrency,
@@ -51,9 +71,13 @@ const form = reactive<ExecutionSettingsInput>({
 watch(
   () => store.settings,
   (settings) => {
+    form.browserProvider = settings.browserProvider
     form.browserExecutablePath = settings.browserExecutablePath
     form.roxyApiKey = settings.roxyApiKey
     form.roxyApiPort = settings.roxyApiPort
+    form.antBrowserExecutablePath = settings.antBrowserExecutablePath
+    form.antApiKey = settings.antApiKey
+    form.antApiPort = settings.antApiPort
     form.headless = settings.headless
     form.proxyRetryCount = settings.proxyRetryCount
     form.concurrency = settings.concurrency
@@ -67,6 +91,9 @@ const rules: FormRules<ExecutionSettingsInput> = {
     { required: true, whitespace: true, message: '浏览器路径不能为空', trigger: 'blur' },
   ],
   roxyApiPort: [
+    { required: true, type: 'integer', min: 1, max: 65535, message: 'API 端口必须为 1–65535 的整数' },
+  ],
+  antApiPort: [
     { required: true, type: 'integer', min: 1, max: 65535, message: 'API 端口必须为 1–65535 的整数' },
   ],
   proxyRetryCount: [
@@ -115,9 +142,13 @@ async function saveSettings() {
   saving.value = true
   try {
     const payload: ExecutionSettingsInput = {
+      browserProvider: form.browserProvider,
       browserExecutablePath: form.browserExecutablePath,
       roxyApiKey: form.roxyApiKey,
       roxyApiPort: form.roxyApiPort,
+      antBrowserExecutablePath: form.antBrowserExecutablePath,
+      antApiKey: form.antApiKey,
+      antApiPort: form.antApiPort,
       headless: form.headless,
       proxyRetryCount: form.proxyRetryCount,
       concurrency: form.concurrency,
@@ -141,6 +172,60 @@ async function submitProxyImport(rawText: string) {
 async function afterProxyImport(_result: ImportResult) {
   proxyPage.value = 1
   await loadProxies()
+}
+
+watch(subscriptionProvider, (provider) => {
+  subscriptionManagerUrl.value = provider === 'easy-proxies'
+    ? 'http://127.0.0.1:9091'
+    : 'http://127.0.0.1:2260'
+})
+
+async function importSubscription() {
+  if (!subscriptionUrl.value.trim()) {
+    ElMessage.warning('请填写订阅链接')
+    return
+  }
+  subscriptionImporting.value = true
+  try {
+    const result = await dataGateway.importProxySubscription({
+      provider: subscriptionProvider.value,
+      subscriptionUrl: subscriptionUrl.value.trim(),
+      managerUrl: subscriptionManagerUrl.value.trim(),
+      adminToken: subscriptionAdminToken.value,
+      proxyToken: subscriptionProxyToken.value,
+      name: subscriptionName.value.trim() || 'AutoRegister',
+      group: importGroup.value.trim() || '默认组',
+      probeTimeoutSeconds: 12,
+    })
+    await loadProxies()
+    const countrySummary = result.countries
+      .map((item) => `${countryLabel(item.country)} ${item.count} 条 / ${item.averageLatencyMs}ms`)
+      .join('；')
+    ElMessage.success(
+      `检测 ${result.testedProxyCount} 条，可用 ${result.usableProxyCount} 条，新增 ${result.importResult.imported} 条。${countrySummary}`,
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '订阅代理导入失败')
+  } finally {
+    subscriptionImporting.value = false
+  }
+}
+
+async function testProxies(group?: ProxyGroupSummary) {
+  if (proxyTesting.value) return
+  proxyTesting.value = group ? proxyGroupKey(group) : 'all'
+  try {
+    const result = await dataGateway.testProxies(group?.country, group?.group)
+    await Promise.all([loadProxies(), store.refreshStats()])
+    ElMessage.success(
+      `检测 ${result.tested} 条，可用 ${result.available} 条，失败 ${result.failed} 条` +
+      (result.averageLatencyMs ? `，平均延迟 ${result.averageLatencyMs}ms` : ''),
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '代理检测失败')
+  } finally {
+    proxyTesting.value = null
+  }
 }
 
 async function toggleProxyGroup(group: ProxyGroupSummary, value: string | number | boolean) {
@@ -181,12 +266,16 @@ async function renameProxyGroup(group: ProxyGroupSummary) {
 async function changeProxyGroupCountry(group: ProxyGroupSummary, country: string) {
   const normalized = normalizeCountryCode(country)
   if (normalized === 'ZZ' || normalized === group.country) return
-  await store.updateProxyGroup({
-    country: group.country,
-    group: group.group,
-    newCountry: normalized,
-  })
-  ElMessage.success(`分组“${group.group}”已移动到 ${countryLabel(normalized)}`)
+  try {
+    await store.updateProxyGroup({
+      country: group.country,
+      group: group.group,
+      newCountry: normalized,
+    })
+    ElMessage.success(`分组“${group.group}”已移动到 ${countryLabel(normalized)}`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '代理国家更新失败')
+  }
 }
 
 async function removeProxyGroup(group: ProxyGroupSummary) {
@@ -423,16 +512,23 @@ onMounted(() => void loadProxies())
           <div class="api-settings-card">
             <div class="api-settings-title">
               <span>指纹浏览器本地API</span>
-              <el-tag :type="form.roxyApiKey.trim() ? 'success' : 'warning'" size="small" round>
-                {{ form.roxyApiKey.trim() ? '密钥已配置' : '等待配置' }}
+              <el-tag :type="form.browserProvider === 'ant' || form.roxyApiKey.trim() ? 'success' : 'warning'" size="small" round>
+                {{ form.browserProvider === 'ant' ? 'Ant Browser' : (form.roxyApiKey.trim() ? '密钥已配置' : '等待配置') }}
               </el-tag>
             </div>
+            <el-form-item label="指纹浏览器类型" prop="browserProvider">
+              <el-radio-group v-model="form.browserProvider">
+                <el-radio-button value="roxy">Roxy Browser</el-radio-button>
+                <el-radio-button value="ant">Ant Browser</el-radio-button>
+              </el-radio-group>
+              <small>切换浏览器不会修改或删除原有 Roxy 配置。</small>
+            </el-form-item>
             <div class="api-input-grid">
-              <el-form-item class="browser-path-field" label="指纹浏览器地址" prop="browserExecutablePath">
+              <el-form-item v-if="form.browserProvider === 'roxy'" class="browser-path-field" label="指纹浏览器地址（Roxy）" prop="browserExecutablePath">
                 <el-input v-model="form.browserExecutablePath" class="mono" placeholder="D:\RoxyBrowser\RoxyBrowser.exe" />
                 <small>本地 API 不在线时将从此地址启动客户端</small>
               </el-form-item>
-              <el-form-item label="Roxy API Key" prop="roxyApiKey">
+              <el-form-item v-if="form.browserProvider === 'roxy'" label="Roxy API Key" prop="roxyApiKey">
                 <el-input
                   v-model="form.roxyApiKey"
                   class="mono"
@@ -442,8 +538,18 @@ onMounted(() => void loadProxies())
                   placeholder="请输入 Roxy API Key"
                 />
               </el-form-item>
-              <el-form-item label="API 端口" prop="roxyApiPort">
+              <el-form-item v-if="form.browserProvider === 'roxy'" label="Roxy API 端口" prop="roxyApiPort">
                 <el-input-number v-model="form.roxyApiPort" :min="1" :max="65535" :step="1" controls-position="right" />
+              </el-form-item>
+              <el-form-item v-if="form.browserProvider === 'ant'" class="browser-path-field" label="Ant Browser 地址" prop="antBrowserExecutablePath">
+                <el-input v-model="form.antBrowserExecutablePath" class="mono" placeholder="D:\AntBrowser\AntBrowser.exe" />
+                <small>Ant API 离线时会尝试从此地址启动客户端。</small>
+              </el-form-item>
+              <el-form-item v-if="form.browserProvider === 'ant'" label="Ant API Key" prop="antApiKey">
+                <el-input v-model="form.antApiKey" class="mono" type="text" autocomplete="off" :spellcheck="false" placeholder="未启用鉴权时可以留空" />
+              </el-form-item>
+              <el-form-item v-if="form.browserProvider === 'ant'" label="Ant API 端口" prop="antApiPort">
+                <el-input-number v-model="form.antApiPort" :min="1" :max="65535" :step="1" controls-position="right" />
               </el-form-item>
             </div>
             <div class="headless-row">
@@ -509,11 +615,60 @@ onMounted(() => void loadProxies())
         >
           清空代理池
         </el-button>
-        <el-tooltip content="等待 Playwright 执行器接入" placement="top">
-          <span><el-button :icon="Refresh" disabled>检测全部</el-button></span>
-        </el-tooltip>
+        <el-button
+          :icon="Refresh"
+          :loading="proxyTesting === 'all'"
+          :disabled="Boolean(proxyTesting) || store.proxyTotal === 0"
+          @click="testProxies()"
+        >检测全部</el-button>
         <el-button type="primary" :icon="DocumentAdd" @click="importOpen = true">导入代理</el-button>
       </div>
+    </div>
+
+    <div class="panel subscription-panel">
+      <div class="subscription-heading">
+        <div>
+          <h3>订阅代理导入</h3>
+          <p>读取订阅后逐个检测可用性、延迟和出口国家，仅把检测成功的节点按国家导入现有代理池。</p>
+        </div>
+        <el-tag effect="plain">本机适配器</el-tag>
+      </div>
+      <el-form label-position="top">
+        <div class="subscription-grid">
+          <el-form-item label="转换引擎">
+            <el-select v-model="subscriptionProvider" style="width: 100%">
+              <el-option label="Easy Proxies（每节点独立端口）" value="easy-proxies" />
+              <el-option label="Resin（统一健康代理池）" value="resin" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="管理地址">
+            <el-input v-model="subscriptionManagerUrl" placeholder="http://127.0.0.1:9091" />
+          </el-form-item>
+          <el-form-item label="订阅名称">
+            <el-input v-model="subscriptionName" maxlength="128" placeholder="AutoRegister" />
+          </el-form-item>
+          <el-form-item label="管理密码 / Admin Token">
+            <el-input v-model="subscriptionAdminToken" type="password" show-password autocomplete="off" placeholder="留空使用 app/.env 配置" />
+          </el-form-item>
+          <el-form-item v-if="subscriptionProvider === 'resin'" label="Resin Proxy Token">
+            <el-input v-model="subscriptionProxyToken" type="password" show-password autocomplete="off" placeholder="留空使用 app/.env 配置" />
+          </el-form-item>
+          <el-form-item class="subscription-url-field" label="订阅链接">
+            <el-input v-model="subscriptionUrl" type="textarea" :rows="2" resize="none" placeholder="https://example.com/subscription" />
+          </el-form-item>
+        </div>
+        <div class="subscription-actions">
+          <small v-if="subscriptionProvider === 'easy-proxies'">
+            使用 D:\baiduProject\代理池\easy-proxies，默认管理端口 9091；出口国家会自动识别，无需手动选择。
+          </small>
+          <small v-else>
+            使用 D:\baiduProject\代理池\Resin，默认端口 2260；每个身份都会经过真实出口检测后再导入。
+          </small>
+          <el-button type="primary" :loading="subscriptionImporting" @click="importSubscription">
+            读取订阅并导入代理池
+          </el-button>
+        </div>
+      </el-form>
     </div>
 
     <div class="stats-grid proxy-stats">
@@ -561,8 +716,16 @@ onMounted(() => void loadProxies())
         <el-table-column prop="enabled" label="已启用" width="100" />
         <el-table-column prop="available" label="健康可用" width="110" />
         <el-table-column prop="quarantined" label="隔离" width="90" />
-        <el-table-column label="操作" width="90" fixed="right">
+        <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
+            <el-button
+              text
+              type="primary"
+              :icon="Refresh"
+              :loading="proxyTesting === proxyGroupKey(row)"
+              :disabled="Boolean(proxyTesting)"
+              @click="testProxies(row)"
+            >检测</el-button>
             <el-button text type="danger" :icon="Delete" aria-label="删除代理分组" @click="removeProxyGroup(row)" />
           </template>
         </el-table-column>
@@ -766,6 +929,47 @@ onMounted(() => void loadProxies())
   margin: 0;
 }
 
+.subscription-panel {
+  margin: 16px 0;
+  padding: 20px;
+}
+
+.subscription-heading,
+.subscription-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.subscription-heading {
+  margin-bottom: 18px;
+}
+
+.subscription-heading h3,
+.subscription-heading p {
+  margin: 0;
+}
+
+.subscription-heading p,
+.subscription-actions small {
+  color: var(--text-soft);
+}
+
+.subscription-heading p {
+  margin-top: 5px;
+}
+
+.subscription-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0 14px;
+}
+
+.subscription-url-field {
+  grid-column: 1 / -1;
+}
+
 .proxy-heading h2 {
   font-size: 18px;
 }
@@ -796,6 +1000,14 @@ onMounted(() => void loadProxies())
 }
 
 @media (max-width: 900px) {
+  .subscription-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .subscription-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
   .api-input-grid {
     grid-template-columns: minmax(0, 1fr) 150px;
   }

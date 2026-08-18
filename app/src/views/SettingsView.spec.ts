@@ -65,7 +65,7 @@ describe('SettingsView Roxy execution settings', () => {
     expect(wrapper.text()).not.toContain('ImRun Browser')
     expect(apiKeyInput(wrapper).attributes('type')).toBe('text')
     expect((apiKeyInput(wrapper).element as HTMLInputElement).value).toBe(TEST_API_KEY)
-    expect(wrapper.find('input[type="password"]').exists()).toBe(false)
+    expect(apiCard.find('input[type="password"]').exists()).toBe(false)
     expect(wrapper.text()).toContain('密钥已配置')
     const sideCards = wrapper.get('.config-side')
     expect(sideCards.findAllComponents({ name: 'StatCard' })).toHaveLength(2)
@@ -80,9 +80,13 @@ describe('SettingsView Roxy execution settings', () => {
     const save = vi.spyOn(store, 'saveSettings').mockImplementation(async (input) => {
       store.settings = {
         schemaVersion: 2,
+        browserProvider: input.browserProvider,
         browserExecutablePath: input.browserExecutablePath,
         roxyApiKey: input.roxyApiKey,
         roxyApiPort: input.roxyApiPort,
+        antBrowserExecutablePath: input.antBrowserExecutablePath,
+        antApiKey: input.antApiKey,
+        antApiPort: input.antApiPort,
         headless: input.headless,
         proxyRetryCount: input.proxyRetryCount,
         concurrency: input.concurrency,

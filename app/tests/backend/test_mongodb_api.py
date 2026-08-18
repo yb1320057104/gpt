@@ -18,7 +18,14 @@ from backend.resource_models import (
     AccountExportInput,
     AccountPlanCheckItem,
     AccountPlanCheckResult,
+    ProxyGroupUpdate,
 )
+
+
+def test_unclassified_proxy_group_can_be_selected_for_reclassification() -> None:
+    payload = ProxyGroupUpdate(country="zz", group="默认组", newCountry="jp")
+    assert payload.country == "ZZ"
+    assert payload.newCountry == "JP"
 
 
 def test_resource_records_expose_browser_ready_api798_urls(monkeypatch) -> None:
@@ -143,9 +150,13 @@ class FakeOnlineMongo(MongoManager):
 class FakePlanCheckService:
     def __init__(self) -> None:
         self.ids: list[str] = []
+        self.proxy_id: str | None = None
 
-    async def check_accounts(self, ids: list[str]) -> AccountPlanCheckResult:
+    async def check_accounts(
+        self, ids: list[str], *, proxy_id: str | None = None
+    ) -> AccountPlanCheckResult:
         self.ids = ids
+        self.proxy_id = proxy_id
         return AccountPlanCheckResult(
             requested=len(ids),
             succeeded=1,
@@ -180,11 +191,12 @@ def test_promotion_check_api_uses_account_id_batch(tmp_path: Path) -> None:
 
     response = client.post(
         "/api/accounts/check-promotion",
-        json={"ids": ["one", "two"]},
+        json={"ids": ["one", "two"], "proxyId": "proxy-fixed"},
     )
 
     assert response.status_code == 200
     assert service.ids == ["one", "two"]
+    assert service.proxy_id == "proxy-fixed"
     assert response.json()["succeeded"] == 1
     assert response.json()["skipped"] == 1
 
@@ -229,6 +241,35 @@ def test_server_side_import_validation_and_proxy_password_colons() -> None:
             "TEST_PASSWORD:tail",
         )
     }
+
+
+def test_proxy_import_accepts_yaml_proxy_lists() -> None:
+    store = ImportStore()
+    service = ResourceService(store)  # type: ignore[arg-type]
+    result = asyncio.run(service.import_proxies("""
+proxies:
+  - name: jp-one
+    type: socks5
+    server: jp.proxy.test
+    port: 1080
+    username: yaml-user
+    password: yaml-pass
+    country: JP
+    group: YAML-JP
+  - name: us-one
+    type: http
+    server: us.proxy.test
+    port: 8080
+    username: yaml-user-2
+    password: yaml-pass-2
+    country_code: US
+"""))
+
+    assert result.model_dump() == {
+        "total": 2, "imported": 2, "duplicateCount": 0, "errorCount": 0
+    }
+    assert store.proxy_schemes == ["socks5", "http"]
+    assert store.proxy_groups[0] == "YAML-JP"
 
 
 def test_server_side_import_accepts_mailcom_password_without_public_exposure() -> None:

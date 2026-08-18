@@ -15,6 +15,8 @@ from .mongo_manager import MongoManager
 PROBE_LOCK_ID = "browser_probe_controller"
 WORKSPACE_LOCK_PREFIX = "browser_probe_workspace:"
 DEFAULT_PROXY_GROUP = "默认组"
+LOCAL_PROXY_GROUP = "__local_127_0_0_1_7890__"
+LOCAL_PROXY_ID_PREFIX = "local-7890:"
 
 
 def utc_now() -> datetime:
@@ -273,10 +275,6 @@ class MongoProbeStore:
         query: dict[str, Any] = {
             "enabled": True,
             "status": {"$ne": "quarantined"},
-            "$or": [
-                {"leaseUntil": {"$lte": now}},
-                {"leaseUntil": {"$exists": False}},
-            ],
         }
         if excluded_ids:
             query["_id"] = {"$nin": sorted(excluded_ids)}
@@ -332,6 +330,8 @@ class MongoProbeStore:
     async def count_eligible_proxies(
         self, country: str | None = None, group: str | None = None
     ) -> int:
+        if group == LOCAL_PROXY_GROUP:
+            return 10000
         return int(
             await self._guard(
                 self.proxies.count_documents(
@@ -349,6 +349,17 @@ class MongoProbeStore:
         country: str | None = None,
         group: str | None = None,
     ) -> ProxyLease | None:
+        if group == LOCAL_PROXY_GROUP:
+            return ProxyLease(
+                id=f"{LOCAL_PROXY_ID_PREFIX}{owner}",
+                host="127.0.0.1",
+                port=7890,
+                username="",
+                password="",
+                country=str(country or "ZZ").upper(),
+                group=LOCAL_PROXY_GROUP,
+                scheme="http",
+            )
         now = utc_now()
         document = await self._guard(
             self.proxies.find_one_and_update(
@@ -356,11 +367,12 @@ class MongoProbeStore:
                 {
                     "$set": {
                         "lastSelectedAt": now,
-                        "leaseOwner": owner,
-                        "leaseUntil": now + timedelta(seconds=lease_seconds),
-                    }
+                    },
+                    "$addToSet": {"activeLeaseOwners": owner},
+                    "$inc": {"activeLeaseCount": 1},
                 },
                 sort=[
+                    ("activeLeaseCount", ASCENDING),
                     ("lastSelectedAt", ASCENDING),
                     ("createdAt", ASCENDING),
                     ("_id", ASCENDING),
@@ -387,11 +399,49 @@ class MongoProbeStore:
         )
 
     async def release_proxy(self, proxy_id: str, owner: str) -> None:
+        if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return
         await self._guard(
             self.proxies.update_one(
-                {"_id": proxy_id, "leaseOwner": owner},
-                {"$unset": {"leaseOwner": "", "leaseUntil": ""}},
+                {"_id": proxy_id, "activeLeaseOwners": owner},
+                {
+                    "$pull": {"activeLeaseOwners": owner},
+                    "$inc": {"activeLeaseCount": -1},
+                    "$unset": {"leaseOwner": "", "leaseUntil": ""},
+                },
             )
+        )
+
+    async def acquire_proxy_by_id(
+        self,
+        proxy_id: str,
+        owner: str,
+        *,
+        lease_seconds: int = 180,
+    ) -> ProxyLease | None:
+        now = utc_now()
+        document = await self._guard(
+            self.proxies.find_one_and_update(
+                {"$and": [self._available_proxy_filter(now), {"_id": proxy_id}]},
+                {
+                    "$set": {"lastSelectedAt": now},
+                    "$addToSet": {"activeLeaseOwners": owner},
+                    "$inc": {"activeLeaseCount": 1},
+                },
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+        if document is None:
+            return None
+        return ProxyLease(
+            id=str(document["_id"]),
+            host=str(document["host"]),
+            port=int(document["port"]),
+            username=str(document.get("username") or ""),
+            password=str(document.get("password") or ""),
+            country=str(document.get("country") or "ZZ").upper(),
+            group=str(document.get("group") or DEFAULT_PROXY_GROUP),
+            scheme=str(document.get("scheme") or "http").lower(),
         )
 
     async def heartbeat_proxy(
@@ -401,15 +451,13 @@ class MongoProbeStore:
         *,
         lease_seconds: int = 180,
     ) -> bool:
+        if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return True
         now = utc_now()
         result = await self._guard(
             self.proxies.update_one(
-                {"_id": proxy_id, "leaseOwner": owner},
-                {
-                    "$set": {
-                        "leaseUntil": now + timedelta(seconds=lease_seconds),
-                    }
-                },
+                {"_id": proxy_id, "activeLeaseOwners": owner},
+                {"$set": {"lastLeaseHeartbeatAt": now}},
             )
         )
         return bool(result.modified_count or result.matched_count)
@@ -417,13 +465,19 @@ class MongoProbeStore:
     async def release_proxy_owner(self, owner: str) -> int:
         result = await self._guard(
             self.proxies.update_many(
-                {"leaseOwner": owner},
-                {"$unset": {"leaseOwner": "", "leaseUntil": ""}},
+                {"$or": [{"activeLeaseOwners": owner}, {"leaseOwner": owner}]},
+                {
+                    "$pull": {"activeLeaseOwners": owner},
+                    "$inc": {"activeLeaseCount": -1},
+                    "$unset": {"leaseOwner": "", "leaseUntil": ""},
+                },
             )
         )
         return int(result.modified_count)
 
     async def record_proxy_success(self, proxy_id: str, latency_ms: int) -> None:
+        if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return
         await self._guard(
             self.proxies.update_one(
                 {"_id": proxy_id},

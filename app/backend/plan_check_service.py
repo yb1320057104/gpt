@@ -5,6 +5,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from .chatgpt_plan import PlanCheckError, check_account_plan_curl
+from .checkout_type import CheckoutTypeCheckError, check_checkout_type_curl
 from .oai_iprocket_chain_bridge import ensure_background_server
 from .oai_payment_extractor.transport import chain_bridge_proxy_url
 from .probe_store import MongoProbeStore, ProxyLease
@@ -47,6 +48,16 @@ def proxy_url(lease: ProxyLease) -> str:
     return f"http://{authority}"
 
 
+def timezone_offset_for_country(country: str) -> str:
+    # API expects JavaScript Date.getTimezoneOffset semantics (UTC - local).
+    return {
+        "JP": "-540", "KR": "-540", "TR": "-180", "SG": "-480",
+        "HK": "-480", "TW": "-480", "GB": "0", "DE": "-60",
+        "FR": "-60", "US": "300", "CA": "300", "BR": "180",
+        "AU": "-600", "PH": "-480",
+    }.get(country, "0")
+
+
 class AccountPlanCheckService:
     def __init__(
         self,
@@ -59,21 +70,25 @@ class AccountPlanCheckService:
         self.proxies = proxies
         self.max_concurrency = max(1, max_concurrency)
 
-    async def check_accounts(self, ids: list[str]) -> AccountPlanCheckResult:
+    async def check_accounts(
+        self, ids: list[str], *, proxy_id: str | None = None
+    ) -> AccountPlanCheckResult:
         unique_ids = list(dict.fromkeys(str(value) for value in ids))
         available = await self.proxies.count_eligible_proxies()
         semaphore = asyncio.Semaphore(
-            max(1, min(self.max_concurrency, available))
+            1 if proxy_id else max(1, min(self.max_concurrency, available))
         )
 
         async def check_one(account_id: str) -> AccountPlanCheckItem:
             async with semaphore:
-                return await self._check_one(account_id)
+                return await self._check_one(account_id, proxy_id=proxy_id)
 
         items = await asyncio.gather(*(check_one(account_id) for account_id in unique_ids))
         return self._result(list(items))
 
-    async def _check_one(self, account_id: str) -> AccountPlanCheckItem:
+    async def _check_one(
+        self, account_id: str, *, proxy_id: str | None = None
+    ) -> AccountPlanCheckItem:
         source = await self.resources.claim_account_plan_check(account_id)
         if source is None:
             return AccountPlanCheckItem(
@@ -83,7 +98,17 @@ class AccountPlanCheckService:
             )
 
         owner = f"plan:{uuid4()}"
-        lease = await self.proxies.acquire_proxy(owner, lease_seconds=120)
+        registration_country = str(source.get("registrationCountry") or "").upper()
+        if proxy_id:
+            lease = await self.proxies.acquire_proxy_by_id(
+                proxy_id, owner, lease_seconds=120
+            )
+        else:
+            lease = await self.proxies.acquire_proxy(
+                owner,
+                lease_seconds=120,
+                country=registration_country or None,
+            )
         if lease is None:
             error = PlanCheckError("no_eligible_proxy")
             await self.resources.store_account_plan_failure(account_id, error)
@@ -98,7 +123,9 @@ class AccountPlanCheckService:
                     check_account_plan_curl,
                     token,
                     proxy_url=proxy_url(lease),
-                    timezone_offset_min="-480",
+                    timezone_offset_min=timezone_offset_for_country(
+                        registration_country
+                    ),
                 )
             except PlanCheckError as exc:
                 await self.resources.store_account_plan_failure(account_id, exc)
@@ -128,6 +155,21 @@ class AccountPlanCheckService:
                     status="failed",
                     errorCode=error.code,
                 )
+            if registration_country:
+                try:
+                    checkout_result = await asyncio.to_thread(
+                        check_checkout_type_curl,
+                        token,
+                        proxy_url=proxy_url(lease),
+                        country=registration_country,
+                    )
+                    await self.resources.store_account_checkout_type(
+                        account_id, checkout_result
+                    )
+                except CheckoutTypeCheckError as exc:
+                    await self.resources.store_account_checkout_type_failure(
+                        account_id, exc
+                    )
             await self.proxies.record_proxy_success(lease.id, result.elapsed_ms)
             return AccountPlanCheckItem(id=account_id, status="success")
         finally:

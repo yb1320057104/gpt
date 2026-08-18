@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlparse, urlsplit
 from uuid import uuid4
 
+import yaml
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -41,7 +42,7 @@ from .resource_models import (
     TextExport,
 )
 from .chatgpt_plan import AccountPlanResult, PlanCheckError
-from .checkout_type import CheckoutTypeResult
+from .checkout_type import CheckoutTypeCheckError, CheckoutTypeResult
 from .totp import normalize_totp_secret
 
 
@@ -55,7 +56,7 @@ DEFAULT_PROXY_GROUP = "默认组"
 REGISTRATION_EXCLUDED_EMAIL_DOMAINS = tuple(
     domain.strip().casefold().lstrip("@")
     for domain in os.getenv(
-        "AUTOREGISTER_EXCLUDED_EMAIL_DOMAINS", "icloud.com"
+        "AUTOREGISTER_EXCLUDED_EMAIL_DOMAINS", ""
     ).split(",")
     if domain.strip().lstrip("@")
 )
@@ -213,6 +214,10 @@ class MongoResourceStore:
                 [("accountType", ASCENDING)], name="accounts_type"
             )
             await self.accounts.create_index(
+                [("registrationCountry", ASCENDING), ("createdAt", DESCENDING)],
+                name="accounts_registration_country_created",
+            )
+            await self.accounts.create_index(
                 [("sourceEmailId", ASCENDING)],
                 unique=True,
                 sparse=True,
@@ -308,21 +313,35 @@ class MongoResourceStore:
         page_size: PageSize,
         query: str,
         promotion: str = "",
+        country: str = "",
     ) -> Page[AccountRecord]:
         mongo_query: dict[str, Any] = {}
         if query.strip():
             mongo_query["emailNormalized"] = {
                 "$regex": re.escape(query.strip().lower()),
             }
+        if country.strip():
+            normalized_country = normalize_country_code(country)
+            if normalized_country == "ZZ":
+                mongo_query.setdefault("$and", []).append(
+                    {"$or": [
+                        {"registrationCountry": None},
+                        {"registrationCountry": {"$exists": False}},
+                    ]}
+                )
+            else:
+                mongo_query["registrationCountry"] = normalized_country
         if promotion == "untried_plus":
             mongo_query.update({"accountType": "free", "promotionEligible": True})
         elif promotion == "ineligible":
             mongo_query["promotionEligible"] = False
         elif promotion == "unchecked":
-            mongo_query["$or"] = [
-                {"promotionEligible": None},
-                {"promotionEligible": {"$exists": False}},
-            ]
+            mongo_query.setdefault("$and", []).append(
+                {"$or": [
+                    {"promotionEligible": None},
+                    {"promotionEligible": {"$exists": False}},
+                ]}
+            )
         total = await self._guard(self.accounts.count_documents(mongo_query))
         cursor = (
             self.accounts.find(mongo_query, {"accessToken": 0})
@@ -519,6 +538,7 @@ class MongoResourceStore:
                 projection={
                     "accessToken": 1,
                     "accessTokenExpiresAt": 1,
+                    "registrationCountry": 1,
                 },
                 return_document=ReturnDocument.AFTER,
             )
@@ -580,12 +600,28 @@ class MongoResourceStore:
                     "$set": {
                         "checkoutType": result.checkout_type,
                         "checkoutTypeCheckedAt": result.checked_at,
+                        "checkoutTypeErrorCode": None,
                     }
                 },
             )
         )
         if int(update.matched_count) != 1:
             raise ResourceNotFoundError("结账类型对应账号不存在")
+
+    async def store_account_checkout_type_failure(
+        self,
+        account_id: str,
+        error: CheckoutTypeCheckError,
+    ) -> None:
+        await self._guard(
+            self.accounts.update_one(
+                {"_id": account_id},
+                {"$set": {
+                    "checkoutTypeErrorCode": error.code,
+                    "checkoutTypeCheckedAt": utc_now(),
+                }},
+            )
+        )
 
     async def list_emails(
         self, page: int, page_size: PageSize, query: str, source: str = "all"
@@ -747,6 +783,12 @@ class MongoResourceStore:
             )
         )
 
+    async def discard_reserved_email(self, email_id: str, run_id: str) -> bool:
+        result = await self._guard(
+            self.emails.delete_one({"_id": email_id, "reservedBy": run_id})
+        )
+        return bool(result.deleted_count)
+
     async def release_run_reservations(self, run_id: str) -> None:
         await self._guard(
             self.emails.update_many(
@@ -885,6 +927,88 @@ class MongoResourceStore:
             page=page,
             pageSize=page_size,
         )
+
+    async def proxy_documents_for_test(
+        self,
+        country: str | None = None,
+        group: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        now = utc_now()
+        query: dict[str, Any] = {
+            "$and": [
+                {
+                    "$or": [
+                        {"activeLeaseOwners": {"$exists": False}},
+                        {"activeLeaseOwners": {"$size": 0}},
+                        {"activeLeaseCount": {"$lte": 0}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"leaseUntil": {"$exists": False}},
+                        {"leaseUntil": None},
+                        {"leaseUntil": {"$lte": now}},
+                    ]
+                },
+            ]
+        }
+        if country:
+            query = {"$and": [query, proxy_country_filter(country)]}
+        if group:
+            group_filter = {"group": normalize_proxy_group(group)}
+            query = {"$and": [query, group_filter]}
+        cursor = self.proxies.find(query).sort("lastCheckedAt", ASCENDING)
+        if limit is not None:
+            cursor = cursor.limit(max(1, limit))
+        return await self._guard(cursor.to_list(length=limit))
+
+    async def record_proxy_test(
+        self,
+        proxy_id: str,
+        *,
+        available: bool,
+        latency_ms: int | None = None,
+        country: str | None = None,
+    ) -> None:
+        changes: dict[str, Any] = {
+            "status": "available" if available else "quarantined",
+            "latencyMs": latency_ms if available else None,
+            "lastCheckedAt": utc_now(),
+        }
+        if available and country:
+            changes["country"] = normalize_country_code(country)
+        update: dict[str, Any] = {"$set": changes}
+        if available:
+            changes["consecutiveFailures"] = 0
+        else:
+            update["$inc"] = {"consecutiveFailures": 1}
+        await self._guard(self.proxies.update_one({"_id": proxy_id}, update))
+
+    async def delete_repeatedly_failed_proxies(self, threshold: int) -> int:
+        now = utc_now()
+        query = {
+            "status": "quarantined",
+            "consecutiveFailures": {"$gte": max(1, threshold)},
+            "$and": [
+                {
+                    "$or": [
+                        {"activeLeaseOwners": {"$exists": False}},
+                        {"activeLeaseOwners": {"$size": 0}},
+                        {"activeLeaseCount": {"$lte": 0}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"leaseUntil": {"$exists": False}},
+                        {"leaseUntil": None},
+                        {"leaseUntil": {"$lte": now}},
+                    ]
+                },
+            ],
+        }
+        result = await self._guard(self.proxies.delete_many(query))
+        return int(result.deleted_count)
 
     async def upsert_proxy(
         self,
@@ -1193,6 +1317,7 @@ class MongoResourceStore:
             promotionCampaignId=document.get("promotionCampaignId"),
             checkoutType=document.get("checkoutType"),
             checkoutTypeCheckedAt=document.get("checkoutTypeCheckedAt"),
+            checkoutTypeErrorCode=document.get("checkoutTypeErrorCode"),
             registrationCountry=document.get("registrationCountry"),
         )
 
@@ -1380,8 +1505,40 @@ class ResourceService:
     ) -> ImportResult:
         total = imported = duplicates = errors = 0
         seen: set[tuple[str, int, str, str, str]] = set()
-        for line in re.split(r"\s+", raw_text.lstrip("\ufeff").strip()):
+        cleaned = raw_text.lstrip("\ufeff").strip()
+        entries: list[tuple[str, str | None, str | None]] = []
+        if re.search(r"(?m)^\s*proxies\s*:", cleaned):
+            try:
+                document = yaml.safe_load(cleaned)
+            except yaml.YAMLError:
+                document = None
+            nodes = document.get("proxies") if isinstance(document, dict) else None
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        entries.append(("", None, None))
+                        continue
+                    scheme = str(node.get("type") or node.get("scheme") or "http").lower()
+                    if scheme == "socks":
+                        scheme = "socks5"
+                    host = str(node.get("server") or node.get("host") or "").strip()
+                    port = node.get("port")
+                    username = quote(str(node.get("username") or node.get("user") or ""), safe="")
+                    password = quote(str(node.get("password") or node.get("pass") or ""), safe="")
+                    entries.append((
+                        f"{scheme}://{username}:{password}@{host}:{port}",
+                        str(node.get("country") or node.get("country_code") or "").strip() or None,
+                        str(node.get("group") or "").strip() or None,
+                    ))
+            else:
+                entries.append(("", None, None))
+        else:
+            entries = [(line, None, None) for line in re.split(r"\s+", cleaned)]
+
+        for line, entry_country, entry_group in entries:
             if not line:
+                total += 1
+                errors += 1
                 continue
             total += 1
             scheme = "http"
@@ -1419,7 +1576,9 @@ class ResourceService:
                 continue
             seen.add(key)
             if await self.store.upsert_proxy(
-                key[0], key[1], key[2], key[3], scheme=key[4], country=country, group=group
+                key[0], key[1], key[2], key[3], scheme=key[4],
+                country=entry_country or country,
+                group=entry_group or group,
             ):
                 imported += 1
             else:

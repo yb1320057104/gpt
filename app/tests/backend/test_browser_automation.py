@@ -60,7 +60,7 @@ class FakeBodyLocator:
 
     async def inner_text(self, timeout: int) -> str:
         _ = timeout
-        stage = "ip" if "ipify" in self.page.url else "login"
+        stage = "ip" if self.page.url == IP_CHECK_URL else "login"
         error = self.page.body_errors.get(stage)
         if error is not None:
             raise error
@@ -332,7 +332,7 @@ class FakePage:
         enable_during_click: bool = False,
         goto_errors: dict[str, Exception] | None = None,
         body_errors: dict[str, Exception] | None = None,
-        ip_body: str = '{"ip":"203.0.113.42"}',
+        ip_body: str = '{"success":true,"ip":"203.0.113.42","country_code":"TR"}',
         next_step: str = "password",
         fill_error: Exception | None = None,
         click_error: Exception | None = None,
@@ -470,7 +470,7 @@ class FakePage:
     async def goto(self, url: str, **kwargs: object) -> None:
         self.goto_calls.append((url, kwargs.get("wait_until"), kwargs.get("timeout")))
         self.url = url
-        stage = "ip" if "ipify" in url else "login"
+        stage = "ip" if url == IP_CHECK_URL else "login"
         error = self.goto_errors.get(stage)
         if error is not None:
             raise error
@@ -1431,6 +1431,7 @@ def test_cdp_probe_masks_ip_strips_query_and_saves_screenshot(tmp_path: Path) ->
     result = asyncio.run(scenario())
 
     assert result.egress_ip_masked == "203.0.*.*"
+    assert result.egress_country == "TR"
     assert result.final_url == "https://chatgpt.com/auth/login"
     assert result.next_step == "password"
     assert result.pre_continue_delay_ms == 5_000
@@ -1451,7 +1452,7 @@ def test_cdp_probe_masks_ip_strips_query_and_saves_screenshot(tmp_path: Path) ->
     assert page.click_timeout == 10_000
     assert page.get_by_role_calls == []
     assert page.goto_calls == [
-        ("https://api64.ipify.org?format=json", "domcontentloaded", 90_000),
+        (IP_CHECK_URL, "domcontentloaded", 90_000),
         (
             "https://chatgpt.com/auth/login?openaicom_referred=true",
             "domcontentloaded",

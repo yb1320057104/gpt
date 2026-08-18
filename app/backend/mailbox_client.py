@@ -5,6 +5,7 @@ import hashlib
 import imaplib
 import ipaddress
 import json
+import logging
 import os
 import re
 import socket
@@ -22,6 +23,7 @@ import requests
 
 
 UTC = timezone.utc
+LOGGER = logging.getLogger(__name__)
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 PUBLIC_DNS_URL = "https://dns.google/resolve"
@@ -34,6 +36,36 @@ MAILCOM_IMAP_SCHEME = "mailcom-imap"
 MAILCOM_IMAP_HOST = "imap.mail.com"
 MAILCOM_IMAP_PORT = 993
 MAILCOM_WEBMAIL_URL = "https://www.mail.com/int/"
+ICLOUD_PRIVACY_CODE_PATH = re.compile(
+    r"^/api/v1/access/[^/]+/mailboxes/[^/]+/code/?$",
+    re.IGNORECASE,
+)
+
+
+def _icloud_privacy_poll_urls(
+    access_url: str,
+) -> tuple[str, str | None]:
+    """Return the original JSON URL and its plain-content fallback URL."""
+    try:
+        parsed = urlsplit(access_url)
+    except ValueError:
+        return access_url, None
+    if not ICLOUD_PRIVACY_CODE_PATH.fullmatch(parsed.path):
+        return access_url, None
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    code_url = access_url
+    content_query = dict(query)
+    content_query["cache"] = ["1"]
+    content_url = urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            re.sub(r"/code/?$", "/content", parsed.path, flags=re.IGNORECASE),
+            urlencode(content_query, doseq=True),
+            "",
+        )
+    )
+    return code_url, content_url
 
 
 def mailbox_source_for_document(document: dict[str, Any]) -> str:
@@ -179,11 +211,19 @@ def _is_mailcom_manager_url(value: str, email: str) -> bool:
 
 
 class MailboxClientError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        response_body: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.response_body = response_body
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +232,10 @@ class MailboxSnapshot:
     verification_code: str | None
     received_at_utc: datetime | None
     received_offset: str | None
+    service_code: str | None = None
+    service_success: bool | None = None
+    response_body: str | None = None
+    received_precision_seconds: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +245,7 @@ class VerificationCodeResult:
     received_offset: str | None
     wait_ms: int
     mail_age_ms: int | None
+    poll_count: int = 0
 
 
 class _VisibleTextParser(HTMLParser):
@@ -390,8 +435,40 @@ def parse_mailbox_snapshot(payload: str, content_type: str = "text/html") -> Mai
 
     code: str | None = None
     code_index: int | None = None
+    structured: Any | None = None
+    stripped_payload = payload.lstrip()
+    if "json" in content_type.casefold() or stripped_payload.startswith(("{", "[")):
+        try:
+            structured = json.loads(payload)
+        except (TypeError, ValueError):
+            structured = None
+    if structured is not None:
+        structured_codes: list[str] = []
+
+        def collect_structured_codes(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    normalized_key = str(key).casefold()
+                    if (
+                        normalized_key in {"code", "verification_code"}
+                        and isinstance(child, str)
+                        and CODE_PATTERN.fullmatch(child.strip())
+                    ):
+                        structured_codes.append(child.strip())
+                    else:
+                        collect_structured_codes(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_structured_codes(child)
+
+        collect_structured_codes(structured)
+        if structured_codes:
+            code = structured_codes[0]
+
     if VERIFICATION_PATTERN.search(normalized):
         for index, text in enumerate(texts):
+            if code is not None:
+                break
             if not CODE_PATTERN.fullmatch(text):
                 continue
             context = "\n".join(texts[max(0, index - 12) : index])
@@ -408,16 +485,45 @@ def parse_mailbox_snapshot(payload: str, content_type: str = "text/html") -> Mai
 
     received_at: datetime | None = None
     received_offset: str | None = None
+    received_precision_seconds = 0
     if dated:
         eligible = [item for item in dated if code_index is None or item[0] <= code_index]
         selected = eligible[-1] if eligible else dated[0]
         received_at, received_offset = selected[1], selected[2]
+    elif isinstance(structured, dict):
+        # iCloud-Privacy-Mail formats received_at in Asia/Shanghai without an
+        # explicit offset (YYYY-MM-DD HH:MM), despite older docs showing RFC3339.
+        raw_received_at = structured.get("received_at")
+        if isinstance(raw_received_at, str):
+            try:
+                local_received_at = datetime.strptime(
+                    raw_received_at.strip(),
+                    "%Y-%m-%d %H:%M",
+                ).replace(tzinfo=timezone(timedelta(hours=8)))
+            except ValueError:
+                pass
+            else:
+                received_at = local_received_at.astimezone(UTC)
+                received_offset = "+08:00"
+                received_precision_seconds = 60
 
     return MailboxSnapshot(
         fingerprint=fingerprint,
         verification_code=code,
         received_at_utc=received_at,
         received_offset=received_offset,
+        service_code=(
+            str(structured.get("code"))
+            if isinstance(structured, dict) and structured.get("code") is not None
+            else None
+        ),
+        service_success=(
+            structured.get("success")
+            if isinstance(structured, dict) and isinstance(structured.get("success"), bool)
+            else None
+        ),
+        response_body=payload,
+        received_precision_seconds=received_precision_seconds,
     )
 
 
@@ -938,7 +1044,7 @@ class MailboxClient:
                     response = self.session.get(
                         current_url,
                         headers={
-                            "Accept": "text/html,text/plain,application/json",
+                            "Accept": "application/json",
                             "Cache-Control": "no-cache",
                             "Pragma": "no-cache",
                             "User-Agent": "AutoRegister-MailboxProbe/1.0",
@@ -968,7 +1074,7 @@ class MailboxClient:
                     continue
                 break
 
-            if response is None or response.status_code != 200:
+            if response is None:
                 raise MailboxClientError(
                     "mailbox_unavailable",
                     "接码服务暂时不可用",
@@ -999,6 +1105,13 @@ class MailboxClient:
 
             encoding = response.encoding or "utf-8"
             payload = bytes(content).decode(encoding, errors="replace")
+            if response.status_code != 200:
+                raise MailboxClientError(
+                    "mailbox_unavailable",
+                    "接码服务暂时不可用",
+                    retryable=True,
+                    response_body=payload,
+                )
             content_type = response.headers.get("Content-Type", "text/html")
             if _is_laimail_list_url(current_url):
                 list_snapshot = parse_mailbox_snapshot(payload, content_type)
@@ -1032,8 +1145,8 @@ class MailboxClient:
         email: str,
         submitted_at_utc: datetime,
         *,
-        timeout_seconds: float = 120,
-        poll_interval_seconds: float = 2,
+        timeout_seconds: float = 300,
+        poll_interval_seconds: float = 5,
         future_clock_skew_seconds: float = 120,
         past_clock_skew_seconds: float = 5,
         baseline: MailboxSnapshot | None = None,
@@ -1041,6 +1154,7 @@ class MailboxClient:
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         utc_now: Callable[[], datetime] = lambda: datetime.now(UTC),
         monotonic_now: Callable[[], float] = monotonic,
+        poll_observer: Callable[[dict[str, Any]], Awaitable[Any]] | None = None,
     ) -> VerificationCodeResult:
         if submitted_at_utc.tzinfo is None:
             raise ValueError("submitted_at_utc must be timezone-aware")
@@ -1061,18 +1175,122 @@ class MailboxClient:
         baseline_available = baseline is not None
         undated_candidate: str | None = None
         undated_candidate_since: float | None = None
+        poll_count = 0
+        next_progress_log_at = started
+        poll_url, content_fallback_url = _icloud_privacy_poll_urls(access_url)
+
+        async def report_poll(details: dict[str, Any]) -> None:
+            if poll_observer is None:
+                return
+            try:
+                await poll_observer(details)
+            except Exception:
+                pass
+
+        LOGGER.info(
+            "Mailbox verification polling started: timeout=%.1fs interval=%.1fs baseline=%s",
+            timeout_seconds,
+            poll_interval_seconds,
+            baseline_available,
+        )
 
         while True:
+            poll_count += 1
+            request_started = monotonic_now()
             try:
-                snapshot = await self.get_snapshot(access_url, email)
+                snapshot = await self.get_snapshot(poll_url, email)
                 saw_successful_response = True
             except MailboxClientError as exc:
                 if not exc.retryable:
                     raise
                 last_retryable_error = exc
                 snapshot = None
+                await report_poll(
+                    {
+                        "attempt": poll_count,
+                        "channel": "json",
+                        "status": "error",
+                        "errorCode": exc.code,
+                        "retryable": exc.retryable,
+                        "responseBody": exc.response_body,
+                        "elapsedMs": max(0, int((monotonic_now() - request_started) * 1000)),
+                    }
+                )
+            else:
+                await report_poll(
+                    {
+                        "attempt": poll_count,
+                        "channel": "json",
+                        "status": "ok",
+                        "codePresent": snapshot.verification_code is not None,
+                        "codeLength": len(snapshot.verification_code or ""),
+                        "apiCode": (
+                            "otp_6_digit"
+                            if snapshot.service_code is not None
+                            and CODE_PATTERN.fullmatch(snapshot.service_code)
+                            else snapshot.service_code
+                        ),
+                        "apiSuccess": snapshot.service_success,
+                        "responseBody": snapshot.response_body,
+                        "receivedAtPresent": snapshot.received_at_utc is not None,
+                        "elapsedMs": max(0, int((monotonic_now() - request_started) * 1000)),
+                    }
+                )
+
+            if (
+                (snapshot is None or snapshot.verification_code is None)
+                and content_fallback_url is not None
+                and poll_count % 3 == 1
+            ):
+                content_request_started = monotonic_now()
+                try:
+                    content_snapshot = await self.get_snapshot(
+                        content_fallback_url,
+                        email,
+                    )
+                except MailboxClientError as exc:
+                    if not exc.retryable:
+                        raise
+                    last_retryable_error = exc
+                    await report_poll(
+                        {
+                            "attempt": poll_count,
+                            "channel": "content",
+                            "status": "error",
+                            "errorCode": exc.code,
+                            "retryable": exc.retryable,
+                            "responseBody": exc.response_body,
+                            "elapsedMs": max(0, int((monotonic_now() - content_request_started) * 1000)),
+                        }
+                    )
+                else:
+                    saw_successful_response = True
+                    await report_poll(
+                        {
+                            "attempt": poll_count,
+                            "channel": "content",
+                            "status": "ok",
+                            "codePresent": content_snapshot.verification_code is not None,
+                            "codeLength": len(content_snapshot.verification_code or ""),
+                            "responseBody": content_snapshot.response_body,
+                            "receivedAtPresent": content_snapshot.received_at_utc is not None,
+                            "elapsedMs": max(0, int((monotonic_now() - content_request_started) * 1000)),
+                        }
+                    )
+                    if content_snapshot.verification_code is not None:
+                        snapshot = content_snapshot
 
             now = utc_now().astimezone(UTC)
+            elapsed_seconds = max(0.0, monotonic_now() - started)
+            if elapsed_seconds >= next_progress_log_at:
+                LOGGER.info(
+                    "Mailbox verification polling progress: attempt=%d elapsed=%.1fs response=%s code_present=%s",
+                    poll_count,
+                    elapsed_seconds,
+                    snapshot is not None,
+                    snapshot is not None and snapshot.verification_code is not None,
+                )
+                next_progress_log_at = elapsed_seconds + 15
             if snapshot is not None and snapshot.verification_code is not None:
                 if snapshot.received_at_utc is None or snapshot.received_offset is None:
                     saw_missing_time = True
@@ -1098,6 +1316,7 @@ class MailboxClient:
                                     int((monotonic_now() - started) * 1000),
                                 ),
                                 mail_age_ms=None,
+                                poll_count=poll_count,
                             )
                     else:
                         undated_candidate = None
@@ -1108,18 +1327,27 @@ class MailboxClient:
                         seconds=max(0, past_clock_skew_seconds)
                     )
                     upper_bound = now + timedelta(seconds=future_clock_skew_seconds)
-                    if lower_bound <= received <= upper_bound:
+                    received_latest = received + timedelta(
+                        seconds=max(0, snapshot.received_precision_seconds)
+                    )
+                    if received_latest >= lower_bound and received <= upper_bound:
                         return VerificationCodeResult(
                             verification_code=snapshot.verification_code,
                             received_at_utc=received,
                             received_offset=snapshot.received_offset,
                             wait_ms=max(0, int((monotonic_now() - started) * 1000)),
                             mail_age_ms=int((now - received).total_seconds() * 1000),
+                            poll_count=poll_count,
                         )
                     saw_stale = True
 
             remaining = deadline - monotonic_now()
             if remaining <= 0:
+                LOGGER.warning(
+                    "Mailbox verification polling ended without a code: attempts=%d elapsed=%.1fs",
+                    poll_count,
+                    max(0.0, monotonic_now() - started),
+                )
                 if saw_missing_time:
                     raise MailboxClientError(
                         "mail_time_missing",
@@ -1134,6 +1362,6 @@ class MailboxClient:
                     raise last_retryable_error
                 raise MailboxClientError(
                     "verification_code_timeout",
-                    "等待新验证码超时",
+                    f"等待新验证码超时（已轮询 {poll_count} 次，持续 {timeout_seconds:g} 秒）",
                 )
             await sleep(min(poll_interval_seconds, remaining))

@@ -1,4 +1,8 @@
 import uvicorn
+from dotenv import load_dotenv
+
+
+load_dotenv(override=False)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ describe('HeroSmsSettingsView', () => {
     })
     await flushPromises()
 
-    expect(wrapper.text()).toContain('HeroSMS PP 接码配置')
+    expect(wrapper.text()).toContain('HeroSMS PayPal 接码配置')
     expect(wrapper.text()).toContain('Japan')
     expect(wrapper.text()).toContain('流水线自动支付已开启')
     const countrySelect = wrapper.findAllComponents({ name: 'ElSelect' })[0]
@@ -59,7 +59,7 @@ describe('HeroSmsSettingsView', () => {
     await flushPromises()
 
     expect(dataGateway.updateHeroSmsSettings).toHaveBeenCalledWith(
-      expect.objectContaining({ countryId: 62, enabled: true }),
+      expect.objectContaining({ apiKey: undefined, countryId: 62, enabled: true }),
     )
     wrapper.unmount()
   })

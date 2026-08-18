@@ -44,7 +44,7 @@ describe('LaunchView', () => {
     await wrapper.get('.start-button').trigger('click')
     await flushPromises()
 
-    expect(start).toHaveBeenCalledWith(1, 'JP', 'JP-A', 'all')
+    expect(start).toHaveBeenCalledWith(1, 'JP', '', 'all')
   })
 
   it('renders pool-wide Plus, Free and available-email statistics', () => {

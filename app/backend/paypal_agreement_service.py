@@ -222,7 +222,7 @@ class PaypalAgreementService:
                 configured_env = dotenv_values(self.env_path)
                 for key in PROXY_ENV_KEYS:
                     value = configured_env.get(key)
-                    if key not in os.environ and value is not None:
+                    if value is not None:
                         env[key] = str(value)
             env.setdefault("PAYPAL_WEB_PRODUCTION", "0")
             env.setdefault("PAYPAL_WEB_COOKIE_SECURE", "0")

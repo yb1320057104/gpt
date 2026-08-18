@@ -35,9 +35,13 @@ def valid_payload(**overrides: object) -> dict[str, object]:
 def public_defaults() -> dict[str, object]:
     return {
         "schemaVersion": 2,
+        "browserProvider": "roxy",
         "browserExecutablePath": DEFAULT_PATH,
         "roxyApiKey": "",
         "roxyApiPort": 50000,
+        "antBrowserExecutablePath": r"D:\AntBrowser\AntBrowser.exe",
+        "antApiKey": "",
+        "antApiPort": 19876,
         "headless": False,
         "proxyRetryCount": 1,
         "concurrency": 2,
