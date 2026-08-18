@@ -163,8 +163,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.
 不要把 `.env`、`data/settings.json` 或浏览器导出的凭据文件提交到仓库。
 
 新克隆首次运行 `app\setup.ps1` 时，会把 `.env.example` 复制为本机
-`app\.env`。填写远程 `AUTOREGISTER_MONGO_URI` 后，安装脚本会跳过本机
-MongoDB 安装。云服务器安全组需要允许运行电脑访问 TCP `37017`。
+`app\.env`。当前私有仓库模板已经配置远程 MongoDB，安装脚本会跳过本机
+MongoDB 安装。云服务器安全组需要允许运行电脑访问 TCP `37017`。模板包含
+受限数据库账号，仓库必须保持私有。
 
 ## 开发
 
