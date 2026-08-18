@@ -21,6 +21,9 @@ from .roxy_client import (
 )
 
 
+ANT_BROWSER_WINDOW_SIZE = "1000,1000"
+
+
 class AntBrowserClient:
     """Compatibility adapter exposing Ant Browser through the existing browser lifecycle."""
 
@@ -183,7 +186,7 @@ class AntBrowserClient:
             f"--lang={locale}",
             f"--accept-lang={locale},{language}",
             f"--timezone={timezone}",
-            "--window-size=1920,1080",
+            f"--window-size={ANT_BROWSER_WINDOW_SIZE}",
             f"--fingerprint-hardware-concurrency={hardware_concurrency}",
             "--disable-non-proxied-udp",
             "--fingerprinting-canvas-image-data-noise",
@@ -219,7 +222,7 @@ class AntBrowserClient:
     async def open_browser(
         self, _workspace_id: int, dir_id: str, *, headless: bool
     ) -> RoxyOpenResult:
-        launch_args = ["--window-size=1920,1080"]
+        launch_args = [f"--window-size={ANT_BROWSER_WINDOW_SIZE}"]
         if headless:
             launch_args.append("--headless=new")
         payload = await self._request(
