@@ -159,10 +159,6 @@ class FakeElementLocator:
 
     async def click(self, *, timeout: int, trial: bool = False) -> None:
         self.page.click_timeout = timeout
-        if self.kind == "cookie_consent":
-            self.page.cookie_banner_visible = False
-            self.page.events.append(("cookie_consent", None))
-            return
         if trial:
             self.page.continue_trial_count += 1
             if self.page.trial_click_error is not None:
@@ -300,8 +296,6 @@ class FakeElementLocator:
             self.page.profile_home_checks += 1
             visible_after = self.page.profile_home_visible_after
             return visible_after is not None and self.page.profile_home_checks >= visible_after
-        if self.kind == "cookie_consent":
-            return self.page.cookie_banner_visible
         return {
             "email": self.page.email_visible,
             "button": self.page.continue_visible,
@@ -373,7 +367,6 @@ class FakePage:
         screenshot_failures: int = 0,
         login_challenge_checks_before_release: int | None = None,
         continue_text: str = "Continue",
-        cookie_banner_visible: bool = False,
     ) -> None:
         self.url = "about:blank"
         self.body = ""
@@ -424,7 +417,6 @@ class FakePage:
             login_challenge_checks_before_release
         )
         self.continue_text = continue_text
-        self.cookie_banner_visible = cookie_banner_visible
         self.login_challenge_checks = 0
         self.screenshot_calls = 0
         self.profile_home_checks = 0
@@ -509,8 +501,6 @@ class FakePage:
         self.locator_calls.append(selector)
         if selector == "body":
             return FakeBodyLocator(self)
-        if 'Reject non-essential' in selector:
-            return FakeElementLocator(self, "cookie_consent")
         if "challenges.cloudflare.com" in selector or "cf-turnstile" in selector:
             return FakeElementLocator(self, "challenge")
         if (
@@ -2801,7 +2791,7 @@ def test_click_exception_on_stable_form_refills_and_retries_once(
     assert page.continue_click_count == 1
 
 
-def test_click_exception_with_reset_stops_without_resubmitting(
+def test_click_exception_with_reset_refills_and_retries_once(
     tmp_path: Path,
 ) -> None:
     page = FakePage(
@@ -2810,12 +2800,15 @@ def test_click_exception_with_reset_stops_without_resubmitting(
         click_error_outcome="reset",
     )
 
-    with pytest.raises(EmailStepError) as exc_info:
-        run_probe(page, tmp_path / "latest.png")
+    result = run_probe(page, tmp_path / "latest.png")
 
-    assert exc_info.value.code == "email_post_submit_reset"
-    assert page.continue_click_invocation_count == 1
-    assert len([event for event in page.events if event[0] == "fill"]) == 1
+    assert result.next_step == "verification"
+    assert result.email_fill_attempts == 2
+    assert result.email_continue_attempts == 2
+    assert result.email_post_submit_reset_count == 1
+    assert result.email_continue_click_failures == 1
+    assert result.email_continue_recovery_state == "form_reset"
+    assert page.continue_click_invocation_count == 2
 
 
 def test_two_click_exceptions_stop_without_third_click(tmp_path: Path) -> None:
@@ -2938,21 +2931,57 @@ def test_repeated_email_form_reset_stops_without_clicking(tmp_path: Path) -> Non
     assert (tmp_path / "latest.png").read_bytes() == b"fake-png"
 
 
-def test_post_submit_refresh_stops_without_resubmitting(
+def test_post_submit_refresh_is_refilled_and_submitted_once_more(
     tmp_path: Path,
 ) -> None:
     page = FakePage(next_step="post_submit_reset_then_verification")
+    generated_delays = iter([3.25, 4.25, 4.75, 3.5])
+    submitted_times = iter(
+        [
+            FIXED_SUBMITTED_AT,
+            datetime(2026, 8, 9, 1, 30, 5, tzinfo=timezone.utc),
+        ]
+    )
+    sleep_calls: list[float] = []
+    submission_calls: list[datetime] = []
 
-    with pytest.raises(EmailStepError) as exc_info:
-        run_probe(page, tmp_path / "latest.png")
+    def sequential_uniform(_minimum: float, _maximum: float) -> float:
+        return next(generated_delays)
 
-    assert exc_info.value.code == "email_post_submit_reset"
+    async def record_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    def record_submission_boundary() -> datetime:
+        submitted_at = next(submitted_times)
+        submission_calls.append(submitted_at)
+        return submitted_at
+
+    result = run_probe(
+        page,
+        tmp_path / "latest.png",
+        random_uniform=sequential_uniform,
+        delay_sleep=record_sleep,
+        utc_now=record_submission_boundary,
+    )
+
+    assert result.next_step == "verification"
+    assert result.submitted_at_utc == submission_calls[-1]
+    assert result.pre_continue_delay_ms == 5_000
+    assert result.email_pre_fill_delays_ms == (5_000, 5_000)
+    assert result.email_fill_attempts == 2
+    assert result.email_form_reset_count == 0
+    assert result.email_continue_attempts == 2
+    assert result.email_post_submit_reset_count == 1
+    assert sleep_calls == [0.5] * 40
     assert [event for event in page.events if event[0] == "fill"] == [
-        ("fill", "person@example.com")
+        ("fill", "person@example.com"),
+        ("fill", "person@example.com"),
     ]
     assert [event for event in page.events if event[0] == "click"] == [
-        ("click", None)
+        ("click", None),
+        ("click", None),
     ]
+    assert page.continue_click_count == 2
 
 
 def test_stalled_email_submission_retries_once_like_reference_flow(
@@ -2989,29 +3018,48 @@ def test_transient_empty_email_observation_does_not_resubmit(tmp_path: Path) -> 
     ]
 
 
-def test_cookie_banner_is_dismissed_before_email_submission(tmp_path: Path) -> None:
-    page = FakePage(cookie_banner_visible=True)
+def test_next_step_arriving_during_refill_delay_does_not_resubmit(
+    tmp_path: Path,
+) -> None:
+    page = FakePage(next_step="post_submit_reset_twice")
+    transitioned = False
 
-    result = run_probe(page, tmp_path / "latest.png")
+    async def transition_during_refill_delay(_seconds: float) -> None:
+        nonlocal transitioned
+        if (
+            page.continue_click_count == 1
+            and page.filled_email == ""
+            and not transitioned
+        ):
+            page.email_visible = False
+            page.verification_visible = True
+            page.body = "Check your email Verification code"
+            transitioned = True
 
-    assert result.next_step == "password"
-    assert page.cookie_banner_visible is False
-    assert ("cookie_consent", None) in page.events
-    assert page.events.index(("cookie_consent", None)) < page.events.index(
-        ("fill", "person@example.com")
+    result = run_probe(
+        page,
+        tmp_path / "latest.png",
+        delay_sleep=transition_during_refill_delay,
     )
 
+    assert result.next_step == "verification"
+    assert result.email_fill_attempts == 1
+    assert result.email_continue_attempts == 1
+    assert result.email_post_submit_reset_count == 1
+    assert page.continue_click_count == 1
+    assert len([event for event in page.events if event[0] == "fill"]) == 1
 
-def test_post_submit_reset_stops_after_first_attempt(tmp_path: Path) -> None:
+
+def test_second_post_submit_reset_stops_without_third_attempt(tmp_path: Path) -> None:
     page = FakePage(next_step="post_submit_reset_twice")
 
     with pytest.raises(EmailStepError) as exc_info:
         run_probe(page, tmp_path / "latest.png")
 
     assert exc_info.value.code == "email_post_submit_reset"
-    assert len([event for event in page.events if event[0] == "fill"]) == 1
-    assert len([event for event in page.events if event[0] == "click"]) == 1
-    assert page.continue_click_count == 1
+    assert len([event for event in page.events if event[0] == "fill"]) == 2
+    assert len([event for event in page.events if event[0] == "click"]) == 2
+    assert page.continue_click_count == 2
     assert (tmp_path / "latest.png").read_bytes() == b"fake-png"
 
 
