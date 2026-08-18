@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from time import monotonic
 from typing import Any
 from urllib.parse import quote
@@ -154,6 +155,41 @@ class AntBrowserClient:
             auth += "@"
         return f"{scheme}://{auth}{proxy.host}:{proxy.port}"
 
+    @staticmethod
+    def _fingerprint_args(proxy: ProxyLease) -> list[str]:
+        country = str(proxy.country or "US").strip().upper()
+        locale, timezone = {
+            "BR": ("pt-BR", "America/Sao_Paulo"),
+            "DE": ("de-DE", "Europe/Berlin"),
+            "FR": ("fr-FR", "Europe/Paris"),
+            "GB": ("en-GB", "Europe/London"),
+            "HK": ("zh-HK", "Asia/Hong_Kong"),
+            "JP": ("ja-JP", "Asia/Tokyo"),
+            "KR": ("ko-KR", "Asia/Seoul"),
+            "PH": ("en-PH", "Asia/Manila"),
+            "SG": ("en-SG", "Asia/Singapore"),
+            "TR": ("tr-TR", "Europe/Istanbul"),
+            "TW": ("zh-TW", "Asia/Taipei"),
+            "US": ("en-US", "America/New_York"),
+        }.get(country, ("en-US", "America/New_York"))
+        language = locale.split("-", 1)[0]
+        fingerprint_seed = secrets.randbelow(2_000_000_000) + 1
+        hardware_concurrency = secrets.choice((4, 8, 12, 16))
+        return [
+            f"--fingerprint={fingerprint_seed}",
+            "--fingerprint-brand=Chrome",
+            "--fingerprint-platform=windows",
+            "--fingerprint-platform-version=10.0.0",
+            f"--lang={locale}",
+            f"--accept-lang={locale},{language}",
+            f"--timezone={timezone}",
+            "--window-size=1920,1080",
+            f"--fingerprint-hardware-concurrency={hardware_concurrency}",
+            "--disable-non-proxied-udp",
+            "--fingerprinting-canvas-image-data-noise",
+            "--fingerprinting-client-rects-noise",
+        ]
+
     async def create_browser(self, _workspace_id: int, probe_id: str, proxy: ProxyLease) -> str:
         payload = await self._request(
             "POST",
@@ -163,6 +199,8 @@ class AntBrowserClient:
                 "profile": {
                     "profileName": f"{MANAGED_BROWSER_PREFIX}{probe_id[:8]}",
                     "proxyConfig": self._proxy_url(proxy),
+                    "fingerprintArgs": self._fingerprint_args(proxy),
+                    "launchArgs": ["--disable-sync", "--no-first-run"],
                     "tags": ["autoregister"],
                     "keywords": [probe_id],
                 },
@@ -181,7 +219,9 @@ class AntBrowserClient:
     async def open_browser(
         self, _workspace_id: int, dir_id: str, *, headless: bool
     ) -> RoxyOpenResult:
-        launch_args = ["--headless=new"] if headless else []
+        launch_args = ["--window-size=1920,1080"]
+        if headless:
+            launch_args.append("--headless=new")
         payload = await self._request(
             "POST",
             "/api/runtime/session",

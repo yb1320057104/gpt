@@ -14,6 +14,7 @@ from time import monotonic
 from typing import Any, Protocol, TypeVar
 from uuid import UUID, uuid4
 
+from .ant_browser_client import AntBrowserClient
 from .errors import (
     LocalProxyUnavailableError,
     MongoUnavailableError,
@@ -1485,9 +1486,8 @@ class RunManager:
         last_error: RoxyApiError | None = None
         while monotonic() - started < 30:
             try:
-                async with self.roxy_factory(
-                    settings.roxyApiPort,
-                    settings.roxyApiKey,
+                async with self._browser_client(
+                    settings,
                     timeout_seconds=3,
                 ) as roxy:
                     await roxy.health()
@@ -1499,9 +1499,8 @@ class RunManager:
                     stable_signature = signature
                     stable_count = 1
                 if stable_count >= 3:
-                    async with self.roxy_factory(
-                        settings.roxyApiPort,
-                        settings.roxyApiKey,
+                    async with self._browser_client(
+                        settings,
                         timeout_seconds=5,
                     ) as cleanup_roxy:
                         await self._cleanup_stale_managed_browsers(
@@ -1517,7 +1516,11 @@ class RunManager:
                 stable_signature = None
                 if not launched:
                     launched = True
-                    executable = Path(settings.browserExecutablePath)
+                    executable = Path(
+                        settings.antBrowserExecutablePath
+                        if settings.browserProvider == "ant"
+                        else settings.browserExecutablePath
+                    )
                     if executable.is_file():
                         popen_options: dict[str, Any] = {
                             "cwd": str(executable.parent),
@@ -1538,6 +1541,24 @@ class RunManager:
             operation=(last_error.operation if last_error else "workspace_list"),
             elapsed_ms=max(0, int((monotonic() - started) * 1000)),
             error_kind=(last_error.error_kind if last_error else "transport"),
+        )
+
+    def _browser_client(
+        self,
+        settings: StoredExecutionSettings,
+        *,
+        timeout_seconds: float = 15,
+    ) -> RoxyClient | AntBrowserClient:
+        if settings.browserProvider == "ant" and self.roxy_factory is RoxyClient:
+            return AntBrowserClient(
+                settings.antApiPort,
+                settings.antApiKey,
+                timeout_seconds=timeout_seconds,
+            )
+        return self.roxy_factory(
+            settings.roxyApiPort,
+            settings.roxyApiKey,
+            timeout_seconds=timeout_seconds,
         )
 
     @staticmethod

@@ -997,6 +997,32 @@ def test_poll_rejects_mail_before_five_second_submission_tolerance() -> None:
     assert exc_info.value.code == "stale_verification_email"
 
 
+def test_poll_accepts_changed_baseline_code_with_provider_timestamp_lag() -> None:
+    submitted = datetime(2026, 8, 9, 1, 30, tzinfo=UTC)
+    baseline = snapshot("empty", None, None)
+    candidate = snapshot(
+        "new",
+        "222222",
+        submitted - timedelta(minutes=4),
+        "+08:00",
+    )
+
+    result = run_poll([candidate], submitted, baseline=baseline)
+
+    assert result.verification_code == "222222"
+    assert result.received_at_utc == submitted - timedelta(minutes=4)
+
+
+def test_poll_rejects_unchanged_baseline_code_with_provider_timestamp_lag() -> None:
+    submitted = datetime(2026, 8, 9, 1, 30, tzinfo=UTC)
+    baseline = snapshot("old", "222222", submitted - timedelta(minutes=4), "+08:00")
+
+    with pytest.raises(MailboxClientError) as exc_info:
+        run_poll([baseline], submitted, timeout_seconds=2, baseline=baseline)
+
+    assert exc_info.value.code == "stale_verification_email"
+
+
 def test_poll_accepts_stable_undated_code_only_after_baseline_changes() -> None:
     submitted = datetime(2026, 8, 9, 1, 30, tzinfo=UTC)
     old = snapshot("old", "111111", None, None)

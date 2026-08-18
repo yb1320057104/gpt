@@ -14,6 +14,26 @@ def test_ant_profile_lifecycle_uses_direct_debug_url() -> None:
     asyncio.run(_exercise_ant_profile_lifecycle())
 
 
+def test_ant_fingerprint_tracks_proxy_country() -> None:
+    args = AntBrowserClient._fingerprint_args(
+        ProxyLease(
+            id="proxy-gb",
+            host="proxy.test",
+            port=8080,
+            username="",
+            password="",
+            country="GB",
+            group="default",
+            scheme="http",
+        )
+    )
+
+    assert "--lang=en-GB" in args
+    assert "--accept-lang=en-GB,en" in args
+    assert "--timezone=Europe/London" in args
+    assert "--window-size=1920,1080" in args
+
+
 async def _exercise_ant_profile_lifecycle() -> None:
     requests: list[httpx.Request] = []
 
@@ -24,8 +44,15 @@ async def _exercise_ant_profile_lifecycle() -> None:
         if request.url.path == "/api/profiles" and request.method == "POST":
             body = json.loads(request.content)
             assert body["profile"]["proxyConfig"] == "http://user:p%40ss@proxy.test:8080"
+            fingerprint_args = body["profile"]["fingerprintArgs"]
+            assert "--lang=en-US" in fingerprint_args
+            assert "--timezone=America/New_York" in fingerprint_args
+            assert "--window-size=1920,1080" in fingerprint_args
+            assert any(value.startswith("--fingerprint=") for value in fingerprint_args)
             return httpx.Response(201, json={"ok": True, "profileId": "profile-1"})
         if request.url.path == "/api/runtime/session":
+            body = json.loads(request.content)
+            assert "--window-size=1920,1080" in body["launchArgs"]
             return httpx.Response(
                 200,
                 json={

@@ -54,17 +54,6 @@ const availableForSource = computed(() => {
 const running = computed(() =>
   ['queued', 'running', 'waiting_for_database'].includes(store.runState.status),
 )
-const countValid = computed(
-  () =>
-    Number.isInteger(requestedCount.value) &&
-    Number(requestedCount.value) >= 1 &&
-    Boolean(selectedCountry.value) &&
-    (!selectedGroup.value || (store.proxyGroups.find(
-      (item) => item.country === selectedCountry.value && item.group === selectedGroup.value,
-    )?.enabled || 0) >=
-      1) &&
-    store.mongoHealth.status === 'online',
-)
 const groupOptions = computed(() =>
   store.proxyGroups
     .filter((item) => item.country === selectedCountry.value && item.enabled > 0)
@@ -248,13 +237,42 @@ function formatElapsed(milliseconds: number) {
 }
 
 async function startRun() {
-  if (!countValid.value || requestedCount.value === undefined) {
-    ElMessage.warning('请输入 1 到 10000 的正整数并选择注册国家')
+  const count = requestedCount.value
+  if (store.mongoHealth.status !== 'online') {
+    ElMessage.warning('MongoDB 尚未在线，请等待右上角状态恢复后重试')
+    return
+  }
+  if (availableForSource.value < 1) {
+    ElMessage.warning(
+      selectedEmailSource.value === 'mailcom_alias'
+        ? '分裂邮箱池为空，请先同步 MailCom Hub 或切换邮箱来源'
+        : '当前邮箱来源没有可用邮箱，请先导入邮箱或切换邮箱来源',
+    )
+    return
+  }
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 1) {
+    ElMessage.warning('请输入 1 到 10000 的正整数')
+    return
+  }
+  if (!selectedCountry.value) {
+    ElMessage.warning('请选择注册国家')
+    return
+  }
+  if (
+    selectedGroup.value &&
+    !store.proxyGroups.some(
+      (item) =>
+        item.country === selectedCountry.value &&
+        item.group === selectedGroup.value &&
+        item.enabled > 0,
+    )
+  ) {
+    ElMessage.warning('所选代理组没有启用代理，请重新选择代理组')
     return
   }
   try {
     const result = await store.startBrowserProbeRun(
-      requestedCount.value,
+      count,
       selectedCountry.value,
       selectedGroup.value,
       selectedEmailSource.value,
@@ -438,7 +456,7 @@ function downloadLogs() {
               size="large"
               :icon="VideoPlay"
               :loading="running && !store.runState.cancelRequested"
-              :disabled="!countValid || running"
+              :disabled="running"
               @click="startRun"
             >
               {{ store.runState.status === 'waiting_for_database' ? '等待数据库恢复' : running ? '真实探测运行中' : '启动真实探测' }}

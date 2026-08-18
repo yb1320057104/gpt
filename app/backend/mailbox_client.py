@@ -1330,7 +1330,19 @@ class MailboxClient:
                     received_latest = received + timedelta(
                         seconds=max(0, snapshot.received_precision_seconds)
                     )
-                    if received_latest >= lower_bound and received <= upper_bound:
+                    code_changed_from_baseline = (
+                        baseline_available
+                        and snapshot.verification_code != baseline_code
+                    )
+                    baseline_changed_lower_bound = now - timedelta(minutes=10)
+                    timestamp_is_acceptable = (
+                        received_latest >= lower_bound
+                        or (
+                            code_changed_from_baseline
+                            and received_latest >= baseline_changed_lower_bound
+                        )
+                    )
+                    if timestamp_is_acceptable and received <= upper_bound:
                         return VerificationCodeResult(
                             verification_code=snapshot.verification_code,
                             received_at_utc=received,

@@ -69,17 +69,21 @@ describe('LaunchView', () => {
     expect(wrapper.text()).not.toContain('masked-in-this-view')
   })
 
-  it('disables starting when the email pool is empty', () => {
+  it('keeps the start action clickable so an empty email pool gets feedback', async () => {
     const pinia = createPinia()
     setActivePinia(pinia)
     const store = useAppStore()
     store.stats.emails.available = 0
+    store.mongoHealth.status = 'online'
+    const start = vi.spyOn(store, 'startBrowserProbeRun')
 
     const wrapper = mount(LaunchView, {
       global: { plugins: [pinia, ElementPlus] },
     })
 
-    expect(wrapper.get('.start-button').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('.start-button').attributes('disabled')).toBeUndefined()
+    await wrapper.get('.start-button').trigger('click')
+    expect(start).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('邮箱池为空，请先导入邮箱')
     expect(wrapper.get('.summary-pending strong').text()).toBe('0')
   })
