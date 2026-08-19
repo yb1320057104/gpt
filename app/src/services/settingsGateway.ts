@@ -10,6 +10,8 @@ const DEFAULT_SETTINGS: ExecutionSettings = {
   antApiKey: '',
   antApiPort: 19876,
   headless: false,
+  requireRegistrationPassword: false,
+  enableRegistrationTotp: true,
   proxyRetryCount: 1,
   concurrency: 2,
   taskTimeoutSeconds: 0,

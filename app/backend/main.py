@@ -60,6 +60,8 @@ from .pipeline_service import (
     PipelineServiceError,
     PipelineSettingsUpdate,
     SmsReceiverBatchInput,
+    SmsReceiverRetryInput,
+    SmsReceiverHeroSmsSettingsUpdate,
     SmsReceiverSettingsUpdate,
 )
 from .probe_store import MongoProbeStore
@@ -385,6 +387,11 @@ def create_app(
             alias="settlementState",
             pattern="^(all|waiting|confirmed|review|failed)$",
         ),
+        receiver_state: str = Query(
+            default="all",
+            alias="receiverState",
+            pattern="^(all|verified|unverified|failed|pending)$",
+        ),
     ) -> dict:
         return await request.app.state.account_pipeline.list_items(
             page=page,
@@ -393,7 +400,12 @@ def create_app(
             query=q,
             export_state=export_state,
             settlement_state=settlement_state,
+            receiver_state=receiver_state,
         )
+
+    @app.get("/api/pipeline/{item_id}/logs")
+    async def pipeline_item_logs(item_id: str, request: Request) -> dict:
+        return await request.app.state.account_pipeline.item_logs(item_id)
 
     @app.get("/api/pipeline/paid/stats")
     async def pipeline_paid_stats(
@@ -438,6 +450,23 @@ def create_app(
     async def test_sms_receiver(request: Request) -> dict:
         return await request.app.state.account_pipeline.test_sms_receiver()
 
+    @app.get("/api/pipeline/sms-receiver/herosms")
+    async def sms_receiver_hero_sms_settings(request: Request) -> dict:
+        return await request.app.state.account_pipeline.sms_receiver_hero_sms_settings()
+
+    @app.put("/api/pipeline/sms-receiver/herosms")
+    async def update_sms_receiver_hero_sms_settings(
+        payload: SmsReceiverHeroSmsSettingsUpdate,
+        request: Request,
+    ) -> dict:
+        return await request.app.state.account_pipeline.update_sms_receiver_hero_sms_settings(
+            payload
+        )
+
+    @app.get("/api/pipeline/sms-receiver/herosms/catalog")
+    async def sms_receiver_hero_sms_catalog(request: Request) -> dict:
+        return await request.app.state.account_pipeline.sms_receiver_hero_sms_catalog()
+
     @app.post("/api/pipeline/paid/sms-receiver/submit")
     async def submit_paid_to_sms_receiver(
         payload: SmsReceiverBatchInput,
@@ -451,6 +480,13 @@ def create_app(
         request: Request,
     ) -> dict:
         return await request.app.state.account_pipeline.refresh_sms_receiver_status(payload)
+
+    @app.post("/api/pipeline/paid/sms-receiver/retry")
+    async def retry_paid_sms_receiver(
+        payload: SmsReceiverRetryInput,
+        request: Request,
+    ) -> dict:
+        return await request.app.state.account_pipeline.queue_sms_receiver_retry(payload)
 
     @app.post("/api/pipeline/sync")
     async def sync_pipeline(request: Request) -> dict:

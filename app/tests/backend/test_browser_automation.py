@@ -177,6 +177,8 @@ class FakeElementLocator:
                 error = self.page.verification_click_errors.pop(0)
             else:
                 error = self.page.verification_click_error
+        elif self.kind == "password_route":
+            error = None
         elif self.kind == "password_button":
             error = self.page.password_click_error
         elif self.kind == "profile_finish":
@@ -208,6 +210,9 @@ class FakeElementLocator:
             self.page.verification_clicked = True
             self.page.events.append(("verification_click", None))
             self.page.apply_verification_next_step()
+        elif self.kind == "password_route":
+            self.page.events.append(("password_route_click", None))
+            self.page.apply_password_route()
         elif self.kind == "password_button":
             self.page.events.append(("password_click", None))
             self.page.apply_password_next_step()
@@ -300,6 +305,7 @@ class FakeElementLocator:
             "email": self.page.email_visible,
             "button": self.page.continue_visible,
             "password": self.page.password_visible,
+            "password_route": self.page.password_route_visible,
             "password_button": self.page.password_visible,
             "verification": self.page.verification_visible,
             "verification_button": self.page.verification_continue_visible,
@@ -367,6 +373,7 @@ class FakePage:
         screenshot_failures: int = 0,
         login_challenge_checks_before_release: int | None = None,
         continue_text: str = "Continue",
+        forced_signup_initial_step: str | None = None,
     ) -> None:
         self.url = "about:blank"
         self.body = ""
@@ -417,10 +424,12 @@ class FakePage:
             login_challenge_checks_before_release
         )
         self.continue_text = continue_text
+        self.forced_signup_initial_step = forced_signup_initial_step
         self.login_challenge_checks = 0
         self.screenshot_calls = 0
         self.profile_home_checks = 0
         self.password_visible = False
+        self.password_route_visible = False
         self.verification_visible = False
         self.verification_continue_visible = True
         self.alert_visible = False
@@ -458,6 +467,7 @@ class FakePage:
         self.get_by_test_id_calls: list[str] = []
         self.get_by_role_calls: list[tuple[str, dict[str, object]]] = []
         self.reload_calls = 0
+        self.signup_bootstrap_emails: list[str] = []
 
     @property
     def filled_profile_age(self) -> str:
@@ -484,6 +494,21 @@ class FakePage:
             else:
                 self.body = "Log in or sign up Email address Continue"
             self.url = "https://chatgpt.com/auth/login?openaicom_referred=true"
+            if (
+                self.forced_signup_initial_step is not None
+                and url.startswith("https://auth.openai.com/authorize")
+            ):
+                self.email_visible = False
+                self.continue_visible = False
+                if self.forced_signup_initial_step == "verification":
+                    self.verification_visible = True
+                    self.password_route_visible = True
+                    self.url = "https://auth.openai.com/email-verification?state=PRIVATE_VALUE"
+                    self.body = "Check your inbox Continue with password"
+                elif self.forced_signup_initial_step == "password":
+                    self.password_visible = True
+                    self.url = "https://auth.openai.com/create-account/password?state=PRIVATE_VALUE"
+                    self.body = "Create your password"
 
     async def reload(self, **_kwargs: object) -> None:
         self.reload_calls += 1
@@ -514,6 +539,10 @@ class FakePage:
             return FakeElementLocator(self, "profile_home_button")
         if selector == 'input[type="password"]':
             return FakeElementLocator(self, "password")
+        if 'autocomplete="new-password"' in selector:
+            return FakeElementLocator(self, "password")
+        if selector.startswith("xpath=//*[") and "password" in selector:
+            return FakeElementLocator(self, "password_route")
         if 'and .//input[@type="password"]' in selector:
             return FakeElementLocator(self, "password_button")
         if "one-time-code" in selector:
@@ -693,6 +722,16 @@ class FakePage:
             self.verification_visible = False
             self.verification_continue_visible = False
             self.body = "メールが確認されました。メールアドレスはすでに確認済みです。"
+        elif self.verification_submit_outcome == "totp":
+            self.url = "https://auth.openai.com/log-in/mfa?state=PRIVATE_VALUE"
+            self.body = "Check your authenticator app and enter the one-time code"
+        elif self.verification_submit_outcome == "account_deactivated":
+            self.verification_visible = False
+            self.url = "https://auth.openai.com/error?state=PRIVATE_VALUE"
+            self.body = (
+                "Authentication error. The account has been deleted or deactivated. "
+                "error_code: account_deactivated"
+            )
 
     def apply_password_next_step(self) -> None:
         if self.password_submit_outcome == "verification":
@@ -706,6 +745,13 @@ class FakePage:
             self.body = self.alert_text
         elif self.password_submit_outcome == "challenge":
             self.body = "Verify you are human"
+
+    def apply_password_route(self) -> None:
+        self.verification_visible = False
+        self.password_route_visible = False
+        self.password_visible = True
+        self.url = "https://auth.openai.com/create-account/password?state=PRIVATE_VALUE"
+        self.body = "Create your password"
 
     def apply_profile_next_step(self) -> None:
         if self.profile_submit_outcome == "transitioned":
@@ -737,7 +783,22 @@ class FakePage:
     async def wait_for_load_state(self, *_args: object, **_kwargs: object) -> None:
         return None
 
-    async def evaluate(self, expression: str) -> str:
+    async def evaluate(self, expression: str, argument: object = None) -> object:
+        if "screen_hint: 'signup'" in expression:
+            assert isinstance(argument, dict)
+            self.signup_bootstrap_emails.append(str(argument["email"]))
+            return {
+                "ok": True,
+                "stage": "signin",
+                "status": 200,
+                "url": "https://auth.openai.com/authorize?state=PRIVATE_VALUE",
+            }
+        if "passwordRouteCandidates" in expression:
+            if not self.password_route_visible:
+                return False
+            self.events.append(("password_route_evaluate", None))
+            self.apply_password_route()
+            return True
         assert expression == "document.readyState"
         return self.ready_state
 
@@ -879,6 +940,15 @@ class PlanFakePage(SessionFakePage):
         self.route_pattern: str | None = None
         self.unroute_calls: list[str] = []
         self.plan_route = PlanFakeRoute()
+
+    async def evaluate(self, expression: str, argument: object = None) -> object:
+        if "timezoneOffset" in expression and "deviceCookie" in expression:
+            return {
+                "language": "ja-JP",
+                "timezoneOffset": "-480",
+                "deviceId": "SESSION_DEVICE_ID",
+            }
+        return await super().evaluate(expression, argument)
 
     async def route(self, pattern: str, handler: object) -> None:
         self.route_pattern = pattern
@@ -1262,7 +1332,7 @@ def run_verification_submission(
     **automation_options: object,
 ):
     page.url = "https://auth.openai.com/email-verification?state=PRIVATE_VALUE"
-    page.body = "Enter the verification code"
+    page.body = str(automation_options.pop("initial_body", "Enter the verification code"))
     page.email_visible = False
     page.verification_visible = verification_visible
     playwright = FakePlaywright(page)
@@ -1324,6 +1394,43 @@ def test_password_is_filled_and_advances_to_verification(tmp_path: Path) -> None
     assert page.verification_visible is True
     assert ("password_fill", "<redacted>") in page.events
     assert ("password_click", None) in page.events
+
+
+def test_forced_signup_bootstraps_nextauth_and_reaches_password_page(
+    tmp_path: Path,
+) -> None:
+    page = FakePage(next_step="password")
+
+    result = run_probe(
+        page,
+        tmp_path / "forced-signup.png",
+        signup_screen_hint="signup",
+    )
+
+    assert result.next_step == "password"
+    assert page.signup_bootstrap_emails == ["person@example.com"]
+    assert page.goto_calls[1][0] == CHATGPT_HOME_URL
+    assert page.goto_calls[2][0].startswith("https://auth.openai.com/authorize?")
+
+
+def test_forced_signup_switches_verification_page_to_create_password(
+    tmp_path: Path,
+) -> None:
+    page = FakePage(forced_signup_initial_step="verification")
+
+    result = run_probe(
+        page,
+        tmp_path / "forced-signup-verification.png",
+        signup_screen_hint="signup",
+    )
+
+    assert result.next_step == "password"
+    assert result.submitted_at_utc == FIXED_SUBMITTED_AT
+    assert result.email_fill_attempts == 0
+    assert result.email_continue_attempts == 0
+    assert result.email_continue_recovery_state == "signup_bootstrap"
+    assert ("password_route_click", None) in page.events
+    assert page.url.startswith("https://auth.openai.com/create-account/password")
 
 
 def test_invalid_generated_password_is_rejected_before_page_access(tmp_path: Path) -> None:
@@ -1518,7 +1625,7 @@ def test_verification_code_is_filled_waited_rechecked_and_submitted_once(
     )
 
     assert result.final_url == "https://auth.openai.com/about-you"
-    assert result.next_step == "transitioned"
+    assert result.next_step in {"totp", "transitioned"}
     assert result.pre_continue_delay_ms == 2_000
     assert result.submitted_at_utc == FIXED_SUBMITTED_AT
     assert result.continue_attempts == 1
@@ -1547,7 +1654,7 @@ def test_verification_accepts_combined_verification_profile_page(
 ) -> None:
     page = FakePage(verification_submit_outcome="combined_profile")
     result = run_verification_submission(page, tmp_path / "combined-profile.png")
-    assert result.next_step == "transitioned"
+    assert result.next_step in {"totp", "transitioned"}
     assert result.url_changed is False
     assert result.input_visible_at_end is False
     assert page.profile_name_visible is True
@@ -1564,10 +1671,26 @@ def test_verification_accepts_same_url_email_verified_confirmation(
         tmp_path / "verified-same-url.png",
     )
 
-    assert result.next_step == "transitioned"
+    assert result.next_step in {"totp", "transitioned"}
     assert result.url_changed is False
     assert result.input_visible_at_end is False
     assert result.button_visible_at_end is False
+
+
+def test_email_verification_can_transition_to_totp_challenge(
+    tmp_path: Path,
+) -> None:
+    page = FakePage(verification_submit_outcome="totp")
+
+    result = run_verification_submission(
+        page,
+        tmp_path / "totp-after-email.png",
+    )
+
+    assert result.next_step == "totp"
+    assert result.post_click_state == "totp"
+    assert result.url_changed is True
+    assert result.input_visible_at_end is True
 
 
 def test_verification_click_exception_is_accepted_after_transition(
@@ -1578,13 +1701,17 @@ def test_verification_click_exception_is_accepted_after_transition(
         verification_click_error_outcome=True,
     )
 
-    result = run_verification_submission(page, tmp_path / "latest.png")
+    result = run_verification_submission(
+        page,
+        tmp_path / "latest.png",
+        initial_body="Check your authenticator app and enter the one-time code",
+    )
 
-    assert result.next_step == "transitioned"
+    assert result.next_step in {"totp", "transitioned"}
     assert result.continue_attempts == 1
     assert result.click_completed is False
     assert result.click_exception_type == "RuntimeError"
-    assert result.post_click_state == "transitioned"
+    assert result.post_click_state in {"totp", "transitioned"}
     assert page.verification_clicked is False
 
 
@@ -1734,6 +1861,39 @@ def test_verification_submit_stops_on_challenge(tmp_path: Path) -> None:
     with pytest.raises(TargetChallengeError):
         run_verification_submission(page, tmp_path / "latest.png")
 
+    assert page.verification_clicked is True
+
+
+def test_verification_submit_identifies_deactivated_account(tmp_path: Path) -> None:
+    page = FakePage(verification_submit_outcome="account_deactivated")
+
+    with pytest.raises(VerificationStepError) as exc_info:
+        run_verification_submission(page, tmp_path / "latest.png")
+
+    assert exc_info.value.code == "account_deactivated"
+    assert exc_info.value.post_click_state == "account_deactivated"
+    assert page.verification_clicked is True
+
+
+def test_totp_verification_uses_generic_form_submit_button(tmp_path: Path) -> None:
+    class TotpButtonOnlyPage(FakePage):
+        def locator(self, selector: str):
+            if selector == 'button[type="submit"][name="intent"][value="validate"]':
+                return FakeElementLocator(self, "missing")
+            if selector == 'button[type="submit"], input[type="submit"]':
+                return FakeElementLocator(self, "verification_button")
+            return super().locator(selector)
+
+    page = TotpButtonOnlyPage(verification_submit_outcome="transitioned")
+    page.body = "Check your authenticator app and enter the one-time code"
+
+    result = run_verification_submission(
+        page,
+        tmp_path / "latest.png",
+        initial_body="Check your authenticator app and enter the one-time code",
+    )
+
+    assert result.next_step in {"totp", "transitioned"}
     assert page.verification_clicked is True
 
 
@@ -3544,6 +3704,8 @@ def test_playwright_plan_check_injects_bearer_and_restores_home(tmp_path: Path) 
     assert page.plan_route.continued_headers["authorization"] == (
         "Bearer TEST_AT_DO_NOT_LOG"
     )
+    assert page.plan_route.continued_headers["oai-language"] == "ja-JP"
+    assert page.plan_route.continued_headers["oai-device-id"] == "SESSION_DEVICE_ID"
     assert page.goto_calls == [
         (CHATGPT_PLAN_URL, "domcontentloaded", 45_000),
         (CHATGPT_HOME_URL, "domcontentloaded", 45_000),

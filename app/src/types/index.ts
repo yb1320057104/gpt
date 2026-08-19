@@ -164,6 +164,8 @@ export interface ExecutionSettings {
   antApiKey: string
   antApiPort: number
   headless: boolean
+  requireRegistrationPassword: boolean
+  enableRegistrationTotp: boolean
   proxyRetryCount: number
   concurrency: number
   taskTimeoutSeconds: number
@@ -179,6 +181,8 @@ export interface ExecutionSettingsInput {
   antApiKey: string
   antApiPort: number
   headless: boolean
+  requireRegistrationPassword: boolean
+  enableRegistrationTotp: boolean
   proxyRetryCount: number
   concurrency: number
   taskTimeoutSeconds: number
@@ -501,6 +505,25 @@ export interface PipelineError {
   message: string
 }
 
+export type PipelineLogLevel = 'info' | 'success' | 'warning' | 'error'
+
+export interface PipelineLogEntry {
+  id: string
+  timestamp: string
+  level: PipelineLogLevel
+  event: string
+  message: string
+  code?: string | null
+  details: Record<string, string | number | boolean | null>
+}
+
+export interface PipelineLogResponse {
+  itemId: string
+  email: string
+  stage: PipelineStage
+  logs: PipelineLogEntry[]
+}
+
 export interface PipelineItem {
   id: string
   accountId: string
@@ -526,6 +549,9 @@ export interface PipelineItem {
   checkoutTypeCheckedAt?: string | null
   paymentLink?: string | null
   paymentLinkConfigured: boolean
+  paymentLinkExpiresAt?: string | null
+  paymentLinkExpired?: boolean
+  paymentLinkRemainingSeconds?: number
   paymentStatus: string
   paymentRetryCount: number
   paymentJobId?: string | null
@@ -556,12 +582,15 @@ export interface PipelineItem {
   mailConfirmationStartedAt?: string | null
   mailConfirmationDeadline?: string | null
   mailConfirmationNextCheckAt?: string | null
-  smsReceiverState?: 'idle' | 'queued' | 'running' | 'retry_wait' | 'paused' | 'completed' | 'ready' | 'failed' | 'stopped'
+  smsReceiverState?: 'idle' | 'waiting' | 'queued' | 'running' | 'retry_wait' | 'paused' | 'completed' | 'ready' | 'failed' | 'stopped'
   smsReceiverCredentialReady?: boolean
   smsReceiverPhoneVerified?: boolean
+  smsReceiverPhoneNumber?: string | null
+  smsReceiverPhoneVerifiedAt?: string | null
   smsReceiverTaskId?: string | null
   smsReceiverSubmittedAt?: string | null
   smsReceiverUpdatedAt?: string | null
+  smsReceiverRetryCount?: number
   smsReceiverError?: string | null
   createdAt: string
   updatedAt: string
@@ -586,15 +615,49 @@ export interface PipelinePaidStats {
   exported: number
   unexported: number
   mailConfirmed: number
+  smsVerified?: number
+  smsUnverified?: number
   daily: Array<{ date: string; count: number }>
 }
+
+export type PipelinePaidExportFormat = 'original' | 'password_totp' | 'sub2api' | 'sub2api_split' | 'codex_json'
 
 export interface PipelinePaidExport {
   content: string
   filename: string
   count: number
   skippedMissingUrlCount: number
+  format: PipelinePaidExportFormat
+  mimeType: string
+  encoding: 'utf-8' | 'base64'
+  contentBase64?: string | null
+  skippedMissingSecurityCount?: number
+  skippedMissingCredentialCount?: number
+  skippedReceiverAccountCount?: number
 }
+
+export interface PipelinePaidExportBatch {
+  formats: PipelinePaidExportFormat[]
+  exports: PipelinePaidExport[]
+  errors: Array<{
+    format: PipelinePaidExportFormat
+    code: string
+    message: string
+    statusCode?: number
+  }>
+  artifactCount: number
+  failedFormatCount: number
+  archive?: {
+    content: string
+    contentBase64?: string | null
+    encoding: 'base64'
+    mimeType: 'application/zip'
+    filename: string
+    count: number
+  } | null
+}
+
+export type PipelinePaidExportResponse = PipelinePaidExport | PipelinePaidExportBatch
 
 export interface PipelinePaidMailCheck {
   requested: number
@@ -612,13 +675,45 @@ export interface SmsReceiverSettings {
   autoSubmit: boolean
   baseUrl: string
   mailboxPublicBaseUrl: string
+  concurrency: number
+  failureRetries: number
+  retryBackoffSeconds: number
   updatedAt: string | null
+}
+
+export interface SmsReceiverHeroSmsCountry {
+  id: number | string
+  name: string
+  flag?: string
+  popular?: boolean
+}
+
+export interface SmsReceiverHeroSmsCatalog {
+  countries: SmsReceiverHeroSmsCountry[]
+}
+
+export interface SmsReceiverHeroSmsSettings {
+  apiKey: string
+  countryIds: number[]
+  minPrice: number | null
+  maxPrice: number
+  preferredPrice: number | null
+  acquirePriority: 'country' | 'price' | 'price_high'
+  maxRetries: number
+  codeWaitSeconds: number
+  emailOtpWaitSeconds: number
+  emailOtpPollIntervalSeconds: number
+  emailOtpAttempts: number
+  reuseEnabled: boolean
+  credentialConfigured: boolean
 }
 
 export interface SmsReceiverBatchResult {
   requested: number
   processed: number
   submitted?: number
+  queued?: number
+  skipped?: number
   ready?: number
   failed: number
   items: Array<{ id: string; ok: boolean; state: string; error?: string }>
