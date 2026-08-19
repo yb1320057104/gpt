@@ -3,11 +3,15 @@ from __future__ import annotations
 from .base import ProviderAdapter
 from .gcash import GCASH
 from .gopay import GOPAY
+from .local_methods import BLIK, IDEAL, KAKAO_PAY, MOMO, PIX, TWINT, UPI
 from .paypal import PAYPAL
 
 
 PROVIDERS: dict[str, ProviderAdapter] = {
-    provider.name: provider for provider in (PAYPAL, GOPAY, GCASH)
+    provider.name: provider
+    for provider in (
+        PAYPAL, GOPAY, GCASH, IDEAL, UPI, PIX, BLIK, TWINT, KAKAO_PAY, MOMO
+    )
 }
 
 

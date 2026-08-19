@@ -304,6 +304,8 @@ def stripe_create_payment_method(
         "key": stripe_key(checkout),
         "_stripe_version": STRIPE_VERSION_BASE,
     }
+    if payment_method == "ideal":
+        body["ideal[bank]"] = "n26"
     response = stage_http_request(
         stripe,
         "Stripe payment_methods",
@@ -558,9 +560,9 @@ def first_value_by_key(payload: Any, key: str) -> Any:
 
 
 def config_currency(config: ExtractionConfig) -> str:
-    from ..config import country_config
+    from ..config import payment_currency
 
-    return country_config(config.country)[1]
+    return payment_currency(config.country, config.payment_method)
 
 
 def config_locale(config: ExtractionConfig) -> str:

@@ -437,6 +437,13 @@ export interface PaymentExtractorResult {
   paypalUrl?: string
   gopayUrl?: string
   gcashUrl?: string
+  idealUrl?: string
+  upiUrl?: string
+  pixUrl?: string
+  blikUrl?: string
+  twintUrl?: string
+  kakaoPayUrl?: string
+  momoUrl?: string
   [key: string]: unknown
 }
 

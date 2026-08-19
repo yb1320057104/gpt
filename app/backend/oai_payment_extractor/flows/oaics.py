@@ -220,6 +220,8 @@ def openai_confirmation_token(
         body["client_context[customer]"] = str(ctx["customer_id"])
     if config.stripe_hcaptcha_token:
         body["payment_method_data[radar_options][hcaptcha_token]"] = config.stripe_hcaptcha_token
+    if payment_method == "ideal":
+        body["payment_method_data[ideal][bank]"] = "n26"
     response = stage_http_request(
         stripe,
         "Stripe confirmation token",
@@ -410,9 +412,9 @@ def expected_amount(payload: Any) -> str:
 
 
 def config_currency(config: ExtractionConfig) -> str:
-    from ..config import country_config
+    from ..config import payment_currency
 
-    return country_config(config.country)[1]
+    return payment_currency(config.country, config.payment_method)
 
 
 def config_locale(config: ExtractionConfig) -> str:

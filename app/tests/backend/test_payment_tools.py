@@ -165,11 +165,18 @@ def test_service_exposes_all_source_options_and_rotates_proxy_pool(monkeypatch) 
     first = service.create(task_payload())
     second = service.create(task_payload(paymentMethod="gopay", country="ID"))
 
-    assert len(service.options()["countries"]) == 15
+    assert len(service.options()["countries"]) == 20
     assert [item["value"] for item in service.options()["paymentMethods"]] == [
         "paypal",
         "gopay",
         "gcash",
+        "ideal",
+        "upi",
+        "pix",
+        "blik",
+        "twint",
+        "kakao_pay",
+        "momo",
     ]
     assert manager.configs[0].checkout_proxy.endswith("@one.example:8080")
     assert manager.configs[1].checkout_proxy.endswith("@two.example:8080")

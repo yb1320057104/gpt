@@ -50,6 +50,11 @@ const TERMINAL_STATES = new Set<PaymentExtractorTaskStatus>([
   'cancelled',
 ])
 const FALLBACK_COUNTRIES: PaymentExtractorOption[] = [
+  { value: 'IN', label: '印度 · INR' },
+  { value: 'PL', label: '波兰 · PLN' },
+  { value: 'CH', label: '瑞士 · CHF' },
+  { value: 'KR', label: '韩国 · KRW' },
+  { value: 'VN', label: '越南 · VND' },
   { value: 'GB', label: '英国 · GBP' },
   { value: 'US', label: '美国 · USD' },
   { value: 'BR', label: '巴西 · USD' },
@@ -70,6 +75,13 @@ const FALLBACK_METHODS: PaymentExtractorOption[] = [
   { value: 'paypal', label: 'PayPal' },
   { value: 'gopay', label: 'GoPay' },
   { value: 'gcash', label: 'GCash' },
+  { value: 'ideal', label: 'iDEAL' },
+  { value: 'upi', label: 'UPI' },
+  { value: 'pix', label: 'PIX' },
+  { value: 'blik', label: 'BLIK' },
+  { value: 'twint', label: 'TWINT' },
+  { value: 'kakao_pay', label: 'KakaoPay' },
+  { value: 'momo', label: 'MoMo' },
 ]
 
 const rawText = ref('')
@@ -342,10 +354,24 @@ function resultUrl(task: PaymentExtractorTask) {
     'paypalUrl',
     'gopayUrl',
     'gcashUrl',
+    'idealUrl',
+    'upiUrl',
+    'pixUrl',
+    'blikUrl',
+    'twintUrl',
+    'kakaoPayUrl',
+    'momoUrl',
     'provider_url',
     'paypal_url',
     'gopay_url',
     'gcash_url',
+    'ideal_url',
+    'upi_url',
+    'pix_url',
+    'blik_url',
+    'twint_url',
+    'kakao_pay_url',
+    'momo_url',
   )
 }
 

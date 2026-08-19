@@ -56,11 +56,23 @@ COUNTRY_NAMES = {
     "ES": "西班牙",
     "FI": "芬兰",
     "FR": "法国",
+    "IN": "印度",
+    "PL": "波兰",
+    "CH": "瑞士",
+    "KR": "韩国",
+    "VN": "越南",
 }
 PAYMENT_METHOD_LABELS = {
     "paypal": "PayPal",
     "gopay": "GoPay",
     "gcash": "GCash",
+    "ideal": "iDEAL",
+    "upi": "UPI",
+    "pix": "PIX",
+    "blik": "BLIK",
+    "twint": "TWINT",
+    "kakao_pay": "KakaoPay",
+    "momo": "MoMo",
 }
 
 
@@ -92,7 +104,10 @@ class PaymentExtractorTaskCreate(ExtractorModel):
         ),
     )
     country: str | None = Field(default=None, min_length=2, max_length=2)
-    paymentMethod: Literal["paypal", "gopay", "gcash"] | None = Field(
+    paymentMethod: Literal[
+        "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
+        "twint", "kakao_pay", "momo"
+    ] | None = Field(
         default=None,
         validation_alias=AliasChoices("paymentMethod", "payment_method"),
     )

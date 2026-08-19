@@ -302,7 +302,9 @@ def country_values(config: ExtractionConfig) -> tuple[str, str, str, str]:
 
 
 def config_currency(config: ExtractionConfig) -> str:
-    return config_values(config)[1]
+    from .config import payment_currency
+
+    return payment_currency(config.country, config.payment_method)
 
 
 def config_locale(config: ExtractionConfig) -> str:

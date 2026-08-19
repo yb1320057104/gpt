@@ -37,6 +37,11 @@ COUNTRY_PROFILES = {
     "ES": {"currency": "EUR", "locale": "es-ES", "timezone": "Europe/Madrid"},
     "FI": {"currency": "EUR", "locale": "fi-FI", "timezone": "Europe/Helsinki"},
     "FR": {"currency": "EUR", "locale": "fr-FR", "timezone": "Europe/Paris"},
+    "IN": {"currency": "INR", "locale": "en-IN", "timezone": "Asia/Kolkata"},
+    "PL": {"currency": "PLN", "locale": "pl-PL", "timezone": "Europe/Warsaw"},
+    "CH": {"currency": "CHF", "locale": "de-CH", "timezone": "Europe/Zurich"},
+    "KR": {"currency": "KRW", "locale": "ko-KR", "timezone": "Asia/Seoul"},
+    "VN": {"currency": "VND", "locale": "vi-VN", "timezone": "Asia/Ho_Chi_Minh"},
 }
 
 _BILLING_VALUES = {
@@ -55,6 +60,11 @@ _BILLING_VALUES = {
     "ES": ("Carlos García", "carlos.garcia@example.com", "+34911234567", "Calle de Alcalá, 1", "Madrid", "Madrid", "28014"),
     "FI": ("Matti Meikäläinen", "matti.meikalainen@example.com", "+35891234567", "Mannerheimintie 1", "Helsinki", "Uusimaa", "00100"),
     "FR": ("Jean Dupont", "jean.dupont@example.com", "+33142345678", "10 Rue de Rivoli", "Paris", "Île-de-France", "75001"),
+    "IN": ("Aisha Sharma", "aisha.sharma@example.com", "+919810123456", "24 Park Street", "Kolkata", "West Bengal", "700016"),
+    "PL": ("Jan Kowalski", "jan.kowalski@example.com", "+48221234567", "Marszalkowska 1", "Warsaw", "Masovian", "00-001"),
+    "CH": ("Alex Meyer", "alex.meyer@example.com", "+41441234567", "Bahnhofstrasse 1", "Zurich", "Zurich", "8001"),
+    "KR": ("Kim Minjun", "minjun.kim@example.com", "+82212345678", "Teheran-ro 1", "Seoul", "Gangnam-gu", "06130"),
+    "VN": ("Nguyen Minh Anh", "minh.anh@example.com", "+842812345678", "1 Le Duan", "Ho Chi Minh City", "Ho Chi Minh", "700000"),
 }
 
 SUPPORTED_COUNTRIES = tuple(COUNTRY_PROFILES)
@@ -91,13 +101,25 @@ def billing_dict_for_country(country: str) -> dict[str, str]:
 
 def currency_minor_scale(currency: str) -> int:
     """Return the number of decimal places for display conversion."""
-    return 0 if str(currency or "").upper() in {"JPY", "IDR"} else 2
+    return 0 if str(currency or "").upper() in {"JPY", "IDR", "KRW", "VND"} else 2
+
+
+def payment_currency(country: str, payment_method: str) -> str:
+    """Resolve currencies that differ by payment method within one country."""
+    method = str(payment_method or "").strip().lower()
+    if method == "pix" and str(country or "").upper() == "BR":
+        return "BRL"
+    return country_config(country)[1]
 
 
 def normalize_payment_method(value: str) -> str:
     method = str(value or "paypal").strip().lower() or "paypal"
-    if method not in {"paypal", "gopay", "gcash"}:
-        raise ConfigurationError("payment_method must be one of paypal, gopay, gcash")
+    supported = {
+        "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
+        "twint", "kakao_pay", "momo",
+    }
+    if method not in supported:
+        raise ConfigurationError("payment_method must be one of " + ", ".join(sorted(supported)))
     return method
 
 
