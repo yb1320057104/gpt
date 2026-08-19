@@ -322,6 +322,7 @@ class FakeElementLocator:
             "profile_segment_day": self.page.profile_segmented_visible,
             "profile_finish": self.page.profile_finish_visible,
             "alert": self.page.alert_visible,
+            "cookie_banner": self.page.cookie_banner_visible,
         }.get(self.kind, False)
 
 class FakePage:
@@ -374,6 +375,7 @@ class FakePage:
         login_challenge_checks_before_release: int | None = None,
         continue_text: str = "Continue",
         forced_signup_initial_step: str | None = None,
+        cookie_banner_visible: bool = True,
     ) -> None:
         self.url = "about:blank"
         self.body = ""
@@ -425,6 +427,7 @@ class FakePage:
         )
         self.continue_text = continue_text
         self.forced_signup_initial_step = forced_signup_initial_step
+        self.cookie_banner_visible = cookie_banner_visible
         self.login_challenge_checks = 0
         self.screenshot_calls = 0
         self.profile_home_checks = 0
@@ -526,6 +529,8 @@ class FakePage:
         self.locator_calls.append(selector)
         if selector == "body":
             return FakeBodyLocator(self)
+        if "reject non-essential" in selector and "accept all" in selector:
+            return FakeElementLocator(self, "cookie_banner")
         if "challenges.cloudflare.com" in selector or "cf-turnstile" in selector:
             return FakeElementLocator(self, "challenge")
         if (

@@ -1297,6 +1297,34 @@ class CdpBrowserAutomation:
             'and not(ancestor-or-self::*[@aria-hidden="true"])]'
         )
 
+    @staticmethod
+    def _cookie_banner_locator(page: Any) -> Any:
+        return page.locator(
+            'xpath=//*[self::button or @role="button"]['
+            'not(ancestor-or-self::*[@inert]) and '
+            'not(ancestor-or-self::*[@aria-hidden="true"]) and ('
+            'contains(translate(normalize-space(.), '
+            '"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), '
+            '"accept all") or '
+            'contains(translate(normalize-space(.), '
+            '"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), '
+            '"reject non-essential")'
+            ')]'
+        )
+
+    async def _wait_for_cookie_banner(self, page: Any, timeout_seconds: float = 8.0) -> bool:
+        """Treat the regional consent banner as the frontend-hydration signal."""
+        deadline = monotonic() + timeout_seconds
+        while True:
+            try:
+                if await self._is_visible(self._cookie_banner_locator(page)):
+                    return True
+            except Exception:
+                pass
+            if monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(0.5, max(0.0, deadline - monotonic())))
+
     async def _page_contains_challenge(
         self,
         page: Any,
@@ -1592,6 +1620,21 @@ class CdpBrowserAutomation:
                     started=started,
                     timeout_ms=self.login_navigation_timeout_ms,
                 ) from None
+            if not await self._wait_for_cookie_banner(page):
+                for _refresh_attempt in range(2):
+                    await page.goto(
+                        CHATGPT_LOGIN_URL,
+                        wait_until="domcontentloaded",
+                        timeout=self.login_navigation_timeout_ms,
+                    )
+                    if await self._wait_for_cookie_banner(page):
+                        break
+                else:
+                    await self._safe_screenshot(page)
+                    raise EmailStepError(
+                        "login_frontend_not_initialized",
+                        "ChatGPT 登录页刷新 3 次后仍未出现 Cookie 初始化标志",
+                    )
             return
 
         started = monotonic()

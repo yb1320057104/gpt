@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   CircleCheck,
   CircleClose,
@@ -56,20 +56,25 @@ const running = computed(() =>
 )
 const groupOptions = computed(() =>
   store.proxyGroups
-    .filter((item) => item.country === selectedCountry.value && item.enabled > 0)
+    .filter((item) => item.country === selectedCountry.value)
     .map((item) => ({ ...item, label: `${item.group} · ${item.enabled} 条启用代理` })),
 )
-const countryOptions = computed(() =>
-  COMMON_REGISTRATION_COUNTRIES.map((country) => {
-    const summary = store.proxyCountries.find((item) => item.country === country.value)
-    return {
-      country: country.value,
-      total: summary?.total || 0,
-      enabled: summary?.enabled || 0,
-      label: `${countryLabel(country.value)} · ${summary?.enabled || 0} 条池代理`,
-    }
-  }),
-)
+const countryOptions = computed(() => {
+  const countryCodes = new Set<string>(COMMON_REGISTRATION_COUNTRIES.map((country) => country.value))
+  store.proxyCountries.forEach((summary) => countryCodes.add(summary.country))
+  return [...countryCodes]
+    .filter((country) => country !== 'ZZ')
+    .sort((left, right) => countryLabel(left).localeCompare(countryLabel(right), 'zh-CN'))
+    .map((country) => {
+      const summary = store.proxyCountries.find((item) => item.country === country)
+      return {
+        country,
+        total: summary?.total || 0,
+        enabled: summary?.enabled || 0,
+        label: `${countryLabel(country)} · ${summary?.enabled || 0} 条池代理`,
+      }
+    })
+})
 const progress = computed(() =>
   store.runState.requested
     ? Math.min(100, Math.max(0, Math.round((store.runState.processed / store.runState.requested) * 100)))
@@ -165,6 +170,13 @@ watch(selectedEmailSource, (value) => {
   } catch {
     // Local storage is optional.
   }
+})
+
+onMounted(() => {
+  void Promise.all([
+    store.refreshProxyCountries(),
+    store.refreshProxyGroups(),
+  ]).catch(() => undefined)
 })
 
 watch(
@@ -429,6 +441,7 @@ function downloadLogs() {
               :key="`${option.country}-${option.group}`"
               :label="option.label"
               :value="option.group"
+              :disabled="option.enabled < 1"
             />
           </el-select>
           <label>本次待处理数量</label>

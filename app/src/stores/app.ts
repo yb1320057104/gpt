@@ -271,29 +271,29 @@ export const useAppStore = defineStore('app', {
 
     async setProxyEnabled(id: string, enabled: boolean) {
       await dataGateway.setProxyEnabled(id, enabled)
-      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshStats()])
+      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshProxyGroups(), this.refreshStats()])
     },
 
     async setProxyCountry(id: string, country: string) {
       await dataGateway.setProxyCountry(id, country)
-      await Promise.all([this.refreshProxies(), this.refreshProxyCountries()])
+      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshProxyGroups()])
     },
 
     async deleteProxy(id: string) {
       const deleted = await dataGateway.deleteProxy(id)
-      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshStats()])
+      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshProxyGroups(), this.refreshStats()])
       return deleted
     },
 
     async deleteProxies(ids: string[]) {
       const deleted = await dataGateway.deleteProxies(ids)
-      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshStats()])
+      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshProxyGroups(), this.refreshStats()])
       return deleted
     },
 
     async clearProxies() {
       const deleted = await dataGateway.clearProxies()
-      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshStats()])
+      await Promise.all([this.refreshProxies(), this.refreshProxyCountries(), this.refreshProxyGroups(), this.refreshStats()])
       return deleted
     },
 
