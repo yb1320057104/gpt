@@ -3739,13 +3739,22 @@ def test_playwright_plan_401_is_redacted_and_restores_home(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
-    ("session_id", "expected"),
-    [("oaics_fixture", "oaics"), ("cs_fixture", "cs")],
+    ("payload", "expected", "expected_detail"),
+    [
+        ({"checkout_session_id": "oaics_fixture"}, "oaics", "oaics"),
+        ({"checkout_session_id": "cs_live_fixture"}, "cs", "stripe_cs_live"),
+        ({"checkout_session_id": "cs_test_fixture"}, "cs", "stripe_cs_test"),
+        ({"checkout_session_id": "cs_fixture"}, "cs", "stripe_cs"),
+        ({"session_kind": "stripe_checkout"}, "cs", "stripe_checkout"),
+    ],
 )
 def test_registration_checkout_type_uses_current_browser_session(
-    tmp_path: Path, session_id: str, expected: str
+    tmp_path: Path,
+    payload: dict[str, str],
+    expected: str,
+    expected_detail: str,
 ) -> None:
-    page = CheckoutTypeFakePage({"checkout_session_id": session_id})
+    page = CheckoutTypeFakePage(payload)
     automation = CdpBrowserAutomation(
         "ws://private.invalid",
         tmp_path / "latest.png",
@@ -3757,6 +3766,7 @@ def test_registration_checkout_type_uses_current_browser_session(
     )
 
     assert result.checkout_type == expected
+    assert result.checkout_detail == expected_detail
     assert page.checkout_arguments is not None
     assert page.checkout_arguments["country"] == "JP"
     assert page.checkout_arguments["token"] == "TEST_AT_DO_NOT_LOG"

@@ -1620,21 +1620,10 @@ class CdpBrowserAutomation:
                     started=started,
                     timeout_ms=self.login_navigation_timeout_ms,
                 ) from None
-            if not await self._wait_for_cookie_banner(page):
-                for _refresh_attempt in range(2):
-                    await page.goto(
-                        CHATGPT_LOGIN_URL,
-                        wait_until="domcontentloaded",
-                        timeout=self.login_navigation_timeout_ms,
-                    )
-                    if await self._wait_for_cookie_banner(page):
-                        break
-                else:
-                    await self._safe_screenshot(page)
-                    raise EmailStepError(
-                        "login_frontend_not_initialized",
-                        "ChatGPT 登录页刷新 3 次后仍未出现 Cookie 初始化标志",
-                    )
+            # The regional consent banner is a useful hydration signal when it
+            # exists, but ChatGPT no longer renders it for every profile. Wait
+            # briefly for it, then let the form-stability gate below decide.
+            await self._wait_for_cookie_banner(page)
             return
 
         started = monotonic()
@@ -1655,6 +1644,10 @@ class CdpBrowserAutomation:
                 started=started,
                 timeout_ms=self.login_navigation_timeout_ms,
             ) from None
+
+        # Prefer the consent banner as a frontend-ready signal, but do not make
+        # it mandatory because returning profiles may have stored consent.
+        await self._wait_for_cookie_banner(page)
 
         bootstrap_started = monotonic()
         try:

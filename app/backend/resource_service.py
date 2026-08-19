@@ -626,6 +626,7 @@ class MongoResourceStore:
                 {
                     "$set": {
                         "checkoutType": result.checkout_type,
+                        "checkoutTypeDetail": result.checkout_detail,
                         "checkoutTypeCheckedAt": result.checked_at,
                         "checkoutTypeErrorCode": None,
                     }
@@ -1356,6 +1357,7 @@ class MongoResourceStore:
             planRenewsAt=document.get("planRenewsAt"),
             promotionCampaignId=document.get("promotionCampaignId"),
             checkoutType=document.get("checkoutType"),
+            checkoutTypeDetail=document.get("checkoutTypeDetail"),
             checkoutTypeCheckedAt=document.get("checkoutTypeCheckedAt"),
             checkoutTypeErrorCode=document.get("checkoutTypeErrorCode"),
             registrationCountry=document.get("registrationCountry"),

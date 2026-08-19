@@ -7,6 +7,13 @@ from uuid import uuid4
 
 
 CheckoutType = Literal["oaics", "cs"]
+CheckoutTypeDetail = Literal[
+    "oaics",
+    "stripe_cs_live",
+    "stripe_cs_test",
+    "stripe_checkout",
+    "stripe_cs",
+]
 
 
 class CheckoutTypeCheckError(RuntimeError):
@@ -20,6 +27,33 @@ class CheckoutTypeCheckError(RuntimeError):
 class CheckoutTypeResult:
     checkout_type: CheckoutType
     checked_at: datetime
+    checkout_detail: CheckoutTypeDetail | None = None
+
+
+def checkout_detail_from_result(
+    result: dict[str, Any],
+) -> CheckoutTypeDetail | None:
+    session_id = str(
+        result.get("checkoutSessionId") or result.get("checkout_session_id") or ""
+    ).strip().casefold()
+    if session_id.startswith("oaics_"):
+        return "oaics"
+    if session_id.startswith("cs_live_"):
+        return "stripe_cs_live"
+    if session_id.startswith("cs_test_"):
+        return "stripe_cs_test"
+    if session_id.startswith("cs_"):
+        return "stripe_cs"
+    session_kind = str(
+        result.get("sessionKind") or result.get("session_kind") or ""
+    ).strip().casefold()
+    if session_kind in {"oaics", "openai_custom_checkout"}:
+        return "oaics"
+    if session_kind == "stripe_checkout":
+        return "stripe_checkout"
+    if session_kind == "stripe_cs":
+        return "stripe_cs"
+    return None
 
 
 def checkout_type_from_result(result: dict[str, Any]) -> CheckoutType | None:
@@ -68,12 +102,38 @@ def parse_checkout_type_response(payload: Any) -> CheckoutTypeResult:
                     return found
         return ""
 
-    checkout_type = checkout_type_from_result(
-        {"checkout_session_id": find_session_id(payload)}
-    )
+    def find_session_kind(value: Any, depth: int = 0) -> str:
+        if depth > 8:
+            return ""
+        if isinstance(value, dict):
+            for key in ("session_kind", "sessionKind"):
+                kind = str(value.get(key) or "").strip()
+                if kind:
+                    return kind
+            for nested in value.values():
+                found = find_session_kind(nested, depth + 1)
+                if found:
+                    return found
+        if isinstance(value, list):
+            for nested in value:
+                found = find_session_kind(nested, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    session_id = find_session_id(payload)
+    result = {
+        "checkout_session_id": session_id,
+        "session_kind": find_session_kind(payload),
+    }
+    checkout_type = checkout_type_from_result(result)
     if checkout_type is None:
         raise CheckoutTypeCheckError("checkout_session_id_missing")
-    return CheckoutTypeResult(checkout_type, datetime.now(timezone.utc))
+    return CheckoutTypeResult(
+        checkout_type,
+        datetime.now(timezone.utc),
+        checkout_detail_from_result(result),
+    )
 
 
 def check_checkout_type_curl(

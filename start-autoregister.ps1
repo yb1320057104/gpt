@@ -1,5 +1,7 @@
 param(
-    [switch] $SkipMailCom
+    [switch] $SkipMailCom,
+    [switch] $NoBrowser,
+    [switch] $Restart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +11,7 @@ $App = Join-Path $Root 'app'
 $Python = Join-Path $Root 'register_env\Scripts\python.exe'
 $settingsPath = Join-Path $Root 'data\settings.json'
 $RuntimeLogs = Join-Path $Root 'data\runtime'
+$RuntimePids = Join-Path $RuntimeLogs 'pids'
 $MailComStart = Join-Path $Root 'mailcom-manager\start.ps1'
 $AppEnv = Join-Path $App '.env'
 $ProjectBase = Split-Path -Parent (Split-Path -Parent $Root)
@@ -28,7 +31,11 @@ $ResinRoot = if ($env:RESIN_ROOT) {
         if (Test-Path -LiteralPath (Join-Path $candidate 'resin.exe')) { $candidate }
     } | Select-Object -First 1
 }
-New-Item -ItemType Directory -Force -Path $RuntimeLogs | Out-Null
+New-Item -ItemType Directory -Force -Path $RuntimeLogs, $RuntimePids | Out-Null
+
+if ($Restart) {
+    & (Join-Path $Root 'stop-autoregister.ps1') -KeepRoxy:$false
+}
 $Roxy = $env:ROXY_BROWSER_PATH
 if (-not $Roxy -and (Test-Path -LiteralPath $settingsPath)) {
     try {
@@ -54,6 +61,19 @@ function Test-LocalPort([int] $Port) {
 function Start-Component([string] $Name, [scriptblock] $Action) {
     Write-Host "[$Name] checking..." -ForegroundColor Cyan
     & $Action
+}
+
+function Save-ProcessId([string] $Name, [System.Diagnostics.Process] $Process) {
+    if ($Process -and -not $Process.HasExited) {
+        $Process.Id | Set-Content -LiteralPath (Join-Path $RuntimePids "$Name.pid") -Encoding ascii
+    }
+}
+if (-not $Roxy -or -not (Test-Path -LiteralPath $Roxy)) {
+    $Roxy = @(
+        'D:\app\RoxyBrowser\RoxyBrowser.exe',
+        'D:\RoxyBrowser\RoxyBrowser.exe',
+        (Join-Path $env:LOCALAPPDATA 'RoxyBrowser\RoxyBrowser.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 }
 
 function Wait-LocalPort([int] $Port, [int] $TimeoutSeconds = 20) {
@@ -105,31 +125,39 @@ function Ensure-AppSecret([string] $Name) {
     return $value
 }
 
-if (-not (Test-Path $Python)) {
+if (-not (Test-Path -LiteralPath $AppEnv)) {
+    New-Item -ItemType File -Path $AppEnv -Force | Out-Null
+}
+if (-not (Test-Path -LiteralPath $Python)) {
     throw "Python environment not found. Run app\setup.ps1 first: $Python"
+}
+if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
+    throw 'npm.cmd was not found. Install Node.js before starting the frontend.'
 }
 
 Start-Component 'Easy Proxies' {
-    $binary = Join-Path $EasyProxiesRoot 'easy_proxies.exe'
+    $binary = if ($EasyProxiesRoot) { Join-Path $EasyProxiesRoot 'easy_proxies.exe' } else { '' }
     $safeConfig = Join-Path $App 'proxy-engines\easy-proxies.yaml'
     if (Test-LocalPort 9091) {
         Write-Host '  already running on 127.0.0.1:9091' -ForegroundColor Green
-    } elseif (Test-Path -LiteralPath $binary) {
+    } elseif ($binary -and (Test-Path -LiteralPath $binary) -and (Test-Path -LiteralPath $safeConfig)) {
         $process = Start-Process -FilePath $binary -ArgumentList '-config', $safeConfig -WorkingDirectory (Split-Path -Parent $safeConfig) -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput (Join-Path $RuntimeLogs 'easy-proxies.out.log') `
             -RedirectStandardError (Join-Path $RuntimeLogs 'easy-proxies.err.log')
         Confirm-Started 'Easy Proxies' $process 9091 (Join-Path $RuntimeLogs 'easy-proxies.err.log') 15
+        Save-ProcessId 'easy-proxies' $process
     } else {
-        Write-Host "  executable not found: $binary" -ForegroundColor Yellow
+        Write-Host '  executable or managed config not found; set EASY_PROXIES_ROOT and verify app\proxy-engines\easy-proxies.yaml' -ForegroundColor Yellow
     }
 }
 
 Start-Component 'Resin' {
     $managedBinary = Join-Path $App 'proxy-engines\bin\resin.exe'
-    $binary = if (Test-Path -LiteralPath $managedBinary) { $managedBinary } else { Join-Path $ResinRoot 'resin.exe' }
+    $binary = if (Test-Path -LiteralPath $managedBinary) { $managedBinary } elseif ($ResinRoot) { Join-Path $ResinRoot 'resin.exe' } else { '' }
+    $workingDirectory = if (Test-Path -LiteralPath $managedBinary) { Split-Path -Parent $managedBinary } else { $ResinRoot }
     if (Test-LocalPort 2260) {
         Write-Host '  already running on 127.0.0.1:2260' -ForegroundColor Green
-    } elseif (Test-Path -LiteralPath $binary) {
+    } elseif ($binary -and $workingDirectory -and (Test-Path -LiteralPath $binary)) {
         $adminToken = Ensure-AppSecret 'AUTOREGISTER_RESIN_ADMIN_TOKEN'
         $proxyToken = Ensure-AppSecret 'AUTOREGISTER_RESIN_PROXY_TOKEN'
         $previousAdmin = $env:RESIN_ADMIN_TOKEN
@@ -148,7 +176,7 @@ Start-Component 'Resin' {
             $env:RESIN_STATE_DIR = Join-Path $Root 'data\resin\state'
             $env:RESIN_LOG_DIR = Join-Path $Root 'data\resin\log'
             New-Item -ItemType Directory -Force -Path $env:RESIN_CACHE_DIR, $env:RESIN_STATE_DIR, $env:RESIN_LOG_DIR | Out-Null
-            $process = Start-Process -FilePath $binary -WorkingDirectory $ResinRoot -WindowStyle Hidden -PassThru `
+            $process = Start-Process -FilePath $binary -WorkingDirectory $workingDirectory -WindowStyle Hidden -PassThru `
                 -RedirectStandardOutput (Join-Path $RuntimeLogs 'resin.out.log') `
                 -RedirectStandardError (Join-Path $RuntimeLogs 'resin.err.log')
         } finally {
@@ -161,6 +189,7 @@ Start-Component 'Resin' {
             $env:RESIN_LOG_DIR = $previousLog
         }
         Confirm-Started 'Resin' $process 2260 (Join-Path $RuntimeLogs 'resin.err.log') 15
+        Save-ProcessId 'resin' $process
     } else {
         Write-Host "  executable not found: $binary (build with: go build -o resin.exe .\cmd\resin)" -ForegroundColor Yellow
     }
@@ -170,7 +199,8 @@ Start-Component 'RoxyBrowser' {
     if (Get-Process -Name 'RoxyBrowser' -ErrorAction SilentlyContinue) {
         Write-Host '  already running' -ForegroundColor Green
     } elseif ($Roxy -and (Test-Path -LiteralPath $Roxy)) {
-        Start-Process -FilePath $Roxy -WindowStyle Normal
+        $process = Start-Process -FilePath $Roxy -WindowStyle Normal -PassThru
+        Save-ProcessId 'roxy-browser' $process
         Write-Host '  started; API may need a few seconds to become ready' -ForegroundColor Green
     } else {
         Write-Host '  path is not configured; start RoxyBrowser manually or set ROXY_BROWSER_PATH' -ForegroundColor Yellow
@@ -207,6 +237,7 @@ Start-Component 'Backend' {
             }
         }
         Confirm-Started 'Backend' $process 8000 (Join-Path $RuntimeLogs 'autoregister-backend.err.log') 30
+        Save-ProcessId 'backend' $process
     }
 }
 
@@ -220,6 +251,7 @@ Start-Component 'Frontend' {
             -RedirectStandardOutput (Join-Path $RuntimeLogs 'autoregister-frontend.out.log') `
             -RedirectStandardError (Join-Path $RuntimeLogs 'autoregister-frontend.err.log')
         Confirm-Started 'Frontend' $process 5173 (Join-Path $RuntimeLogs 'autoregister-frontend.err.log') 30
+        Save-ProcessId 'frontend' $process
     }
 }
 
@@ -245,6 +277,10 @@ if (Test-LocalPort 7890) {
     Write-Host '  Local proxy: ready at 127.0.0.1:7890' -ForegroundColor Green
 } else {
     Write-Host '  Local proxy: unavailable (enable Clash/Mihomo mixed port 7890 before selecting local proxy)' -ForegroundColor Yellow
+}
+
+if (-not $NoBrowser -and (Test-LocalPort 5173)) {
+    Start-Process 'http://127.0.0.1:5173/launch'
 }
 if (-not $SkipMailCom) {
     Write-Host '  MailCom: http://127.0.0.1:3211'

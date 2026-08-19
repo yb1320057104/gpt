@@ -90,6 +90,12 @@ function promotionTooltip(account: AccountRecord) {
 }
 
 function checkoutTypeLabel(account: AccountRecord) {
+  if (account.checkoutTypeDetail === 'stripe_cs_live') return 'CS Live'
+  if (account.checkoutTypeDetail === 'stripe_cs_test') return 'CS Test'
+  if (account.checkoutTypeDetail === 'stripe_checkout') return 'Stripe Checkout'
+  if (account.checkoutTypeDetail === 'stripe_cs') return 'Stripe CS'
+  if (account.checkoutTypeDetail === 'oaics') return 'OAICS'
+  if (account.checkoutTypeDetail) return account.checkoutTypeDetail
   if (account.checkoutType === 'oaics') return 'OAICS'
   if (account.checkoutType === 'cs') return 'CS'
   if (account.checkoutTypeErrorCode) return '检测失败'
@@ -98,7 +104,10 @@ function checkoutTypeLabel(account: AccountRecord) {
 
 function checkoutTypeTooltip(account: AccountRecord) {
   if (account.checkoutTypeErrorCode) return `错误码：${account.checkoutTypeErrorCode}`
-  if (account.checkoutTypeCheckedAt) return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}`
+  if (account.checkoutTypeCheckedAt) {
+    const detail = account.checkoutTypeDetail ? `；详细类型：${checkoutTypeLabel(account)}` : ''
+    return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}${detail}`
+  }
   return '点击“检测选中资格”时会同时检测结账类型'
 }
 
@@ -491,7 +500,7 @@ onBeforeUnmount(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="结账类型" width="105">
+        <el-table-column label="结账类型" width="145">
           <template #default="{ row }">
             <el-tooltip :content="checkoutTypeTooltip(row)">
               <el-tag

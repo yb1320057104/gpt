@@ -83,6 +83,7 @@ class AccountRecord(ApiModel):
     planRenewsAt: datetime | None = None
     promotionCampaignId: str | None = None
     checkoutType: CheckoutType | None = None
+    checkoutTypeDetail: str | None = None
     checkoutTypeCheckedAt: datetime | None = None
     checkoutTypeErrorCode: str | None = None
     registrationCountry: str | None = None

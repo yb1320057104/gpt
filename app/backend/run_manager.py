@@ -551,6 +551,13 @@ class BrowserProbeRunExecutor:
                     )
                     if key in poll_details
                 }
+                # A mailbox endpoint may return a complete HTML error page.
+                # Preserve it in structured details, while keeping the visible
+                # message inside RunLogEntryInput's 1,000-character limit.
+                response_body = str(safe_details.get("responseBody") or "")
+                response_preview = response_body
+                if len(response_preview) > 500:
+                    response_preview = response_preview[:500] + "…（完整内容见日志详情）"
                 context.append_log(
                     context.state.runId,
                     "info" if safe_details.get("status") == "ok" else "warning",
@@ -562,7 +569,7 @@ class BrowserProbeRunExecutor:
                         f"{safe_details.get('status', 'unknown')}，"
                         f"apiCode={safe_details.get('apiCode', '-')}，"
                         f"发现验证码={bool(safe_details.get('codePresent', False))}，"
-                        f"原始响应={safe_details.get('responseBody', '')}"
+                        f"原始响应={response_preview}"
                     ),
                     email=handle.email,
                     sequence=handle.sequence,

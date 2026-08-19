@@ -167,18 +167,27 @@ class AntBrowserClient:
     def _fingerprint_args(proxy: ProxyLease) -> list[str]:
         country = str(proxy.country or "US").strip().upper()
         locale, timezone = {
+            "AE": ("en-AE", "Asia/Dubai"),
+            "AU": ("en-AU", "Australia/Sydney"),
+            "BA": ("bs-BA", "Europe/Sarajevo"),
             "BR": ("pt-BR", "America/Sao_Paulo"),
+            "CA": ("en-CA", "America/Toronto"),
             "DE": ("de-DE", "Europe/Berlin"),
             "FR": ("fr-FR", "Europe/Paris"),
             "GB": ("en-GB", "Europe/London"),
             "HK": ("zh-HK", "Asia/Hong_Kong"),
+            "ID": ("id-ID", "Asia/Jakarta"),
             "JP": ("ja-JP", "Asia/Tokyo"),
             "KR": ("ko-KR", "Asia/Seoul"),
+            "MX": ("es-MX", "America/Mexico_City"),
+            "NL": ("nl-NL", "Europe/Amsterdam"),
             "PH": ("en-PH", "Asia/Manila"),
             "SG": ("en-SG", "Asia/Singapore"),
+            "TH": ("th-TH", "Asia/Bangkok"),
             "TR": ("tr-TR", "Europe/Istanbul"),
             "TW": ("zh-TW", "Asia/Taipei"),
             "US": ("en-US", "America/New_York"),
+            "VN": ("vi-VN", "Asia/Ho_Chi_Minh"),
         }.get(country, ("en-US", "America/New_York"))
         language = locale.split("-", 1)[0]
         fingerprint_seed = secrets.randbelow(2_000_000_000) + 1
@@ -191,6 +200,8 @@ class AntBrowserClient:
             f"--lang={locale}",
             f"--accept-lang={locale},{language}",
             f"--timezone={timezone}",
+            f"--fingerprint-locale={locale}",
+            f"--fingerprint-timezone={timezone}",
             f"--window-size={ANT_BROWSER_WINDOW_SIZE}",
             f"--fingerprint-hardware-concurrency={hardware_concurrency}",
             "--disable-non-proxied-udp",

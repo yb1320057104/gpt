@@ -35,7 +35,29 @@ def test_ant_fingerprint_tracks_proxy_country() -> None:
     assert "--lang=en-GB" in args
     assert "--accept-lang=en-GB,en" in args
     assert "--timezone=Europe/London" in args
+    assert "--fingerprint-locale=en-GB" in args
+    assert "--fingerprint-timezone=Europe/London" in args
     assert f"--window-size={ANT_BROWSER_WINDOW_SIZE}" in args
+
+
+def test_ant_fingerprint_supports_vietnam_proxy_country() -> None:
+    args = AntBrowserClient._fingerprint_args(
+        ProxyLease(
+            id="proxy-vn",
+            host="proxy.test",
+            port=8080,
+            username="",
+            password="",
+            country="VN",
+            group="default",
+            scheme="http",
+        )
+    )
+
+    assert "--lang=vi-VN" in args
+    assert "--timezone=Asia/Ho_Chi_Minh" in args
+    assert "--fingerprint-locale=vi-VN" in args
+    assert "--fingerprint-timezone=Asia/Ho_Chi_Minh" in args
 
 
 async def _exercise_ant_profile_lifecycle() -> None:

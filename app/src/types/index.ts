@@ -22,6 +22,7 @@ export interface AccountRecord {
   planRenewsAt?: string | null
   promotionCampaignId?: string | null
   checkoutType?: 'oaics' | 'cs' | null
+  checkoutTypeDetail?: 'oaics' | 'stripe_cs_live' | 'stripe_cs_test' | 'stripe_checkout' | 'stripe_cs' | string | null
   checkoutTypeCheckedAt?: string | null
   checkoutTypeErrorCode?: string | null
   registrationCountry?: string | null
