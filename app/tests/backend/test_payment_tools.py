@@ -1006,9 +1006,10 @@ def test_task_manager_runtime_concurrency_releases_queued_tasks() -> None:
 
 
 def test_task_manager_failure_redacts_all_configured_secrets() -> None:
-    def failing_extractor(config: ExtractionConfig, **_kwargs) -> PaymentLinkResult:
+    def failing_extractor(config: ExtractionConfig, **kwargs) -> PaymentLinkResult:
+        kwargs["stage_callback"]("checkout")
         raise RuntimeError(
-            "fixture failure "
+            "fixture failure HTTP status: 403 "
             f"token={config.access_token} "
             f"checkout={config.checkout_proxy} "
             f"update={config.update_proxy} "
@@ -1030,6 +1031,9 @@ def test_task_manager_failure_redacts_all_configured_secrets() -> None:
         serialized = json.dumps(snapshot)
         assert snapshot["status"] == "failed"
         assert snapshot["networkError"] is False
+        assert snapshot["failureStage"] == "checkout"
+        assert snapshot["errorKind"] == "RuntimeError"
+        assert snapshot["errorHttpStatus"] == 403
         assert "***" in snapshot["error"]
         for secret in (
             payload.accessToken,

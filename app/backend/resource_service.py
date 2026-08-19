@@ -341,6 +341,7 @@ class MongoResourceStore:
         query: str,
         promotion: str = "",
         country: str = "",
+        alive: str = "",
     ) -> Page[AccountRecord]:
         mongo_query: dict[str, Any] = {}
         if query.strip():
@@ -367,6 +368,15 @@ class MongoResourceStore:
                 {"$or": [
                     {"promotionEligible": None},
                     {"promotionEligible": {"$exists": False}},
+                ]}
+            )
+        if alive in {"alive", "dead", "unknown"}:
+            mongo_query["aliveStatus"] = alive
+        elif alive == "unchecked":
+            mongo_query.setdefault("$and", []).append(
+                {"$or": [
+                    {"aliveStatus": None},
+                    {"aliveStatus": {"$exists": False}},
                 ]}
             )
         total = await self._guard(self.accounts.count_documents(mongo_query))
@@ -571,6 +581,68 @@ class MongoResourceStore:
             )
         )
 
+    async def claim_account_alive_check(self, account_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        return await self._guard(
+            self.accounts.find_one_and_update(
+                {
+                    "_id": account_id,
+                    "accessToken": {"$type": "string", "$ne": ""},
+                    "$or": [
+                        {"aliveStatus": {"$ne": "running"}},
+                        {"aliveCheckStartedAt": {"$lte": now - timedelta(minutes=5)}},
+                    ],
+                },
+                {
+                    "$set": {
+                        "aliveStatus": "running",
+                        "aliveCheckStartedAt": now,
+                        "aliveErrorCode": None,
+                        "aliveHttpStatus": None,
+                    }
+                },
+                projection={"accessToken": 1, "registrationCountry": 1},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+
+    async def store_account_alive_result(
+        self,
+        account_id: str,
+        *,
+        alive: bool,
+        error_code: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        await self._guard(
+            self.accounts.update_one(
+                {"_id": account_id},
+                {"$set": {
+                    "aliveStatus": "alive" if alive else "dead",
+                    "aliveCheckedAt": utc_now(),
+                    "aliveErrorCode": error_code,
+                    "aliveHttpStatus": http_status,
+                }},
+            )
+        )
+
+    async def store_account_alive_failure(
+        self,
+        account_id: str,
+        error: PlanCheckError,
+    ) -> None:
+        await self._guard(
+            self.accounts.update_one(
+                {"_id": account_id},
+                {"$set": {
+                    "aliveStatus": "unknown",
+                    "aliveCheckedAt": utc_now(),
+                    "aliveErrorCode": error.code,
+                    "aliveHttpStatus": error.http_status,
+                }},
+            )
+        )
+
     async def store_account_plan_result(
         self,
         account_id: str,
@@ -629,6 +701,7 @@ class MongoResourceStore:
                         "checkoutTypeDetail": result.checkout_detail,
                         "checkoutTypeCheckedAt": result.checked_at,
                         "checkoutTypeErrorCode": None,
+                        "checkoutTypeHttpStatus": None,
                     }
                 },
             )
@@ -646,6 +719,7 @@ class MongoResourceStore:
                 {"_id": account_id},
                 {"$set": {
                     "checkoutTypeErrorCode": error.code,
+                    "checkoutTypeHttpStatus": error.http_status,
                     "checkoutTypeCheckedAt": utc_now(),
                 }},
             )
@@ -1360,7 +1434,12 @@ class MongoResourceStore:
             checkoutTypeDetail=document.get("checkoutTypeDetail"),
             checkoutTypeCheckedAt=document.get("checkoutTypeCheckedAt"),
             checkoutTypeErrorCode=document.get("checkoutTypeErrorCode"),
+            checkoutTypeHttpStatus=document.get("checkoutTypeHttpStatus"),
             registrationCountry=document.get("registrationCountry"),
+            aliveStatus=document.get("aliveStatus"),
+            aliveCheckedAt=document.get("aliveCheckedAt"),
+            aliveErrorCode=document.get("aliveErrorCode"),
+            aliveHttpStatus=document.get("aliveHttpStatus"),
         )
 
     @staticmethod

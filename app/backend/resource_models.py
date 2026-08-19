@@ -86,7 +86,12 @@ class AccountRecord(ApiModel):
     checkoutTypeDetail: str | None = None
     checkoutTypeCheckedAt: datetime | None = None
     checkoutTypeErrorCode: str | None = None
+    checkoutTypeHttpStatus: int | None = None
     registrationCountry: str | None = None
+    aliveStatus: Literal["running", "alive", "dead", "unknown"] | None = None
+    aliveCheckedAt: datetime | None = None
+    aliveErrorCode: str | None = None
+    aliveHttpStatus: int | None = None
 
 
 class AccountCreate(ApiModel):
@@ -230,6 +235,26 @@ class AccountPlanCheckResult(ApiModel):
     failed: int
     skipped: int
     items: list[AccountPlanCheckItem]
+
+
+class AccountAliveCheckInput(ApiModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+    proxyId: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class AccountAliveCheckItem(ApiModel):
+    id: str
+    status: Literal["alive", "dead", "failed", "skipped"]
+    errorCode: str | None = None
+
+
+class AccountAliveCheckResult(ApiModel):
+    requested: int
+    alive: int
+    dead: int
+    failed: int
+    skipped: int
+    items: list[AccountAliveCheckItem]
 
 
 class DeleteResult(ApiModel):

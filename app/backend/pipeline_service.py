@@ -46,6 +46,28 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def extraction_error_category(message: str, *, network_error: bool = False) -> str:
+    text = str(message or "").casefold()
+    if "billing country must match request country" in text:
+        return "country_mismatch"
+    if "manual approval" in text:
+        return "manual_approval"
+    if network_error or any(
+        marker in text
+        for marker in ("proxy connect", "socks", "connection reset", "timed out")
+    ):
+        return "network_or_proxy"
+    if "eligib" in text or "promo" in text:
+        return "eligibility"
+    if "checkout" in text:
+        return "checkout"
+    if "stripe" in text:
+        return "stripe"
+    if "paypal" in text:
+        return "paypal"
+    return "unknown"
+
+
 class PipelineModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -2822,7 +2844,16 @@ class AccountPipelineService:
                             self._log_entry(
                                 "extraction.started",
                                 "提链任务已启动",
-                                details={"billingCountry": billing_country},
+                                details={
+                                    "billingCountry": billing_country,
+                                    "checkoutProxyCountry": str(settings.get("checkoutProxyCountry") or ""),
+                                    "checkoutProxyGroup": str(settings.get("checkoutProxyGroup") or ""),
+                                    "updateProxyCountry": str(settings.get("updateProxyCountry") or ""),
+                                    "updateProxyGroup": str(settings.get("updateProxyGroup") or ""),
+                                    "applyCheckoutUpdate": bool(settings.get("applyCheckoutUpdate")),
+                                    "checkoutProxyConfigured": bool(checkout_proxy),
+                                    "updateProxyConfigured": bool(update_proxy),
+                                },
                             )
                         ),
                     },
@@ -2833,8 +2864,22 @@ class AccountPipelineService:
             await self._mark_extraction_failed(item_id, getattr(exc, "code", "extraction_start_failed"), str(exc))
             return False
 
-    async def _mark_extraction_failed(self, item_id: str, code: str, message: str) -> None:
+    async def _mark_extraction_failed(
+        self,
+        item_id: str,
+        code: str,
+        message: str,
+        *,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
         now = utc_now()
+        safe_diagnostics = {
+            str(key)[:64]: value
+            for key, value in (diagnostics or {}).items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+        error_document = {"code": code, "message": message[:500]}
+        error_document.update(safe_diagnostics)
         await self._guard(
             self.items.update_one(
                 {"_id": item_id},
@@ -2842,7 +2887,7 @@ class AccountPipelineService:
                     "$set": {
                         "stage": "extraction_failed",
                         "extractionStatus": "failed",
-                        "extractionError": {"code": code, "message": message[:500]},
+                        "extractionError": error_document,
                         "updatedAt": now,
                     },
                     "$push": self._log_push(
@@ -2852,6 +2897,7 @@ class AccountPipelineService:
                             level="error",
                             timestamp=now,
                             code=code,
+                            details=safe_diagnostics,
                         )
                     ),
                 },
@@ -2941,10 +2987,26 @@ class AccountPipelineService:
                         )
                     )
             elif status in {"failed", "cancelled"}:
+                error_message = str(snapshot.get("error") or f"提链任务{status}")[:500]
+                diagnostics = {
+                    "failureStage": str(snapshot.get("failureStage") or snapshot.get("stage") or "unknown"),
+                    "errorKind": str(snapshot.get("errorKind") or "unknown"),
+                    "httpStatus": snapshot.get("errorHttpStatus"),
+                    "networkError": bool(snapshot.get("networkError")),
+                    "errorCategory": extraction_error_category(
+                        error_message,
+                        network_error=bool(snapshot.get("networkError")),
+                    ),
+                    "billingCountry": str(snapshot.get("billingCountry") or item.get("billingCountry") or ""),
+                    "checkoutType": str(snapshot.get("sessionKind") or item.get("checkoutType") or "unknown"),
+                    "progress": int(snapshot.get("progress") or 0),
+                    "retryCount": int(item.get("extractionRetryCount") or 0),
+                }
                 await self._mark_extraction_failed(
                     item_id,
                     "extractor_" + status,
-                    str(snapshot.get("error") or f"提链任务{status}")[:500],
+                    error_message,
+                    diagnostics=diagnostics,
                 )
             else:
                 await self._guard(

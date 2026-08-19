@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import queue
+import re
 import threading
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -70,6 +71,9 @@ class TaskRecord:
     result: dict[str, Any] | None = None
     error: str | None = None
     network_error: bool = False
+    failure_stage: str | None = None
+    error_kind: str | None = None
+    error_http_status: int | None = None
     account_email: str = ""
     session_kind: str | None = None
     retry_of: str | None = None
@@ -408,6 +412,16 @@ class TaskManager:
                 record = self._tasks.get(task_id)
                 if record is None:
                     return
+                record.failure_stage = record.stage
+                record.error_kind = type(exc).__name__
+                status_match = re.search(
+                    r"(?:HTTP(?: status)?|status(?: code)?)[\s:=]+(\d{3})",
+                    str(exc),
+                    flags=re.IGNORECASE,
+                )
+                record.error_http_status = (
+                    int(status_match.group(1)) if status_match else None
+                )
                 record.status = "failed"
                 record.stage = "failed"
                 record.error = redact_text(exc, self._secrets(record.config))
@@ -420,6 +434,9 @@ class TaskManager:
                         "status": record.status,
                         "error": record.error,
                         "network_error": record.network_error,
+                        "failure_stage": record.failure_stage,
+                        "error_kind": record.error_kind,
+                        "error_http_status": record.error_http_status,
                         "progress": record.progress,
                     },
                 )
@@ -508,6 +525,9 @@ class TaskManager:
             snapshot["error"] = record.error
         if record.status == "failed":
             snapshot["network_error"] = record.network_error
+            snapshot["failure_stage"] = record.failure_stage
+            snapshot["error_kind"] = record.error_kind
+            snapshot["error_http_status"] = record.error_http_status
         return snapshot
 
     def _cleanup_locked(self) -> None:

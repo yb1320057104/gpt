@@ -21,9 +21,18 @@ from backend.pipeline_service import (
     PipelineServiceError,
     PipelineSettingsUpdate,
     HeroSmsSettingsUpdate,
+    extraction_error_category,
 )
 from backend.hero_sms_service import HeroSmsActivation, HeroSmsClient, HeroSmsStatus
 from backend.paid_mail_service import PaidMailCheckResult
+
+
+def test_extraction_error_categories_are_actionable() -> None:
+    assert extraction_error_category(
+        'checkout create failed: {"detail":"Billing country must match request country."}'
+    ) == "country_mismatch"
+    assert extraction_error_category("Proxy CONNECT aborted") == "network_or_proxy"
+    assert extraction_error_category("ChatGPT manual approval blocked") == "manual_approval"
 
 
 class MemoryCursor:

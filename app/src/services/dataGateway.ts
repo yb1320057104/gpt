@@ -1,5 +1,6 @@
 import type {
   AccountPlanCheckResult,
+  AccountAliveCheckResult,
   AccountExport,
   AccountRecord,
   AccessTokenExtractResult,
@@ -96,6 +97,7 @@ function queryString(query: ResourceQuery) {
   if (query.q?.trim()) params.set('q', query.q.trim())
   if (query.country?.trim()) params.set('country', query.country.trim().toUpperCase())
   if (query.promotion) params.set('promotion', query.promotion)
+  if (query.alive) params.set('alive', query.alive)
   if (query.source && query.source !== 'all') params.set('source', query.source)
   return params.toString()
 }
@@ -593,6 +595,16 @@ export const dataGateway = {
   async checkAccountPromotions(ids: string[], proxyId?: string): Promise<AccountPlanCheckResult> {
     return parseResponse(
       await fetch('/api/accounts/check-promotion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, ...(proxyId ? { proxyId } : {}) }),
+      }),
+    )
+  },
+
+  async checkAccountsAlive(ids: string[], proxyId?: string): Promise<AccountAliveCheckResult> {
+    return parseResponse(
+      await fetch('/api/accounts/check-alive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids, ...(proxyId ? { proxyId } : {}) }),

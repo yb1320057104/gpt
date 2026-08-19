@@ -66,6 +66,7 @@ from .pipeline_service import (
 )
 from .probe_store import MongoProbeStore
 from .plan_check_service import AccountPlanCheckService
+from .account_alive_service import AccountAliveCheckService
 from .proxy_subscription_service import (
     ProxySubscriptionError,
     ProxySubscriptionService,
@@ -77,6 +78,8 @@ from .resource_models import (
     AccountRecord,
     AccountPlanCheckInput,
     AccountPlanCheckResult,
+    AccountAliveCheckInput,
+    AccountAliveCheckResult,
     BulkIdsInput,
     BrowserProbeRunCreate,
     DeleteResult,
@@ -198,6 +201,7 @@ def create_app(
     proxy_health_scheduler = ProxyHealthScheduler(proxy_subscription_service)
     probe_store = MongoProbeStore(mongo)
     plan_check_service = AccountPlanCheckService(resource_store, probe_store)
+    alive_check_service = AccountAliveCheckService(resource_store, probe_store)
     extractor_service = payment_extractor_service or PaymentExtractorService()
     agreement_service = paypal_agreement_service or PaypalAgreementService()
     account_pipeline = pipeline_service or AccountPipelineService(
@@ -273,6 +277,7 @@ def create_app(
     app.state.proxy_health_scheduler = proxy_health_scheduler
     app.state.probe_store = probe_store
     app.state.plan_check_service = plan_check_service
+    app.state.alive_check_service = alive_check_service
     app.state.payment_extractor_service = extractor_service
     app.state.paypal_agreement_service = agreement_service
     app.state.account_pipeline = account_pipeline
@@ -967,9 +972,10 @@ def create_app(
         q: SearchQuery = "",
         promotion: Annotated[str, Query(max_length=32)] = "",
         country: Annotated[str, Query(max_length=2)] = "",
+        alive: Annotated[str, Query(pattern="^(|alive|dead|unknown|unchecked)$")] = "",
     ) -> Page[AccountRecord]:
         mongo.require_online()
-        return await resource_store.list_accounts(page, int(page_size), q, promotion, country)  # type: ignore[arg-type]
+        return await resource_store.list_accounts(page, int(page_size), q, promotion, country, alive)  # type: ignore[arg-type]
 
     @app.post("/api/accounts", response_model=AccountRecord, status_code=201)
     async def create_account(payload: AccountCreate) -> AccountRecord:
@@ -994,6 +1000,19 @@ def create_app(
     ) -> AccountPlanCheckResult:
         mongo.require_online()
         return await request.app.state.plan_check_service.check_accounts(
+            payload.ids, proxy_id=payload.proxyId
+        )
+
+    @app.post(
+        "/api/accounts/check-alive",
+        response_model=AccountAliveCheckResult,
+    )
+    async def check_accounts_alive(
+        request: Request,
+        payload: AccountAliveCheckInput,
+    ) -> AccountAliveCheckResult:
+        mongo.require_online()
+        return await request.app.state.alive_check_service.check_accounts(
             payload.ids, proxy_id=payload.proxyId
         )
 

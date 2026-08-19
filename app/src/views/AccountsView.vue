@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { CopyDocument, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
+import { CircleCheck, CopyDocument, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
 import type { AccountRecord, ExportFormat, ExportScope, ProxyRecord, ResourceQuery } from '@/types'
 import { useAppStore } from '@/stores/app'
@@ -16,15 +16,14 @@ const store = useAppStore()
 const tableRef = ref<TableInstance>()
 const search = ref('')
 const promotionFilter = ref<ResourceQuery['promotion']>('')
+const aliveFilter = ref<ResourceQuery['alive']>('')
 const countryFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref<ResourceQuery['pageSize']>(10)
 const pageSizeOptions = [10, 20, 50, 100]
 const loading = ref(false)
-const promotionChecking = ref(false)
 const promotionProxyId = ref('')
 const promotionProxies = ref<ProxyRecord[]>([])
-const checkingAccountIds = ref<string[]>([])
 const selectedIds = ref<string[]>([])
 const exportOpen = ref(false)
 const exportScope = ref<ExportScope>('selected')
@@ -45,6 +44,10 @@ const copyAtLimit = ref((() => {
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 
 const pageAccounts = computed(() => store.accounts)
+const promotionChecking = computed(() => store.accountPromotionChecking)
+const aliveChecking = computed(() => store.accountAliveChecking)
+const checkingAccountIds = computed(() => store.accountPromotionCheckingIds)
+const aliveCheckingAccountIds = computed(() => store.accountAliveCheckingIds)
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -103,12 +106,69 @@ function checkoutTypeLabel(account: AccountRecord) {
 }
 
 function checkoutTypeTooltip(account: AccountRecord) {
-  if (account.checkoutTypeErrorCode) return `错误码：${account.checkoutTypeErrorCode}`
+  if (account.checkoutTypeErrorCode) {
+    const status = account.checkoutTypeHttpStatus
+    const reason = status === 401
+      ? 'Access Token 已失效'
+      : status === 403
+        ? '代理 IP、地区或账号触发风控'
+        : status === 429
+          ? '请求过于频繁，请稍后重试'
+          : status === 400 || status === 422
+            ? 'Checkout 参数或注册国家不被接受'
+            : status && status >= 500
+              ? 'ChatGPT 服务端暂时异常'
+              : status
+                ? 'Checkout 接口返回非成功状态'
+                : '请求未取得有效 HTTP 状态'
+    return `错误码：${account.checkoutTypeErrorCode}${status ? `；HTTP ${status}` : ''}；${reason}`
+  }
   if (account.checkoutTypeCheckedAt) {
     const detail = account.checkoutTypeDetail ? `；详细类型：${checkoutTypeLabel(account)}` : ''
     return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}${detail}`
   }
   return '点击“检测选中资格”时会同时检测结账类型'
+}
+
+function aliveLabel(account: AccountRecord) {
+  if (account.aliveStatus === 'running') return '检测中'
+  if (account.aliveStatus === 'alive') return '正常'
+  if (account.aliveStatus === 'dead') return '已失效'
+  if (account.aliveStatus === 'unknown') return '检测异常'
+  return '未检测'
+}
+
+function aliveTagType(account: AccountRecord) {
+  if (account.aliveStatus === 'alive') return 'success'
+  if (account.aliveStatus === 'dead') return 'danger'
+  if (account.aliveStatus === 'running') return 'warning'
+  return 'info'
+}
+
+function aliveTooltip(account: AccountRecord) {
+  const parts: string[] = []
+  if (account.aliveCheckedAt) parts.push(`检测时间：${formatDate(account.aliveCheckedAt)}`)
+  if (account.aliveHttpStatus) parts.push(`HTTP：${account.aliveHttpStatus}`)
+  if (account.aliveErrorCode) parts.push(`结果：${account.aliveErrorCode}`)
+  return parts.join('；') || '尚未检测账号是否有效'
+}
+
+async function checkAlive(ids: string[]) {
+  if (!ids.length || aliveChecking.value) return
+  if (ids.length > 100) {
+    ElMessage.warning('单次最多检测 100 个账号')
+    return
+  }
+  try {
+    const result = promotionProxyId.value
+      ? await store.checkAccountsAlive(ids, promotionProxyId.value)
+      : await store.checkAccountsAlive(ids)
+    const message = `验活完成：正常 ${result.alive}，失效 ${result.dead}，异常 ${result.failed}，跳过 ${result.skipped}`
+    if (result.dead || result.failed || result.skipped) ElMessage.warning(message)
+    else ElMessage.success(message)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '账号验活失败')
+  }
 }
 
 async function checkPromotions(ids: string[]) {
@@ -117,8 +177,6 @@ async function checkPromotions(ids: string[]) {
     ElMessage.warning('单次最多查询 100 个账号')
     return
   }
-  promotionChecking.value = true
-  checkingAccountIds.value = [...ids]
   try {
     const result = promotionProxyId.value
       ? await store.checkAccountPromotions(ids, promotionProxyId.value)
@@ -132,9 +190,6 @@ async function checkPromotions(ids: string[]) {
     }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '优惠资格查询失败')
-  } finally {
-    checkingAccountIds.value = []
-    promotionChecking.value = false
   }
 }
 
@@ -187,6 +242,7 @@ async function loadPage() {
       q: search.value,
       promotion: promotionFilter.value,
       country: countryFilter.value,
+      alive: aliveFilter.value,
     })
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
@@ -237,6 +293,12 @@ function changePromotionFilter(value: string | number | boolean | undefined) {
 
 function changeCountryFilter(value: string | number | boolean | undefined) {
   countryFilter.value = String(value || '').trim().toUpperCase()
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeAliveFilter(value: string | number | boolean | undefined) {
+  aliveFilter.value = String(value || '') as ResourceQuery['alive']
   currentPage.value = 1
   void loadPage()
 }
@@ -383,6 +445,16 @@ onBeforeUnmount(() => {
             查询选中优惠
           </el-button>
           <el-button
+            type="success"
+            plain
+            :icon="CircleCheck"
+            :loading="aliveChecking"
+            :disabled="selectedIds.length === 0 || aliveChecking"
+            @click="checkAlive([...selectedIds])"
+          >
+            验活选中账号
+          </el-button>
+          <el-button
             type="danger"
             plain
             :icon="Delete"
@@ -459,6 +531,18 @@ onBeforeUnmount(() => {
             />
             <el-option label="历史账号 / 未识别" value="ZZ" />
           </el-select>
+          <el-select
+            :model-value="aliveFilter"
+            clearable
+            placeholder="筛选验活状态"
+            style="width: 160px"
+            @change="changeAliveFilter"
+          >
+            <el-option label="正常" value="alive" />
+            <el-option label="已失效" value="dead" />
+            <el-option label="检测异常" value="unknown" />
+            <el-option label="未检测" value="unchecked" />
+          </el-select>
           <el-button type="primary" plain :disabled="store.accountTotal === 0" @click="openExport('all')">导出全部</el-button>
         </div>
       </div>
@@ -498,6 +582,15 @@ onBeforeUnmount(() => {
             <el-tag :type="row.accountType === 'plus' ? 'warning' : 'info'" effect="dark" round>
               {{ row.accountType === 'plus' ? 'Plus' : 'Free' }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="验活状态" width="125">
+          <template #default="{ row }">
+            <el-tooltip :content="aliveTooltip(row)">
+              <el-tag :type="aliveTagType(row)" effect="plain" round>
+                {{ aliveLabel(row) }}
+              </el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="结账类型" width="145">
@@ -558,8 +651,21 @@ onBeforeUnmount(() => {
         <el-table-column label="创建时间" width="145">
           <template #default="{ row }"><span class="muted">{{ formatDate(row.createdAt) }}</span></template>
         </el-table-column>
-        <el-table-column label="操作" width="252" fixed="right">
+        <el-table-column label="操作" width="292" fixed="right">
           <template #default="{ row }">
+            <el-tooltip content="检测账号是否仍然有效">
+              <span>
+                <el-button
+                  text
+                  type="success"
+                  :icon="CircleCheck"
+                  aria-label="账号验活"
+                  :loading="aliveCheckingAccountIds.includes(row.id)"
+                  :disabled="!row.accessTokenConfigured || aliveChecking"
+                  @click="checkAlive([row.id])"
+                />
+              </span>
+            </el-tooltip>
             <el-tooltip content="查询 Plus 试用资格">
               <span>
                 <el-button

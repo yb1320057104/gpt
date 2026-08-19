@@ -92,6 +92,10 @@ export const useAppStore = defineStore('app', {
     displayedLogs: [] as RunLogEntry[],
     selectedLogRunId: null as string | null,
     runHistory: [] as RunLogSummary[],
+    accountPromotionChecking: false,
+    accountPromotionCheckingIds: [] as string[],
+    accountAliveChecking: false,
+    accountAliveCheckingIds: [] as string[],
   }),
 
   actions: {
@@ -245,9 +249,31 @@ export const useAppStore = defineStore('app', {
     },
 
     async checkAccountPromotions(ids: string[], proxyId?: string) {
-      const result = await dataGateway.checkAccountPromotions(ids, proxyId)
-      await Promise.all([this.refreshAccounts(), this.refreshStats()])
-      return result
+      if (this.accountPromotionChecking) throw new Error('已有优惠资格查询正在执行')
+      this.accountPromotionChecking = true
+      this.accountPromotionCheckingIds = [...ids]
+      try {
+        const result = await dataGateway.checkAccountPromotions(ids, proxyId)
+        await Promise.all([this.refreshAccounts(), this.refreshStats()])
+        return result
+      } finally {
+        this.accountPromotionCheckingIds = []
+        this.accountPromotionChecking = false
+      }
+    },
+
+    async checkAccountsAlive(ids: string[], proxyId?: string) {
+      if (this.accountAliveChecking) throw new Error('已有账号验活正在执行')
+      this.accountAliveChecking = true
+      this.accountAliveCheckingIds = [...ids]
+      try {
+        const result = await dataGateway.checkAccountsAlive(ids, proxyId)
+        await this.refreshAccounts()
+        return result
+      } finally {
+        this.accountAliveCheckingIds = []
+        this.accountAliveChecking = false
+      }
     },
 
     async deleteEmails(ids: string[]) {

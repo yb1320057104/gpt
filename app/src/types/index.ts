@@ -25,7 +25,12 @@ export interface AccountRecord {
   checkoutTypeDetail?: 'oaics' | 'stripe_cs_live' | 'stripe_cs_test' | 'stripe_checkout' | 'stripe_cs' | string | null
   checkoutTypeCheckedAt?: string | null
   checkoutTypeErrorCode?: string | null
+  checkoutTypeHttpStatus?: number | null
   registrationCountry?: string | null
+  aliveStatus?: 'running' | 'alive' | 'dead' | 'unknown' | null
+  aliveCheckedAt?: string | null
+  aliveErrorCode?: string | null
+  aliveHttpStatus?: number | null
 }
 
 export interface AccountPlanCheckItem {
@@ -40,6 +45,19 @@ export interface AccountPlanCheckResult {
   failed: number
   skipped: number
   items: AccountPlanCheckItem[]
+}
+
+export interface AccountAliveCheckResult {
+  requested: number
+  alive: number
+  dead: number
+  failed: number
+  skipped: number
+  items: Array<{
+    id: string
+    status: 'alive' | 'dead' | 'failed' | 'skipped'
+    errorCode: string | null
+  }>
 }
 
 export type AccountType = 'plus' | 'free'
@@ -220,6 +238,7 @@ export interface ResourceQuery {
   q?: string
   country?: string
   promotion?: '' | 'untried_plus' | 'ineligible' | 'unchecked'
+  alive?: '' | 'alive' | 'dead' | 'unknown' | 'unchecked'
   source?: EmailSource
 }
 
