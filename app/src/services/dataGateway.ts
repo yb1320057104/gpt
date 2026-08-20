@@ -23,10 +23,13 @@ import type {
   ProxySubscriptionImportResult,
   ProxyTestResult,
   PaymentExtractorBulkDeleteResult,
+  PaymentExtractorBulkCancelResult,
   PaymentExtractorConcurrency,
   PaymentExtractorDefaults,
   PaymentExtractorDeleteResult,
   PaymentExtractorOption,
+  PaymentExtractorAccountSource,
+  PaymentExtractorProxyPoolResult,
   PaymentExtractorProxyTestResult,
   PaymentExtractorProxySourceResult,
   PaymentExtractorRetryInput,
@@ -98,6 +101,7 @@ function queryString(query: ResourceQuery) {
   if (query.country?.trim()) params.set('country', query.country.trim().toUpperCase())
   if (query.promotion) params.set('promotion', query.promotion)
   if (query.alive) params.set('alive', query.alive)
+  if (query.globalPromotion) params.set('globalPromotion', query.globalPromotion)
   if (query.source && query.source !== 'all') params.set('source', query.source)
   return params.toString()
 }
@@ -461,6 +465,27 @@ export const dataGateway = {
     )
   },
 
+  async listPaymentExtractorAccounts(): Promise<PaymentExtractorAccountSource[]> {
+    const result = await parseResponse<{ items: PaymentExtractorAccountSource[] }>(
+      await fetch('/api/payment-extractor/accounts', { headers: paymentExtractorHeaders() }),
+    )
+    return result.items
+  },
+
+  async loadPaymentExtractorProxyPool(
+    country: string,
+    group: string,
+  ): Promise<PaymentExtractorProxyPoolResult> {
+    const params = new URLSearchParams()
+    if (country) params.set('country', country)
+    if (group) params.set('group', group)
+    return parseResponse(
+      await fetch(`/api/payment-extractor/proxy-pool?${params}`, {
+        headers: paymentExtractorHeaders(),
+      }),
+    )
+  },
+
   async listPaymentExtractorTasks(): Promise<PaymentExtractorTaskList> {
     return parseResponse(await fetch('/api/payment-extractor/tasks', {
       headers: paymentExtractorHeaders(),
@@ -478,6 +503,15 @@ export const dataGateway = {
   async cancelPaymentExtractorTask(taskId: string): Promise<PaymentExtractorTask> {
     return parseResponse(
       await fetch(`/api/payment-extractor/tasks/${encodeURIComponent(taskId)}/cancel`, {
+        method: 'POST',
+        headers: paymentExtractorHeaders(),
+      }),
+    )
+  },
+
+  async cancelAllPaymentExtractorTasks(): Promise<PaymentExtractorBulkCancelResult> {
+    return parseResponse(
+      await fetch('/api/payment-extractor/tasks/bulk-cancel', {
         method: 'POST',
         headers: paymentExtractorHeaders(),
       }),
@@ -598,6 +632,36 @@ export const dataGateway = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids, ...(proxyId ? { proxyId } : {}) }),
+      }),
+    )
+  },
+
+  async checkAccountGlobalPromotions(ids: string[]): Promise<{ requested: number; queued: number; skipped: number }> {
+    return parseResponse(
+      await fetch('/api/accounts/check-global-promotion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      }),
+    )
+  },
+
+  async checkAccountCheckoutTypes(ids: string[], proxyId?: string): Promise<AccountPlanCheckResult> {
+    return parseResponse(
+      await fetch('/api/accounts/check-checkout-type', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids, ...(proxyId ? { proxyId } : {}) }),
+      }),
+    )
+  },
+
+  async checkAccountOaicsAllProxies(ids: string[]): Promise<{ requested: number; started: number; skipped: number }> {
+    return parseResponse(
+      await fetch('/api/accounts/check-oaics-all-proxies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids }),
       }),
     )
   },

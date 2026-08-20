@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -29,6 +30,9 @@ class ProxyLocation:
     country_code: str
     region: str
     region_code: str
+    http_status: int
+    tls_version: str
+    latency_ms: int
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -46,6 +50,7 @@ def probe_proxy(
             raise ProxyProbeError("requests is required for proxy testing", 500)
         request_get = requests.get
 
+    started = time.perf_counter()
     try:
         response = request_get(
             IP_LOOKUP_URL,
@@ -62,6 +67,7 @@ def probe_proxy(
 
     if getattr(response, "status_code", 0) != 200:
         raise ProxyProbeError("IP lookup service unavailable", 502)
+    latency_ms = max(0, round((time.perf_counter() - started) * 1000))
     try:
         payload = response.json()
     except Exception as exc:
@@ -78,7 +84,28 @@ def probe_proxy(
         country_code=_field(payload, "country_code"),
         region=_field(payload, "region"),
         region_code=_field(payload, "region_code"),
+        http_status=int(getattr(response, "status_code", 0) or 0),
+        tls_version=_tls_version(response),
+        latency_ms=latency_ms,
     )
+
+
+def _tls_version(response: Any) -> str:
+    """Best-effort TLS version for requests/urllib3 responses."""
+    candidates = (
+        getattr(getattr(getattr(response, "raw", None), "connection", None), "sock", None),
+        getattr(getattr(getattr(response, "raw", None), "_connection", None), "sock", None),
+    )
+    for sock in candidates:
+        version = getattr(sock, "version", None)
+        if callable(version):
+            try:
+                value = str(version() or "").strip()
+                if value:
+                    return value
+            except Exception:
+                pass
+    return "unknown"
 
 
 def _normalize_probe_proxy(value: str) -> str:

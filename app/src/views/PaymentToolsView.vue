@@ -10,15 +10,18 @@ import {
   Refresh,
   VideoPause,
 } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { dataGateway } from '@/services/dataGateway'
+import { countryName, normalizeCountryCode } from '@/services/countries'
 import type {
   ExtractedAccessToken,
   PaymentExtractorOption,
+  PaymentExtractorAccountSource,
   PaymentExtractorProxyTestResult,
   PaymentExtractorResult,
   PaymentExtractorTask,
   PaymentExtractorTaskStatus,
+  ProxyGroupSummary,
 } from '@/types'
 
 type TaskFilter = 'all' | 'running' | 'succeeded' | 'failed'
@@ -40,6 +43,8 @@ interface SavedPreferences {
   rotateUpdateSession?: boolean
   proxySourceUrl?: string
   concurrency?: number
+  autoRetryCount?: number
+  idealBank?: string
 }
 
 const PREFERENCES_KEY = 'autoregister.payment-extractor.preferences'
@@ -50,15 +55,15 @@ const TERMINAL_STATES = new Set<PaymentExtractorTaskStatus>([
   'cancelled',
 ])
 const FALLBACK_COUNTRIES: PaymentExtractorOption[] = [
-  { value: 'IN', label: '印度 · INR' },
-  { value: 'PL', label: '波兰 · PLN' },
-  { value: 'CH', label: '瑞士 · CHF' },
-  { value: 'KR', label: '韩国 · KRW' },
-  { value: 'VN', label: '越南 · VND' },
-  { value: 'GB', label: '英国 · GBP' },
-  { value: 'US', label: '美国 · USD' },
-  { value: 'BR', label: '巴西 · USD' },
-  { value: 'DE', label: '德国 · EUR' },
+  { value: 'IN', label: '印度 · INR', currency: 'INR' },
+  { value: 'PL', label: '波兰 · PLN', currency: 'PLN' },
+  { value: 'CH', label: '瑞士 · CHF', currency: 'CHF' },
+  { value: 'KR', label: '韩国 · KRW', currency: 'KRW' },
+  { value: 'VN', label: '越南 · VND', currency: 'VND' },
+  { value: 'GB', label: '英国 · GBP', currency: 'GBP' },
+  { value: 'US', label: '美国 · USD', currency: 'USD' },
+  { value: 'BR', label: '巴西 · USD', currency: 'USD' },
+  { value: 'DE', label: '德国 · EUR', currency: 'EUR' },
   { value: 'TH', label: '泰国 · USD' },
   { value: 'BA', label: '波黑 · USD' },
   { value: 'PH', label: '菲律宾 · PHP' },
@@ -73,18 +78,21 @@ const FALLBACK_COUNTRIES: PaymentExtractorOption[] = [
 ]
 const FALLBACK_METHODS: PaymentExtractorOption[] = [
   { value: 'paypal', label: 'PayPal' },
-  { value: 'gopay', label: 'GoPay' },
-  { value: 'gcash', label: 'GCash' },
-  { value: 'ideal', label: 'iDEAL' },
-  { value: 'upi', label: 'UPI' },
-  { value: 'pix', label: 'PIX' },
-  { value: 'blik', label: 'BLIK' },
-  { value: 'twint', label: 'TWINT' },
-  { value: 'kakao_pay', label: 'KakaoPay' },
-  { value: 'momo', label: 'MoMo' },
+  { value: 'gopay', label: 'GoPay', country: 'ID', currency: 'IDR' },
+  { value: 'gcash', label: 'GCash', country: 'PH', currency: 'PHP' },
+  { value: 'ideal', label: 'iDEAL', country: 'NL', currency: 'EUR' },
+  { value: 'upi', label: 'UPI', country: 'IN', currency: 'INR', resultKind: 'qr_or_deep_link' },
+  { value: 'pix', label: 'PIX', country: 'BR', currency: 'BRL', resultKind: 'qr_or_deep_link' },
+  { value: 'blik', label: 'BLIK（暂不可用）', country: 'PL', currency: 'PLN', enabled: false },
+  { value: 'twint', label: 'TWINT', country: 'CH', currency: 'CHF' },
+  { value: 'kakao_pay', label: 'Kakao Pay', country: 'KR', currency: 'KRW' },
+  { value: 'momo', label: 'MoMo', country: 'VN', currency: 'VND' },
 ]
 
 const rawText = ref('')
+const accountSources = ref<PaymentExtractorAccountSource[]>([])
+const selectedAccountCountry = ref('')
+const accountSourcesLoading = ref(false)
 const extracting = ref(false)
 const tokens = ref<ExtractedAccessToken[]>([])
 const selectedIndex = ref(0)
@@ -96,14 +104,20 @@ const paymentMethods = ref<PaymentExtractorOption[]>(FALLBACK_METHODS)
 const country = ref('DE')
 const forceCountry = ref('')
 const paymentMethod = ref('paypal')
+const idealBank = ref('n26')
 const checkoutProxyPool = ref('')
 const updateProxyPool = ref('')
 const proxySourceUrl = ref('')
 const proxySourceLoading = ref(false)
+const proxyGroups = ref<ProxyGroupSummary[]>([])
+const checkoutStoredGroup = ref('')
+const updateStoredGroup = ref('')
+const storedProxyLoading = ref<ProxyKind | ''>('')
 const stripeHcaptchaToken = ref('')
 const workbenchPassword = ref('')
 const applyCheckoutUpdate = ref(true)
 const concurrency = ref(4)
+const autoRetryCount = ref(2)
 const maxConcurrency = ref(10)
 const concurrencyUpdating = ref(false)
 const rotateCheckoutSession = ref(true)
@@ -111,9 +125,12 @@ const rotateUpdateSession = ref(true)
 const checkoutProxyTest = ref<ProxyTestState>({ loading: false, result: null, error: '' })
 const updateProxyTest = ref<ProxyTestState>({ loading: false, result: null, error: '' })
 const tasks = ref<PaymentExtractorTask[]>([])
+const taskDetailsOpen = ref(false)
+const taskDetailsLoading = ref(false)
+const selectedTaskDetails = ref<PaymentExtractorTask | null>(null)
 const taskFilter = ref<TaskFilter>('all')
 const pendingActions = ref<Record<string, string>>({})
-const bulkAction = ref<'' | 'failed' | 'succeeded' | 'retry-network'>('')
+const bulkAction = ref<'' | 'failed' | 'succeeded' | 'retry-network' | 'cancel-all'>('')
 const existingLink = ref('')
 const preferencesReady = ref(false)
 const hadSavedPreferences = ref(false)
@@ -147,10 +164,47 @@ const filteredTasks = computed(() => {
 })
 const successfulTasks = computed(() => tasks.value.filter((task) => task.status === 'succeeded'))
 const canSubmit = computed(() => {
-  if (!selectedToken.value || selectedToken.value.expired === true || submitting.value) return false
+  if ((!selectedToken.value || selectedToken.value.expired === true) && !selectedAccountIds.value.length) return false
+  if (submitting.value) return false
   if (!checkoutProxyPool.value.trim()) return false
   return !applyCheckoutUpdate.value || Boolean(updateProxyPool.value.trim())
 })
+
+const accountCountryOptions = computed(() => {
+  const counts = new Map<string, number>()
+  for (const item of accountSources.value) {
+    const code = normalizeCountryCode(item.registrationCountry)
+    counts.set(code, (counts.get(code) || 0) + 1)
+  }
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, label: countryName(value), count }))
+    .sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
+})
+
+const selectedAccountIds = computed(() => {
+  if (!selectedAccountCountry.value) return []
+  return accountSources.value
+    .filter((item) => normalizeCountryCode(item.registrationCountry) === selectedAccountCountry.value)
+    .map((item) => item.id)
+})
+const selectedMethodProfile = computed(() =>
+  paymentMethods.value.find((item) => item.value === paymentMethod.value),
+)
+const effectiveCurrency = computed(() =>
+  selectedMethodProfile.value?.currency
+  || countries.value.find((item) => item.value === country.value)?.currency
+  || '—',
+)
+const requiredMethodCountry = computed(() => selectedMethodProfile.value?.country || '')
+
+function storedGroupValue(item: ProxyGroupSummary) {
+  return `${item.country}\u0000${item.group}`
+}
+
+function parseStoredGroup(value: string) {
+  const [country = '', group = ''] = value.split('\u0000', 2)
+  return { country, group }
+}
 
 watch(
   [
@@ -163,6 +217,8 @@ watch(
     rotateUpdateSession,
     proxySourceUrl,
     concurrency,
+    autoRetryCount,
+    idealBank,
   ],
   savePreferences,
 )
@@ -201,6 +257,12 @@ function restorePreferences() {
     if (Number.isInteger(saved.concurrency)) {
       concurrency.value = Math.max(1, Math.min(10, Number(saved.concurrency)))
     }
+    if (Number.isInteger(saved.autoRetryCount)) {
+      autoRetryCount.value = Math.max(0, Math.min(10, Number(saved.autoRetryCount)))
+    }
+    if (typeof saved.idealBank === 'string' && saved.idealBank.trim()) {
+      idealBank.value = saved.idealBank.trim()
+    }
   } catch {
     // Keep service defaults when browser storage is unavailable or malformed.
   }
@@ -218,6 +280,26 @@ function saveWorkbenchPassword(value: string) {
 
 watch(workbenchPassword, saveWorkbenchPassword)
 
+watch(paymentMethod, (method) => {
+  const profile = paymentMethods.value.find((item) => item.value === method)
+  if (!profile?.country) return
+  country.value = profile.country
+  if (selectedAccountCountry.value && selectedAccountCountry.value !== profile.country) {
+    selectedAccountCountry.value = ''
+    ElMessage.warning('支付方式与账号注册国家不一致，已清除账号池国家选择')
+  }
+})
+
+watch(selectedAccountCountry, (value) => {
+  if (!value) return
+  country.value = value
+  const profile = selectedMethodProfile.value
+  if (profile?.country && profile.country !== value) {
+    paymentMethod.value = 'paypal'
+    ElMessage.warning('当前支付方式不支持该账号国家，已切换为 PayPal')
+  }
+})
+
 function savePreferences() {
   if (!preferencesReady.value) return
   const preferences: SavedPreferences = {
@@ -230,6 +312,8 @@ function savePreferences() {
     rotateUpdateSession: rotateUpdateSession.value,
     proxySourceUrl: proxySourceUrl.value,
     concurrency: concurrency.value,
+    autoRetryCount: autoRetryCount.value,
+    idealBank: idealBank.value,
   }
   try {
     localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences))
@@ -375,6 +459,105 @@ function resultUrl(task: PaymentExtractorTask) {
   )
 }
 
+function translateLogText(value: string) {
+  const exact: Record<string, string> = {
+    eligible: '符合资格', ineligible: '不符合资格', open: '已创建', unpaid: '未支付',
+    success: '成功', failed: '失败', approved: '已批准', blocked: '已阻止',
+    true: '是', false: '否', none: '无', unknown: '未知',
+    'Promo eligibility check': 'Plus 试用资格检测',
+    'ChatGPT checkout': '创建 ChatGPT 结账会话',
+    'ChatGPT checkout/update': '更新 ChatGPT 结账国家与促销',
+    'ChatGPT checkout/snapshot': '保存 ChatGPT 账单资料快照',
+    'ChatGPT checkout approve': 'ChatGPT 结账审批',
+    'ChatGPT oaics checkout/confirm': '确认 ChatGPT OAICS 结账',
+    'Stripe Elements session': '获取 Stripe 支付组件会话',
+    'Stripe payment_methods': '创建 Stripe 支付方式',
+    'Stripe payment_pages confirm': '确认 Stripe 支付页面',
+    'Provider redirect hop': '解析支付服务商跳转',
+    'MoMo 跳转解析': '解析 MoMo 支付跳转',
+    'This promotion is not available.': '当前账号或结账会话无法使用此促销活动。',
+    checkout_creation_rate_limited: '创建结账会话过于频繁，已被限流',
+    'Too many checkout attempts. Please try again later.': '创建结账会话的尝试次数过多，请稍后再试。',
+  }
+  if (exact[value] !== undefined) return exact[value]
+  return value
+    .replaceAll('This promotion is not available.', '当前账号或结账会话无法使用此促销活动。')
+    .replaceAll('Too many checkout attempts. Please try again later.', '创建结账会话的尝试次数过多，请稍后再试。')
+    .replaceAll('checkout_creation_rate_limited', '创建结账会话过于频繁，已被限流')
+    .replaceAll('does not offer', '未提供支付方式')
+    .replaceAll('request timed out', '请求超时')
+    .replaceAll('proxy connection failed', '代理连接失败')
+}
+
+function localizedLogObject(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(localizedLogObject)
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        detailLabel(key),
+        localizedLogObject(item),
+      ]),
+    )
+  }
+  if (typeof value === 'string') return translateLogText(value)
+  return value
+}
+
+function detailValue(value: unknown) {
+  if (Array.isArray(value)) return value.length ? value.map(localizedLogObject).join('、') : '—'
+  if (typeof value === 'object' && value !== null) return JSON.stringify(localizedLogObject(value), null, 2)
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (value === null || value === undefined || value === '') return '—'
+  return translateLogText(String(value))
+}
+
+function detailLabel(key: string) {
+  const labels: Record<string, string> = {
+    ip: '出口 IP', country: '出口国家', region: '地区', city: '城市', proxy: '代理',
+    billing_country: '配置账单国家', actual_billing_country: '实际账单国家',
+    billing_currency: '配置币种', actual_currency: '实际币种', currency: '币种',
+    payment_method: '配置支付方式', payment_method_requested: '请求支付方式',
+    payment_method_extracted: '提取支付方式', offered_payment_methods: '服务端可用支付方式',
+    amount_due: '应付金额', amount_due_minor: '最小单位金额', is_zero_amount: '账单是否为 0',
+    trial_eligible: '检测到试用资格', session_kind: '结账类型', provider_link_created: '支付链接已生成',
+    failure_stage: '失败步骤', error_kind: '异常类型', http_status: 'HTTP 状态', message: '错误原因',
+    attempt: '尝试次数', checkout_session_id: 'Checkout 会话', latency_ms: '代理延迟',
+    json: 'JSON 请求体', params: '查询参数', data: '表单请求体', detail: '详细原因',
+    state: '资格状态', coupon: '优惠券', redemption: '兑换状态', redeemed: '已兑换',
+    redeemed_at: '兑换时间', redeemed_by_user: '用户已兑换', redeemed_by_workspace: '工作区已兑换',
+    user_redeemed_at: '用户兑换时间', workspace_redeemed_at: '工作区兑换时间',
+    promotion_length_days: '优惠天数', expires_at: '过期时间',
+    processor_entity: '结账处理实体', plan_name: '套餐名称', price_interval: '计费周期',
+    seat_quantity: '席位数量', promo_campaign: '促销活动', promo_campaign_id: '促销活动 ID',
+    is_coupon_from_query_param: '优惠券来自地址参数', billing_details: '账单信息',
+    payment_method_types: '支付方式列表', custom_payment_methods: '自定义支付方式列表',
+    one_click_trial_eligible: '一键试用资格', payment_status: '支付状态', status: '状态',
+    checkout_ui_mode: '结账界面模式',
+    automatic_tax_enabled: '自动计税已启用', requires_manual_approval: '需要人工审批',
+    entry_point: '入口来源', checkout_provider: '结账服务商', checkout_kind: '结账类型',
+    selected_payment_method_type: '已选择支付方式', confirm_return_url: '确认后返回地址',
+    checkout_state: '结账状态详情',
+    amount: '金额', minorUnitsAmount: '最小单位金额', total: '合计', subtotal: '小计',
+    discount: '折扣', taxAmounts: '税费', lineItems: '账单项目', canConfirm: '允许确认',
+    email: '邮箱', name: '姓名', address: '地址', phone: '手机号',
+    line1: '地址第一行', line2: '地址第二行', postal_code: '邮政编码',
+  }
+  return labels[key] || key
+}
+
+async function openTaskDetails(task: PaymentExtractorTask) {
+  taskDetailsOpen.value = true
+  taskDetailsLoading.value = true
+  selectedTaskDetails.value = task
+  try {
+    selectedTaskDetails.value = await dataGateway.getPaymentExtractorTask(task.taskId)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '加载任务日志失败')
+  } finally {
+    taskDetailsLoading.value = false
+  }
+}
+
 function formatAmount(result?: PaymentExtractorResult | null) {
   if (!result || result.amountDue === undefined || result.amountDue === null) return '—'
   return `${result.amountDue} ${result.currency || ''}`.trim()
@@ -438,6 +621,59 @@ async function extractTokens() {
   } finally {
     extracting.value = false
   }
+}
+
+async function loadAccountSources() {
+  accountSourcesLoading.value = true
+  try {
+    accountSources.value = await dataGateway.listPaymentExtractorAccounts()
+    if (!accountCountryOptions.value.some((item) => item.value === selectedAccountCountry.value)) {
+      selectedAccountCountry.value = ''
+    }
+  } catch (error) {
+    ElMessage.warning(error instanceof Error ? error.message : '账号池 AT 加载失败')
+  } finally {
+    accountSourcesLoading.value = false
+  }
+}
+
+async function submitStoredAccounts() {
+  if (!selectedAccountIds.value.length || submitting.value) return
+  try {
+    validateSubmission()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '提链配置不完整')
+    return
+  }
+  submitting.value = true
+  let succeeded = 0
+  const failures: string[] = []
+  for (const accountId of selectedAccountIds.value) {
+    try {
+      const task = await dataGateway.createPaymentExtractorTask({
+        accountId,
+        accessToken: '',
+        checkoutProxy: checkoutProxyPool.value,
+        updateProxy: applyCheckoutUpdate.value ? updateProxyPool.value : '',
+        rotateCheckoutProxy: rotateCheckoutSession.value,
+        rotateUpdateProxy: rotateUpdateSession.value,
+        autoRetryCount: autoRetryCount.value,
+        idealBank: idealBank.value,
+        stripeHcaptchaToken: stripeHcaptchaToken.value.trim(),
+        country: country.value,
+        paymentMethod: paymentMethod.value,
+        applyCheckoutUpdate: applyCheckoutUpdate.value,
+      })
+      upsertTask(task)
+      succeeded += 1
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : '任务提交失败')
+    }
+  }
+  submitting.value = false
+  ensurePolling()
+  if (succeeded) ElMessage.success(`已从账号池提交 ${succeeded} 个提链任务`)
+  if (failures.length) ElMessage.error(`${failures.length} 个任务提交失败：${failures[0]}`)
 }
 
 function clearCredentials() {
@@ -518,18 +754,15 @@ async function loadTasks() {
 }
 
 async function pollActiveTasks() {
-  const activeIds = tasks.value
-    .filter((task) => !TERMINAL_STATES.has(task.status))
-    .map((task) => task.taskId)
-  if (!activeIds.length) {
+  if (!tasks.value.some((task) => !TERMINAL_STATES.has(task.status))) {
     stopPolling()
     return
   }
-  const results = await Promise.allSettled(
-    activeIds.map((taskId) => dataGateway.getPaymentExtractorTask(taskId)),
-  )
-  for (const result of results) {
-    if (result.status === 'fulfilled') upsertTask(result.value)
+  try {
+    const result = await dataGateway.listPaymentExtractorTasks()
+    tasks.value = result.tasks ?? []
+  } catch {
+    // A transient backend restart must not create one warning per active task.
   }
   if (!tasks.value.some((task) => !TERMINAL_STATES.has(task.status))) stopPolling()
 }
@@ -552,6 +785,15 @@ function validateSubmission() {
   }
   if (!country.value) throw new Error('请选择账单国家')
   if (!paymentMethod.value) throw new Error('请选择支付方式')
+  if (selectedMethodProfile.value?.enabled === false) {
+    throw new Error(`${selectedMethodProfile.value.label}当前不可用`)
+  }
+  if (requiredMethodCountry.value && requiredMethodCountry.value !== country.value) {
+    throw new Error(`${selectedMethodProfile.value?.label || '当前支付方式'}仅支持${countryName(requiredMethodCountry.value)}`)
+  }
+  if (paymentMethod.value === 'ideal' && !idealBank.value.trim()) {
+    throw new Error('请填写 iDEAL Bank 标识')
+  }
 }
 
 async function submitTokenItems(items: ExtractedAccessToken[]) {
@@ -566,19 +808,15 @@ async function submitTokenItems(items: ExtractedAccessToken[]) {
   let succeeded = 0
   const failures: string[] = []
   for (const item of items) {
-    const checkoutSelected = selectProxy(checkoutProxyPool.value, 'checkout')
-    const updateSelected = applyCheckoutUpdate.value
-      ? selectProxy(updateProxyPool.value, 'update')
-      : ''
     try {
       const task = await dataGateway.createPaymentExtractorTask({
         accessToken: item.token,
-        checkoutProxy: rotateCheckoutSession.value
-          ? rotateProxySessionMarker(checkoutSelected)
-          : checkoutSelected,
-        updateProxy: rotateUpdateSession.value
-          ? rotateProxySessionMarker(updateSelected)
-          : updateSelected,
+        checkoutProxy: checkoutProxyPool.value,
+        updateProxy: applyCheckoutUpdate.value ? updateProxyPool.value : '',
+        rotateCheckoutProxy: rotateCheckoutSession.value,
+        rotateUpdateProxy: rotateUpdateSession.value,
+        autoRetryCount: autoRetryCount.value,
+        idealBank: idealBank.value,
         stripeHcaptchaToken: stripeHcaptchaToken.value.trim(),
         country: country.value,
         paymentMethod: paymentMethod.value,
@@ -637,6 +875,24 @@ async function importProxySource() {
   }
 }
 
+async function loadStoredProxyGroup(kind: ProxyKind) {
+  const selected = kind === 'checkout' ? checkoutStoredGroup.value : updateStoredGroup.value
+  if (!selected) return
+  const { country, group } = parseStoredGroup(selected)
+  storedProxyLoading.value = kind
+  try {
+    const result = await dataGateway.loadPaymentExtractorProxyPool(country, group)
+    const text = result.proxies.join('\n')
+    if (kind === 'checkout') checkoutProxyPool.value = text
+    else updateProxyPool.value = text
+    ElMessage.success(`已从 ${countryName(country)} / ${group} 载入 ${result.count} 条可用代理`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '代理组载入失败')
+  } finally {
+    storedProxyLoading.value = ''
+  }
+}
+
 function setPending(taskId: string, action: string) {
   pendingActions.value = { ...pendingActions.value, [taskId]: action }
 }
@@ -656,6 +912,30 @@ async function cancelTask(task: PaymentExtractorTask) {
     ElMessage.error(error instanceof Error ? error.message : '取消任务失败')
   } finally {
     clearPending(task.taskId)
+  }
+}
+
+async function cancelAllTasks() {
+  if (bulkAction.value || !taskCounts.value.running) return
+  try {
+    await ElMessageBox.confirm(
+      `确认取消全部 ${taskCounts.value.running} 个运行中或排队中的提链任务？`,
+      '一键取消全部任务',
+      { type: 'warning', confirmButtonText: '全部取消', cancelButtonText: '返回' },
+    )
+  } catch {
+    return
+  }
+  bulkAction.value = 'cancel-all'
+  try {
+    const result = await dataGateway.cancelAllPaymentExtractorTasks()
+    await loadTasks()
+    ensurePolling()
+    ElMessage.success(`已向 ${result.cancelledCount} 个任务发送取消指令`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '批量取消任务失败')
+  } finally {
+    bulkAction.value = ''
   }
 }
 
@@ -791,7 +1071,12 @@ function exportSuccessfulCsv() {
 
 onMounted(async () => {
   restorePreferences()
-  await Promise.allSettled([loadDefaults(), loadTasks()])
+  await Promise.allSettled([
+    loadDefaults(),
+    loadTasks(),
+    loadAccountSources(),
+    dataGateway.listProxyGroups().then((items) => { proxyGroups.value = items }),
+  ])
   await updateConcurrency(true)
 })
 
@@ -827,6 +1112,41 @@ onBeforeUnmount(() => {
               <p>支持裸 Token、Bearer、Session JSON 和批量分隔内容。</p>
             </div>
           </div>
+          <div class="stored-source-box">
+            <div class="field-heading">
+              <label for="extractor-account-source">从账号池同步 AT</label>
+              <span>{{ accountSources.length }} 个有效账号</span>
+            </div>
+            <div class="stored-source-row">
+              <el-select
+                id="extractor-account-source"
+                v-model="selectedAccountCountry"
+                data-testid="account-source-select"
+                filterable
+                clearable
+                :loading="accountSourcesLoading"
+                placeholder="选择注册国家，自动同步该国家全部有效 AT"
+              >
+                <el-option
+                  v-for="item in accountCountryOptions"
+                  :key="item.value"
+                  :label="`${item.label} · ${item.count} 个账号`"
+                  :value="item.value"
+                />
+              </el-select>
+              <el-button :icon="Refresh" :loading="accountSourcesLoading" @click="loadAccountSources">刷新账号池</el-button>
+              <el-button
+                type="primary"
+                :loading="submitting"
+                :disabled="!selectedAccountIds.length || !checkoutProxyPool.trim()"
+                data-testid="submit-account-source"
+                @click="submitStoredAccounts"
+              >
+                同步并提交 {{ selectedAccountIds.length }} 个
+              </el-button>
+            </div>
+          </div>
+          <el-divider content-position="left">或手动粘贴 Session / AT</el-divider>
           <el-input
             v-model="rawText"
             data-testid="credential-input"
@@ -907,6 +1227,28 @@ onBeforeUnmount(() => {
                 <label for="checkout-proxy-pool">Checkout Proxy 池</label>
                 <span>{{ checkoutProxyCount }} 条</span>
               </div>
+              <div class="stored-proxy-row">
+                <el-select
+                  v-model="checkoutStoredGroup"
+                  data-testid="checkout-stored-group"
+                  filterable
+                  clearable
+                  placeholder="从现有代理池选择国家 / 分组"
+                >
+                  <el-option
+                    v-for="item in proxyGroups"
+                    :key="`checkout-${storedGroupValue(item)}`"
+                    :label="`${countryName(item.country)} / ${item.group} · 可用 ${item.available}/${item.enabled}`"
+                    :value="storedGroupValue(item)"
+                  />
+                </el-select>
+                <el-button
+                  :loading="storedProxyLoading === 'checkout'"
+                  :disabled="!checkoutStoredGroup"
+                  data-testid="load-checkout-stored-group"
+                  @click="loadStoredProxyGroup('checkout')"
+                >载入</el-button>
+              </div>
               <el-input
                 id="checkout-proxy-pool"
                 v-model="checkoutProxyPool"
@@ -941,6 +1283,28 @@ onBeforeUnmount(() => {
               <div class="field-heading">
                 <label for="update-proxy-pool">Update Proxy 池</label>
                 <span>{{ updateProxyCount }} 条</span>
+              </div>
+              <div class="stored-proxy-row">
+                <el-select
+                  v-model="updateStoredGroup"
+                  data-testid="update-stored-group"
+                  filterable
+                  clearable
+                  placeholder="从现有代理池选择国家 / 分组"
+                >
+                  <el-option
+                    v-for="item in proxyGroups"
+                    :key="`update-${storedGroupValue(item)}`"
+                    :label="`${countryName(item.country)} / ${item.group} · 可用 ${item.available}/${item.enabled}`"
+                    :value="storedGroupValue(item)"
+                  />
+                </el-select>
+                <el-button
+                  :loading="storedProxyLoading === 'update'"
+                  :disabled="!updateStoredGroup"
+                  data-testid="load-update-stored-group"
+                  @click="loadStoredProxyGroup('update')"
+                >载入</el-button>
               </div>
               <el-input
                 id="update-proxy-pool"
@@ -992,7 +1356,7 @@ onBeforeUnmount(() => {
                 id="extractor-country"
                 v-model="country"
                 data-testid="country-select"
-                :disabled="Boolean(forceCountry)"
+                :disabled="Boolean(forceCountry || requiredMethodCountry)"
                 :loading="defaultsLoading"
               >
                 <el-option
@@ -1009,10 +1373,24 @@ onBeforeUnmount(() => {
                 <el-option
                   v-for="option in paymentMethods"
                   :key="option.value"
-                  :label="option.label"
+                  :label="option.country ? `${option.label} · ${countryName(option.country)} · ${option.currency || '—'}` : option.label"
                   :value="option.value"
+                  :disabled="option.enabled === false"
                 />
               </el-select>
+            </div>
+            <div>
+              <label class="field-label" for="extractor-currency">实际结算币种</label>
+              <el-input id="extractor-currency" :model-value="effectiveCurrency" readonly />
+            </div>
+            <div v-if="paymentMethod === 'ideal'">
+              <label class="field-label" for="extractor-ideal-bank">iDEAL Bank 标识</label>
+              <el-input
+                id="extractor-ideal-bank"
+                v-model="idealBank"
+                data-testid="ideal-bank"
+                placeholder="例如 n26"
+              />
             </div>
             <div>
               <label class="field-label" for="extractor-workbench-password">工作台密码（可选）</label>
@@ -1052,6 +1430,17 @@ onBeforeUnmount(() => {
                   controls-position="right"
                   @change="updateConcurrency(false)"
                 />
+              </div>
+              <div class="concurrency-control">
+                <span>失败自动重试</span>
+                <el-input-number
+                  v-model="autoRetryCount"
+                  data-testid="extractor-auto-retry-count"
+                  :min="0"
+                  :max="10"
+                  controls-position="right"
+                />
+                <span>次</span>
               </div>
               <el-checkbox v-model="applyCheckoutUpdate" data-testid="apply-update">
                 执行 Checkout Update
@@ -1109,6 +1498,17 @@ onBeforeUnmount(() => {
           <div class="bulk-actions">
             <el-button
               size="small"
+              type="danger"
+              plain
+              :disabled="!taskCounts.running"
+              :loading="bulkAction === 'cancel-all'"
+              data-testid="cancel-all-tasks"
+              @click="cancelAllTasks"
+            >
+              一键取消全部
+            </el-button>
+            <el-button
+              size="small"
               :disabled="!tasks.some((task) => task.status === 'failed' && task.networkError)"
               :loading="bulkAction === 'retry-network'"
               data-testid="retry-network-failed"
@@ -1157,6 +1557,9 @@ onBeforeUnmount(() => {
                     {{ statusLabel(task.status) }}
                   </el-tag>
                   <el-tag v-if="task.networkError" type="warning" effect="plain" round>网络错误</el-tag>
+                  <el-tag v-if="(task.maxAttempts || 1) > 1" type="info" effect="plain" round>
+                    第 {{ task.attempt || 1 }}/{{ task.maxAttempts || 1 }} 次
+                  </el-tag>
                 </div>
                 <p>
                   {{ task.paymentMethod.toUpperCase() }} · {{ task.billingCountry }} ·
@@ -1173,9 +1576,6 @@ onBeforeUnmount(() => {
             </div>
 
             <div v-if="task.error" class="task-error">{{ redactSensitiveText(task.error) }}</div>
-            <div v-if="task.logs?.length" class="task-logs">
-              <code v-for="(line, index) in task.logs.slice(-8)" :key="index">{{ redactSensitiveText(line) }}</code>
-            </div>
 
             <div v-if="task.status === 'succeeded'" class="result-box">
               <div v-if="resultUrl(task)" class="result-url">
@@ -1183,6 +1583,7 @@ onBeforeUnmount(() => {
                 <div>
                   <el-button size="small" :icon="CopyDocument" @click="copyText(resultUrl(task), '支付链接')">复制</el-button>
                   <el-button
+                    v-if="normalizedHttpsUrl(resultUrl(task))"
                     size="small"
                     type="primary"
                     :icon="CreditCard"
@@ -1203,6 +1604,9 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="task-actions">
+              <el-button size="small" type="primary" plain @click="openTaskDetails(task)">
+                详细步骤日志
+              </el-button>
               <el-button
                 v-if="!TERMINAL_STATES.has(task.status)"
                 size="small"
@@ -1249,10 +1653,47 @@ onBeforeUnmount(() => {
         </div>
       </article>
     </div>
-  </section>
+      </section>
+
+      <el-dialog v-model="taskDetailsOpen" title="提链任务详细步骤" width="900px" destroy-on-close>
+        <div v-loading="taskDetailsLoading" class="task-detail-dialog">
+          <el-descriptions v-if="selectedTaskDetails" :column="3" border size="small">
+            <el-descriptions-item label="账号">{{ selectedTaskDetails.accountEmail || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="任务 ID">{{ selectedTaskDetails.taskId }}</el-descriptions-item>
+            <el-descriptions-item label="状态">{{ statusLabel(selectedTaskDetails.status) }}</el-descriptions-item>
+            <el-descriptions-item label="账单国家">{{ countryName(selectedTaskDetails.billingCountry) }}</el-descriptions-item>
+            <el-descriptions-item label="支付方式">{{ selectedTaskDetails.paymentMethod.toUpperCase() }}</el-descriptions-item>
+            <el-descriptions-item label="尝试次数">{{ selectedTaskDetails.attempt || 1 }}/{{ selectedTaskDetails.maxAttempts || 1 }}</el-descriptions-item>
+          </el-descriptions>
+          <el-timeline v-if="selectedTaskDetails?.logs?.length" class="task-detail-timeline">
+            <el-timeline-item
+              v-for="(entry, index) in selectedTaskDetails.logs"
+              :key="`${entry.timestamp}-${index}`"
+              :timestamp="formatDate(entry.timestamp)"
+              :type="entry.status === 'error' ? 'danger' : entry.status === 'warning' ? 'warning' : 'success'"
+              placement="top"
+            >
+              <el-card shadow="never">
+                <strong>{{ entry.label }}</strong>
+                <small>第 {{ entry.attempt }} 次尝试 · {{ entry.step }}</small>
+                <dl v-if="Object.keys(entry.details || {}).length" class="result-meta">
+                  <div v-for="(value, key) in entry.details" :key="key">
+                    <dt>{{ detailLabel(String(key)) }}</dt><dd>{{ detailValue(value) }}</dd>
+                  </div>
+                </dl>
+              </el-card>
+            </el-timeline-item>
+          </el-timeline>
+          <el-empty v-else description="该任务暂无详细步骤日志" />
+        </div>
+      </el-dialog>
 </template>
 
 <style scoped>
+.stored-source-box { padding: 12px; margin-bottom: 4px; border: 1px solid var(--border-color); border-radius: 10px; background: rgb(79 140 255 / 4%); }
+.stored-source-row, .stored-proxy-row { display: flex; gap: 10px; align-items: center; }
+.stored-source-row .el-select, .stored-proxy-row .el-select { flex: 1; min-width: 0; }
+.stored-proxy-row { margin-bottom: 10px; }
 .heading-stats,
 .task-title-row,
 .panel-actions,
@@ -1455,7 +1896,11 @@ onBeforeUnmount(() => {
 .result-meta div { min-width: 0; padding-top: 8px; border-top: 1px solid rgb(255 255 255 / 6%); }
 .result-meta dt { color: var(--text-muted); font-size: 11px; }
 .result-meta dd { margin: 4px 0 0; color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.task-detail-timeline .result-meta dd { white-space: pre-wrap; }
 .task-actions { justify-content: flex-end; flex-wrap: wrap; margin-top: 12px; }
+.task-detail-dialog { min-height: 180px; }
+.task-detail-timeline { max-height: 62vh; padding: 20px 12px 0 4px; overflow: auto; }
+.task-detail-timeline small { display: block; margin-top: 5px; color: var(--text-muted); }
 
 @media (max-width: 1280px) {
   .console-grid { grid-template-columns: 1fr; }

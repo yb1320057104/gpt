@@ -21,16 +21,47 @@ export interface AccountRecord {
   planExpiresAt?: string | null
   planRenewsAt?: string | null
   promotionCampaignId?: string | null
+  promotionKind?: 'trial' | 'discount' | string | null
   checkoutType?: 'oaics' | 'cs' | null
   checkoutTypeDetail?: 'oaics' | 'stripe_cs_live' | 'stripe_cs_test' | 'stripe_checkout' | 'stripe_cs' | string | null
   checkoutTypeCheckedAt?: string | null
   checkoutTypeErrorCode?: string | null
   checkoutTypeHttpStatus?: number | null
+  checkoutTypeCheckStatus?: 'running' | 'success' | 'failed' | null
   registrationCountry?: string | null
   aliveStatus?: 'running' | 'alive' | 'dead' | 'unknown' | null
   aliveCheckedAt?: string | null
   aliveErrorCode?: string | null
   aliveHttpStatus?: number | null
+  globalPromotionStatus?: 'pending' | 'running' | 'eligible' | 'ineligible' | 'failed' | null
+  globalPromotionEligible?: boolean | null
+  globalPromotionCheckedAt?: string | null
+  globalPromotionProxyCount?: number
+  globalPromotionCountries?: string[]
+  globalPromotionResults?: Array<{
+    proxyId: string
+    country: string
+    eligible: boolean | null
+    campaignId?: string | null
+    httpStatus?: number | null
+    latencyMs?: number | null
+    error?: string
+  }>
+  globalPromotionMessage?: string | null
+  oaicsScanStatus?: 'pending' | 'running' | 'completed' | 'failed' | null
+  oaicsScanCheckedAt?: string | null
+  oaicsScanTotal?: number
+  oaicsScanSuccess?: number
+  oaicsScanCountryStats?: Array<{
+    country: string
+    total: number
+    oaics: number
+    cs: number
+    failed: number
+    successRate: number
+  }>
+  oaicsScanResults?: Array<Record<string, unknown>>
+  oaicsScanMessage?: string | null
 }
 
 export interface AccountPlanCheckItem {
@@ -46,6 +77,8 @@ export interface AccountPlanCheckResult {
   skipped: number
   items: AccountPlanCheckItem[]
 }
+
+export type AccountCheckoutTypeCheckResult = AccountPlanCheckResult
 
 export interface AccountAliveCheckResult {
   requested: number
@@ -239,6 +272,7 @@ export interface ResourceQuery {
   country?: string
   promotion?: '' | 'untried_plus' | 'ineligible' | 'unchecked'
   alive?: '' | 'alive' | 'dead' | 'unknown' | 'unchecked'
+  globalPromotion?: '' | 'eligible' | 'ineligible' | 'pending' | 'failed'
   source?: EmailSource
 }
 
@@ -375,6 +409,9 @@ export interface PaymentExtractorOption {
   value: string
   label: string
   currency?: string | null
+  country?: string | null
+  resultKind?: string | null
+  enabled?: boolean
 }
 
 export interface PaymentExtractorDefaults {
@@ -397,12 +434,30 @@ export interface PaymentExtractorConcurrency {
 
 export interface PaymentExtractorTaskInput {
   accessToken: string
+  accountId?: string
   checkoutProxy: string
   updateProxy: string
   stripeHcaptchaToken: string
   country: string
   paymentMethod: string
   applyCheckoutUpdate: boolean
+  autoRetryCount?: number
+  rotateCheckoutProxy?: boolean
+  rotateUpdateProxy?: boolean
+  idealBank?: string
+}
+
+export interface PaymentExtractorAccountSource {
+  id: string
+  email: string
+  registrationCountry?: string | null
+  accessTokenExpiresAt: string
+  accountType?: AccountType | null
+}
+
+export interface PaymentExtractorProxyPoolResult {
+  proxies: string[]
+  count: number
 }
 
 export interface PaymentExtractorRetryInput {
@@ -460,11 +515,22 @@ export interface PaymentExtractorTask {
   billingCountry: string
   sessionKind?: string | null
   retryOf?: string | null
+  attempt?: number
+  maxAttempts?: number
   result?: PaymentExtractorResult | null
   error?: string | null
   networkError?: boolean
   message?: string | null
-  logs?: string[]
+  logs?: PaymentExtractorTaskLog[]
+}
+
+export interface PaymentExtractorTaskLog {
+  timestamp: string
+  step: string
+  label: string
+  status: 'success' | 'warning' | 'error' | string
+  attempt: number
+  details: Record<string, unknown>
 }
 
 export interface PaymentExtractorTaskList {
@@ -497,6 +563,12 @@ export interface PaymentExtractorDeleteResult {
 export interface PaymentExtractorBulkDeleteResult {
   ok: boolean
   deletedCount: number
+  taskIds: string[]
+}
+
+export interface PaymentExtractorBulkCancelResult {
+  ok: boolean
+  cancelledCount: number
   taskIds: string[]
 }
 
@@ -562,6 +634,7 @@ export interface PipelineItem {
   accountType: AccountType
   promotionEligible: boolean
   promotionCampaignId?: string | null
+  promotionKind?: 'trial' | 'discount' | string | null
   planCheckedAt?: string | null
   accessTokenConfigured: boolean
   accessTokenExpiresAt: string | null

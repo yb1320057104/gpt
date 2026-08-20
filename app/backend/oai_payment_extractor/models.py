@@ -15,6 +15,10 @@ class ExtractionConfig:
     apply_checkout_update: bool = True
     verbose: bool = True
     oaics_only: bool = False
+    auto_retry_count: int = 0
+    retry_checkout_proxies: tuple[str, ...] = ()
+    retry_update_proxies: tuple[str, ...] = ()
+    ideal_bank: str = "n26"
 
 
 @dataclass(frozen=True)

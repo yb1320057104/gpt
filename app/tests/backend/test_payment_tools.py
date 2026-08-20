@@ -16,8 +16,18 @@ import backend.oai_iprocket_chain_bridge as bridge_module
 from backend.main import create_app
 from backend.mongo_manager import MongoManager
 from backend.oai_payment_extractor import application
+from backend.oai_payment_extractor.config import payment_currency
+from backend.oai_payment_extractor.checkout import update_checkout
 from backend.oai_payment_extractor.models import ExtractionConfig, PaymentLinkResult
-from backend.oai_payment_extractor.web.tasks import TaskManager
+from backend.oai_payment_extractor.errors import NetworkError, ProtocolError
+from backend.oai_payment_extractor.stripe_common import checkout_payable_amount, extract_redirect_to_url
+from backend.oai_payment_extractor.stripe_common import stripe_confirm_return_url
+from backend.oai_payment_extractor.flows.cs_live import stripe_wallet_pre_confirm
+import backend.oai_payment_extractor.flows.cs_live as cs_live_module
+from backend.oai_payment_extractor.flows.oaics import oaics_custom_method_id
+from backend.oai_payment_extractor.transport import reset_request_trace, set_request_trace, stage_http_request
+from backend.oai_payment_extractor.web.tasks import TaskManager, chinese_failure_reason, classify_failure
+from backend.oai_payment_extractor.web.proxy_probe import probe_proxy
 import backend.payment_extractor_service as payment_extractor_module
 from backend.payment_extractor_service import (
     PaymentExtractorProxySource,
@@ -71,6 +81,153 @@ def test_extract_access_tokens_recurses_normalizes_and_deduplicates() -> None:
     assert item.planType == "free"
     assert item.expired is False
     assert token not in item.preview
+
+
+def test_oaics_custom_method_matches_only_requested_payment_method() -> None:
+    payload = {
+        "custom_payment_methods": [
+            {"id": "cpmt_momo", "payment_method_type": "momo_wallet", "provider": "adyen"},
+            {"id": "cpmt_gcash", "payment_method_type": "gcash", "provider": "adyen"},
+        ]
+    }
+
+    assert oaics_custom_method_id(payload, "gcash") == "cpmt_gcash"
+    assert oaics_custom_method_id(payload, "momo") == "cpmt_momo"
+    assert oaics_custom_method_id(payload, "kakao_pay") == ""
+
+
+def test_zero_paypal_confirm_matches_compact_approved_template(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Response:
+        status_code = 200
+        text = '{"submission_attempt":{"state":"requires_approval"}}'
+
+        @staticmethod
+        def json() -> dict:
+            return {"submission_attempt": {"state": "requires_approval"}}
+
+    def fake_request(*_args, **kwargs):
+        captured.update(kwargs.get("data") or {})
+        return Response()
+
+    monkeypatch.setattr(cs_live_module, "stage_http_request", fake_request)
+    result = cs_live_module.stripe_confirm_cs_live(
+        object(),
+        {"cs_id": "cs_fixture", "publishable_key": "pk_fixture", "billing_country": "DE"},
+        {"init_checksum": "checksum", "consent_collection": {}},
+        {
+            "checkout_amount": "0",
+            "stripe_js_id": "js_fixture",
+            "config_id": "cfg_fixture",
+            "elements_session_id": "elements_session_fixture",
+            "elements_session_config_id": "elements_config_fixture",
+        },
+        "https://checkout.stripe.com/c/pay/cs_fixture",
+        "paypal",
+        "pm_paypal_fixture",
+        {"name": "Test", "email": "test@example.test", "line1": "One", "city": "Berlin", "postal_code": "10115", "country": "DE"},
+        None,
+    )
+
+    assert result["submission_attempt"]["state"] == "requires_approval"
+    assert captured["payment_method"] == "pm_paypal_fixture"
+    assert "payment_method_data[type]" not in captured
+    assert captured["expected_amount"] == "0"
+    assert captured["eid"] == "NA"
+    assert captured["client_attribution_metadata[merchant_integration_version]"] == "custom_checkout"
+    assert "elements_session_client[session_id]" not in captured
+    assert "payment_method_data[type]" not in captured
+
+
+def test_paid_paypal_confirm_uses_compact_precreated_payment_method(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Response:
+        status_code = 200
+        text = '{"submission_attempt":{"state":"requires_approval"}}'
+
+        @staticmethod
+        def json() -> dict:
+            return {"submission_attempt": {"state": "requires_approval"}}
+
+    def fake_request(*_args, **kwargs):
+        captured.update(kwargs.get("data") or {})
+        return Response()
+
+    monkeypatch.setattr(cs_live_module, "stage_http_request", fake_request)
+    cs_live_module.stripe_confirm_cs_live(
+        object(),
+        {"cs_id": "cs_fixture", "publishable_key": "pk_fixture", "billing_country": "GB"},
+        {"init_checksum": "checksum", "consent_collection": {}},
+        {"checkout_amount": "2000", "stripe_js_id": "js_fixture", "config_id": "cfg_fixture"},
+        "https://checkout.stripe.com/c/pay/cs_fixture",
+        "paypal",
+        "pm_paypal_fixture",
+        {"name": "Test", "email": "test@example.test", "line1": "One", "city": "London", "postal_code": "SW1A 1AA", "country": "GB"},
+        None,
+    )
+
+    assert captured["payment_method"] == "pm_paypal_fixture"
+    assert captured["expected_amount"] == "2000"
+    assert "elements_session_client[session_id]" not in captured
+
+
+def test_upi_confirm_uses_precreated_payment_method_and_compact_form(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Response:
+        status_code = 200
+        text = '{"next_action":{}}'
+
+        @staticmethod
+        def json() -> dict:
+            return {"next_action": {}}
+
+    def fake_request(*_args, **kwargs):
+        captured.update(kwargs.get("data") or {})
+        return Response()
+
+    monkeypatch.setattr(cs_live_module, "stage_http_request", fake_request)
+    cs_live_module.stripe_confirm_cs_live(
+        object(),
+        {"cs_id": "cs_fixture", "publishable_key": "pk_fixture", "billing_country": "IN"},
+        {"init_checksum": "checksum", "consent_collection": {}},
+        {"checkout_amount": "0", "stripe_js_id": "js_fixture", "config_id": "cfg_fixture"},
+        "https://checkout.stripe.com/c/pay/cs_fixture",
+        "upi",
+        "pm_upi_fixture",
+        {"name": "Test", "email": "test@example.test", "line1": "One", "city": "Kolkata", "postal_code": "700016", "country": "IN", "state": "West Bengal"},
+        None,
+    )
+
+    assert captured["payment_method"] == "pm_upi_fixture"
+    assert captured["expected_payment_method_type"] == "upi"
+    assert "payment_method_data[type]" not in captured
+    assert "elements_session_client[session_id]" not in captured
+
+
+def test_stripe_confirm_return_url_uses_hosted_success_return_url() -> None:
+    url = stripe_confirm_return_url(
+        {"cs_id": "cs_fixture", "processor_entity": "openai_ie"},
+        "https://checkout.stripe.com/c/pay/cs_fixture",
+    )
+    assert "success_return_url=" in url
+    assert "return_url=" not in url.replace("success_return_url=", "")
+
+
+@pytest.mark.parametrize(
+    ("raw_error", "expected"),
+    [
+        ("checkout_creation_rate_limited: Too many checkout attempts", "限流"),
+        ("ChatGPT manual approval blocked", "结账审批被服务端拒绝"),
+        ("OAICS 未返回目标支付方式 gcash 的 cpmt_ 通道", "没有所选支付方式资格"),
+    ],
+)
+def test_payment_failure_reason_exposes_rate_limit_and_method_eligibility(
+    raw_error: str, expected: str
+) -> None:
+    assert expected in chinese_failure_reason(raw_error)
 
 
 def test_extract_access_tokens_supports_separator_and_expired_flag() -> None:
@@ -186,6 +343,179 @@ def test_service_exposes_all_source_options_and_rotates_proxy_pool(monkeypatch) 
     serialized = json.dumps([first, second])
     assert "CHECKOUT_SECRET" not in serialized
     assert "UPDATE_SECRET" not in serialized
+
+
+def test_payment_method_profiles_validate_country_and_expose_currency() -> None:
+    service = PaymentExtractorService(manager=FakeManager())  # type: ignore[arg-type]
+
+    methods = {item["value"]: item for item in service.options()["paymentMethods"]}
+    assert methods["pix"]["country"] == "BR"
+    assert methods["pix"]["currency"] == "BRL"
+    assert methods["upi"]["result_kind"] == "qr_or_deep_link"
+    assert methods["blik"]["enabled"] is False
+    assert payment_currency("BR", "paypal") == "USD"
+    assert payment_currency("BR", "pix") == "BRL"
+
+    with pytest.raises(PaymentExtractorServiceError, match="仅支持账单国家 PH"):
+        service.create(task_payload(paymentMethod="gcash", country="DE"))
+    with pytest.raises(PaymentExtractorServiceError, match="安全模式"):
+        service.create(task_payload(paymentMethod="blik", country="PL"))
+
+
+def test_extract_redirect_supports_wallet_qr_and_deep_link_payloads() -> None:
+    assert extract_redirect_to_url(
+        {"next_action": {"pix_display_qr_code": {"data": "PIX-COPY-PASTE"}}}
+    ) == "PIX-COPY-PASTE"
+    assert extract_redirect_to_url(
+        {"payment_intent": {"next_action": {"mobile_app_redirect": {"deep_link": "upi://pay?fixture"}}}}
+    ) == "upi://pay?fixture"
+    assert extract_redirect_to_url(
+        {"next_action": {"gopay_redirect": {"deep_link": "gopay://pay/fixture"}}}
+    ) == "gopay://pay/fixture"
+    assert extract_redirect_to_url(
+        {"next_action": {"upi_handle_redirect_or_display_qr_code": {
+            "qr_code": {"data": "upi://pay?pa=fixture"}
+        }}}
+    ) == "upi://pay?pa=fixture"
+    assert extract_redirect_to_url(
+        {"next_action": {"momo_handle_redirect_or_display_qr_code": {
+            "hosted_instructions_url": "https://payment.momo.vn/fixture"
+        }}}
+    ) == "https://payment.momo.vn/fixture"
+
+
+def test_unknown_checkout_amount_is_not_treated_as_zero() -> None:
+    with pytest.raises(Exception, match="未返回应付金额"):
+        checkout_payable_amount({"currency": "USD"})
+
+
+@pytest.mark.parametrize(("payment_method", "expected_timeout"), [("gopay", 90), ("momo", 60)])
+def test_local_wallets_use_provider_specific_poll_timeout(
+    monkeypatch, payment_method: str, expected_timeout: int
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_poll(_stripe, _checkout, method, timeout, _log, _ctx):
+        captured.update({"method": method, "timeout": timeout})
+        return "https://provider.example/fixture"
+
+    monkeypatch.setattr(cs_live_module, "stripe_provider_poll", fake_poll)
+    result = cs_live_module.provider_redirect_after_confirm(
+        object(), object(), {"cs_id": "cs_fixture"}, {}, payment_method, None, {}
+    )
+
+    assert result == "https://provider.example/fixture"
+    assert captured == {"method": payment_method, "timeout": expected_timeout}
+
+
+def test_checkout_approval_blocked_rotates_proxy_and_retries_same_step(monkeypatch) -> None:
+    approval_proxies: list[str] = []
+    results = iter(("blocked", "approved"))
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def __init__(self, result: str) -> None:
+            self._result = result
+
+        def json(self) -> dict[str, str]:
+            return {"result": self._result}
+
+    def fake_request(session, _stage, _method, url, *_args, **_kwargs):
+        if url.endswith("/sentinel/ping"):
+            raise RuntimeError("skip sentinel in test")
+        approval_proxies.append(session.proxies["https"])
+        return Response(next(results))
+
+    monkeypatch.setattr(cs_live_module, "stage_http_request", fake_request)
+    session = SimpleNamespace(proxies={"https": "http://proxy-one.example:8080"})
+
+    cs_live_module.chatgpt_approve(
+        session,
+        {"cs_id": "cs_live_fixture", "billing_country": "GB", "processor_entity": "openai_llc"},
+        None,
+        ("http://proxy-one.example:8080", "http://proxy-two.example:8080"),
+    )
+
+    assert approval_proxies == [
+        "http://proxy-one.example:8080",
+        "http://proxy-two.example:8080",
+    ]
+
+
+def test_kakao_wallet_preconfirm_uses_dedicated_protocol_endpoint() -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        text = '{"accepted":true}'
+
+        @staticmethod
+        def json() -> dict[str, bool]:
+            return {"accepted": True}
+
+    class Session:
+        def request(self, method: str, url: str, **kwargs):
+            captured.update({"method": method, "url": url, "data": kwargs.get("data")})
+            return Response()
+
+    payload = stripe_wallet_pre_confirm(
+        Session(), {"cs_id": "cs_live_fixture", "publishable_key": "pk_test_fixture"},
+        "kakao_pay", None,
+    )
+
+    assert payload["accepted"] is True
+    assert captured["url"] == "https://api.stripe.com/v1/payment_pages/cs_live_fixture/pre_confirm"
+    assert captured["data"]["payment_method_type"] == "kakao_pay"
+
+
+def test_request_trace_records_response_and_redacts_secrets() -> None:
+    events: list[tuple[str, dict]] = []
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict:
+            return {"state": "eligible", "client_secret": "must-not-leak", "amount": 0}
+
+    class Session:
+        @staticmethod
+        def request(*_args, **_kwargs):
+            return Response()
+
+    token = set_request_trace(lambda stage, details: events.append((stage, details)))
+    try:
+        stage_http_request(
+            Session(), "资格检测", "POST", "https://chatgpt.com/test?token=hidden",
+            json={"campaign": "plus", "access_token": "must-not-leak"},
+        )
+    finally:
+        reset_request_trace(token)
+
+    assert events[0][0] == "http_request"
+    serialized = json.dumps(events, ensure_ascii=False)
+    assert "eligible" in serialized
+    assert "must-not-leak" not in serialized
+    assert "https://chatgpt.com/test" in serialized
+    assert "token=hidden" not in serialized
+
+
+def test_service_prepares_rotating_proxy_sequence_for_automatic_retries(monkeypatch) -> None:
+    monkeypatch.setenv("OPLL_STICKY_TASK_PROXY", "false")
+    manager = FakeManager()
+    service = PaymentExtractorService(manager=manager)  # type: ignore[arg-type]
+
+    service.create(task_payload(autoRetryCount=2))
+
+    config = manager.configs[0]
+    assert config.auto_retry_count == 2
+    assert config.checkout_proxy.endswith("@one.example:8080")
+    assert config.retry_checkout_proxies[0].endswith("@two.example:8080")
+    assert config.retry_checkout_proxies[1].endswith("@one.example:8080")
+    assert len(config.retry_update_proxies) == 2
 
 
 def test_explicit_billing_country_is_not_overridden_by_proxy_region() -> None:
@@ -659,7 +989,7 @@ def test_readme_environment_defaults_and_snake_case_payload(monkeypatch, tmp_pat
     monkeypatch.setenv("OPLL_AT", token)
     monkeypatch.setenv("OPLL_COUNTRY", "JP")
     monkeypatch.setenv("OPLL_FORCE_COUNTRY", "DE")
-    monkeypatch.setenv("OPLL_PAYMENT_METHOD", "gopay")
+    monkeypatch.setenv("OPLL_PAYMENT_METHOD", "paypal")
     monkeypatch.setenv("OPLL_UPDATE_CHECKOUT", "false")
     monkeypatch.setenv("OPLL_TASK_WORKERS", "3")
     monkeypatch.setenv("OPLL_TASK_TTL_SECONDS", "77")
@@ -676,7 +1006,7 @@ def test_readme_environment_defaults_and_snake_case_payload(monkeypatch, tmp_pat
         options = service.options()
         assert options["country"] == "DE"
         assert options["forceCountry"] == "DE"
-        assert options["paymentMethod"] == "gopay"
+        assert options["paymentMethod"] == "paypal"
         assert options["applyCheckoutUpdate"] is False
         assert options["checkoutProxy"].startswith("http://pool-user:")
         assert captured == {
@@ -701,7 +1031,7 @@ def test_readme_environment_defaults_and_snake_case_payload(monkeypatch, tmp_pat
         assert created["status"] == "queued"
         assert service.manager.configs[0].access_token == token
         assert service.manager.configs[0].country == "DE"
-        assert service.manager.configs[0].payment_method == "gopay"
+        assert service.manager.configs[0].payment_method == "paypal"
         assert service.manager.configs[0].apply_checkout_update is False
     finally:
         service.close()
@@ -1051,3 +1381,174 @@ def test_task_manager_failure_redacts_all_configured_secrets() -> None:
             assert secret not in serialized
     finally:
         service.close()
+
+
+def test_task_manager_automatically_retries_and_translates_failure() -> None:
+    attempts: list[str] = []
+
+    def flaky_extractor(config: ExtractionConfig, **_kwargs) -> dict:
+        attempts.append(config.checkout_proxy)
+        if len(attempts) < 3:
+            raise RuntimeError("Proxy CONNECT aborted")
+        return {"ok": True, "provider_url": "https://pay.example.test/success"}
+
+    manager = TaskManager(extractor=flaky_extractor, max_workers=1)  # type: ignore[arg-type]
+    config = ExtractionConfig(
+        access_token="header.payload.signature",
+        checkout_proxy="http://proxy-one.example:8080",
+        update_proxy="http://update-one.example:8080",
+        country="DE",
+        payment_method="paypal",
+        auto_retry_count=2,
+        retry_checkout_proxies=(
+            "http://proxy-two.example:8080",
+            "http://proxy-three.example:8080",
+        ),
+        retry_update_proxies=(
+            "http://update-two.example:8080",
+            "http://update-three.example:8080",
+        ),
+    )
+    try:
+        task_id = manager.create(config)["task_id"]
+        deadline = time.monotonic() + 3
+        snapshot = manager.get(task_id)
+        while snapshot and snapshot["status"] not in {"succeeded", "failed", "cancelled"}:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+            snapshot = manager.get(task_id)
+        assert snapshot is not None
+        assert snapshot["status"] == "succeeded"
+        assert snapshot["attempt"] == 3
+        assert snapshot["max_attempts"] == 3
+        assert attempts == [
+            "http://proxy-one.example:8080",
+            "http://proxy-two.example:8080",
+            "http://proxy-three.example:8080",
+        ]
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize(
+    ("exc", "stage", "category", "retryable"),
+    [
+        (NetworkError("checkout", "connection reset"), "checkout", "network_error", True),
+        (ProtocolError(409, "promo eligibility rejected: state=not_eligible"), "eligibility_check", "eligibility_rejected", True),
+        (ProtocolError(409, "checkout trial eligibility rejected: one_click_trial_eligible=false"), "checkout_update", "eligibility_rejected", True),
+        (ProtocolError(409, "final amount is not zero"), "payment_confirmation", "amount_or_currency_mismatch", True),
+        (ProtocolError(409, "最终账单不是 0 元"), "redirect_resolution", "amount_or_currency_mismatch", True),
+        (ProtocolError(409, "ChatGPT manual approval blocked"), "payment_confirmation", "final_approval_rejected", True),
+        (ProtocolError(409, "ChatGPT 结账审批被服务端拒绝，金额或风险校验未通过"), "payment_confirmation", "final_approval_rejected", True),
+    ],
+)
+def test_failure_classifier_drives_retry_policy(exc, stage, category, retryable) -> None:
+    result = classify_failure(exc, stage)
+    assert result["category"] == category
+    assert result["retryable"] is retryable
+    assert result["stage"] == stage
+
+
+def test_checkout_update_continues_when_one_click_trial_is_false(monkeypatch) -> None:
+    payload = {
+        "success": True,
+        "checkout_session": {"one_click_trial_eligible": False},
+    }
+
+    class Response:
+        status_code = 200
+        text = json.dumps(payload)
+
+        @staticmethod
+        def json() -> dict:
+            return payload
+
+    monkeypatch.setattr(
+        "backend.oai_payment_extractor.checkout.stage_http_request",
+        lambda *_args, **_kwargs: Response(),
+    )
+    session = SimpleNamespace(proxies={})
+    config = ExtractionConfig(
+        access_token="header.payload.signature",
+        checkout_proxy="http://checkout.example:8080",
+        update_proxy="http://update.example:8080",
+        country="GB",
+    )
+    checkout = {
+        "cs_id": "cs_live_fixture",
+        "billing_country": "GB",
+        "processor_entity": "openai_llc",
+    }
+
+    result = update_checkout(config, session, checkout, None)
+
+    assert result["checkout_session"]["one_click_trial_eligible"] is False
+    assert session.proxies["https"] == "http://checkout.example:8080"
+
+
+def test_task_manager_retries_non_network_failure_with_rotated_proxy() -> None:
+    attempts = 0
+
+    def rejected_extractor(_config: ExtractionConfig, **kwargs) -> dict:
+        nonlocal attempts
+        attempts += 1
+        kwargs["stage_callback"]("payment_confirmation")
+        raise ProtocolError(409, "ChatGPT manual approval blocked")
+
+    manager = TaskManager(extractor=rejected_extractor, max_workers=1)  # type: ignore[arg-type]
+    config = ExtractionConfig(
+        access_token="header.payload.signature",
+        checkout_proxy="http://proxy-one.example:8080",
+        update_proxy="http://update-one.example:8080",
+        country="GB",
+        payment_method="paypal",
+        auto_retry_count=2,
+        retry_checkout_proxies=("http://proxy-two.example:8080", "http://proxy-three.example:8080"),
+        retry_update_proxies=("http://update-two.example:8080", "http://update-three.example:8080"),
+    )
+    try:
+        task_id = manager.create(config)["task_id"]
+        deadline = time.monotonic() + 3
+        snapshot = manager.get(task_id)
+        while snapshot["status"] not in {"succeeded", "failed", "cancelled"}:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+            snapshot = manager.get(task_id)
+        assert attempts == 3
+        assert snapshot["status"] == "failed"
+        assert snapshot["failure_category"] == "final_approval_rejected"
+        assert snapshot["retryable"] is True
+        assert snapshot["attempt"] == 3
+    finally:
+        manager.close()
+
+
+def test_proxy_probe_records_http_tls_and_egress_metadata() -> None:
+    class Socket:
+        @staticmethod
+        def version() -> str:
+            return "TLSv1.3"
+
+    response = SimpleNamespace(
+        status_code=200,
+        raw=SimpleNamespace(connection=SimpleNamespace(sock=Socket())),
+        json=lambda: {
+            "success": True,
+            "ip": "203.0.113.10",
+            "country": "United Kingdom",
+            "country_code": "GB",
+            "region": "England",
+            "region_code": "ENG",
+        },
+    )
+
+    def fake_get(*_args, **kwargs):
+        assert kwargs["proxies"]["https"] == "http://proxy.example:8080"
+        return response
+
+    result = probe_proxy("http://proxy.example:8080", request_get=fake_get).to_dict()
+    assert result["ip"] == "203.0.113.10"
+    assert result["country_code"] == "GB"
+    assert result["http_status"] == 200
+    assert result["tls_version"] == "TLSv1.3"
+    assert isinstance(result["latency_ms"], int)

@@ -96,6 +96,8 @@ export const useAppStore = defineStore('app', {
     accountPromotionCheckingIds: [] as string[],
     accountAliveChecking: false,
     accountAliveCheckingIds: [] as string[],
+    accountCheckoutTypeChecking: false,
+    accountCheckoutTypeCheckingIds: [] as string[],
   }),
 
   actions: {
@@ -273,6 +275,20 @@ export const useAppStore = defineStore('app', {
       } finally {
         this.accountAliveCheckingIds = []
         this.accountAliveChecking = false
+      }
+    },
+
+    async checkAccountCheckoutTypes(ids: string[], proxyId?: string) {
+      if (this.accountCheckoutTypeChecking) throw new Error('已有账单类型检测正在执行')
+      this.accountCheckoutTypeChecking = true
+      this.accountCheckoutTypeCheckingIds = [...ids]
+      try {
+        const result = await dataGateway.checkAccountCheckoutTypes(ids, proxyId)
+        await this.refreshAccounts()
+        return result
+      } finally {
+        this.accountCheckoutTypeCheckingIds = []
+        this.accountCheckoutTypeChecking = false
       }
     },
 

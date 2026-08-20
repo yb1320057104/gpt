@@ -28,6 +28,7 @@ from .chatgpt_plan import (
 from .checkout_type import (
     CheckoutTypeCheckError,
     CheckoutTypeResult,
+    checkout_currency,
     parse_checkout_type_response,
 )
 from .totp import TotpSecretError, generate_totp, normalize_totp_secret
@@ -3624,10 +3625,12 @@ class CdpBrowserAutomation:
         token = normalize_access_token(access_token)
         if not token:
             raise CheckoutTypeCheckError("access_token_missing")
+        normalized_country = str(country or "").strip().upper()
+        currency = checkout_currency(normalized_country)
         try:
             response = await page.evaluate(
                 """
-                async ({ url, path, token, country, deviceId }) => {
+                async ({ url, path, token, country, currency, deviceId }) => {
                   const result = await fetch(url, {
                     method: 'POST',
                     credentials: 'include',
@@ -3643,7 +3646,7 @@ class CdpBrowserAutomation:
                     body: JSON.stringify({
                       entry_point: 'all_plans_pricing_modal',
                       plan_name: 'chatgptplusplan',
-                      billing_details: { country, currency: 'JPY' },
+                      billing_details: { country, currency },
                       checkout_ui_mode: 'custom',
                     }),
                   });
@@ -3655,7 +3658,8 @@ class CdpBrowserAutomation:
                     "url": CHATGPT_CHECKOUT_URL,
                     "path": CHATGPT_CHECKOUT_PATH,
                     "token": token,
-                    "country": country.upper(),
+                    "country": normalized_country,
+                    "currency": currency,
                     "deviceId": str(uuid4()),
                 },
             )

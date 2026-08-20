@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -82,16 +82,33 @@ class AccountRecord(ApiModel):
     planExpiresAt: datetime | None = None
     planRenewsAt: datetime | None = None
     promotionCampaignId: str | None = None
+    promotionKind: str | None = None
+    promotionKind: str | None = None
     checkoutType: CheckoutType | None = None
     checkoutTypeDetail: str | None = None
     checkoutTypeCheckedAt: datetime | None = None
     checkoutTypeErrorCode: str | None = None
     checkoutTypeHttpStatus: int | None = None
+    checkoutTypeCheckStatus: PlanCheckStatus | None = None
     registrationCountry: str | None = None
     aliveStatus: Literal["running", "alive", "dead", "unknown"] | None = None
     aliveCheckedAt: datetime | None = None
     aliveErrorCode: str | None = None
     aliveHttpStatus: int | None = None
+    globalPromotionStatus: Literal["pending", "running", "eligible", "ineligible", "failed"] | None = None
+    globalPromotionEligible: bool | None = None
+    globalPromotionCheckedAt: datetime | None = None
+    globalPromotionProxyCount: int = 0
+    globalPromotionCountries: list[str] = Field(default_factory=list)
+    globalPromotionResults: list[dict[str, Any]] = Field(default_factory=list)
+    globalPromotionMessage: str | None = None
+    oaicsScanStatus: Literal["pending", "running", "completed", "failed"] | None = None
+    oaicsScanCheckedAt: datetime | None = None
+    oaicsScanTotal: int = 0
+    oaicsScanSuccess: int = 0
+    oaicsScanCountryStats: list[dict[str, Any]] = Field(default_factory=list)
+    oaicsScanResults: list[dict[str, Any]] = Field(default_factory=list)
+    oaicsScanMessage: str | None = None
 
 
 class AccountCreate(ApiModel):
@@ -235,6 +252,14 @@ class AccountPlanCheckResult(ApiModel):
     failed: int
     skipped: int
     items: list[AccountPlanCheckItem]
+
+
+class AccountCheckoutTypeCheckInput(AccountPlanCheckInput):
+    pass
+
+
+class AccountCheckoutTypeCheckResult(AccountPlanCheckResult):
+    pass
 
 
 class AccountAliveCheckInput(ApiModel):

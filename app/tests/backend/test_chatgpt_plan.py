@@ -97,6 +97,28 @@ def test_parse_accounts_check_plan_and_trial_rules(
     assert result.has_active_subscription is active
 
 
+def test_active_plus_entitlement_overrides_stale_free_account_claim() -> None:
+    result = parse_accounts_check(
+        {
+            "accounts": {
+                "target": {
+                    "account": {"account_id": "target", "plan_type": "free"},
+                    "entitlement": {
+                        "subscription_plan": "chatgptplusplan",
+                        "has_active_subscription": True,
+                    },
+                    "eligible_promo_campaigns": {},
+                }
+            }
+        },
+        access_token=_jwt("target"),
+    )
+
+    assert result.current_plan_type == "plus"
+    assert result.has_active_subscription is True
+    assert result.plus_trial_eligible is False
+
+
 class FakeResponse:
     def __init__(self, status: int, payload: dict | None = None) -> None:
         self.status_code = status

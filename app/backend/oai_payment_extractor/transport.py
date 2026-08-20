@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import base64
+from contextvars import ContextVar, Token
 import time
 import uuid
 from typing import Any, Protocol
@@ -44,6 +45,59 @@ class TransportFactory(Protocol):
     def chatgpt(self, config: ExtractionConfig, proxy: str) -> Any: ...
 
     def stripe(self, config: ExtractionConfig) -> Any: ...
+
+
+_REQUEST_TRACE: ContextVar[Any | None] = ContextVar("payment_request_trace", default=None)
+_SENSITIVE_FIELD_MARKERS = (
+    "authorization", "cookie", "access_token", "client_secret", "confirm_token",
+    "confirmation_token", "password", "captcha", "secret", "proxy",
+)
+
+
+def set_request_trace(callback: Any | None) -> Token:
+    return _REQUEST_TRACE.set(callback)
+
+
+def reset_request_trace(token: Token) -> None:
+    _REQUEST_TRACE.reset(token)
+
+
+def _safe_trace_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 3:
+        return "[内容层级过深，已省略]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 80:
+                result["其余字段"] = f"已省略 {len(value) - 80} 个字段"
+                break
+            name = str(key)
+            if any(marker in name.casefold() for marker in _SENSITIVE_FIELD_MARKERS):
+                result[name] = "***已脱敏***"
+            else:
+                result[name] = _safe_trace_value(item, depth=depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_safe_trace_value(item, depth=depth + 1) for item in list(value)[:30]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        text = safe_log_text(value, 500) if isinstance(value, str) else value
+        return text
+    return safe_log_text(value, 300)
+
+
+def _trace_response_payload(response: Any) -> Any:
+    try:
+        payload = response.json()
+    except Exception:
+        text = safe_log_text(getattr(response, "text", ""), 1000)
+        return {"响应文本摘要": text} if text else {"响应体": "空"}
+    return _safe_trace_value(payload)
+
+
+def _emit_request_trace(stage: str, details: dict[str, Any]) -> None:
+    callback = _REQUEST_TRACE.get()
+    if callback is not None:
+        callback("http_request", {"请求阶段": stage, **details})
 
 
 def new_session() -> Any:
@@ -253,12 +307,53 @@ def stage_http_request(
     **kwargs: Any,
 ) -> Any:
     started = time.perf_counter()
+    request_fields: dict[str, Any] = {}
+    for source_name in ("params", "data", "json"):
+        if source_name in kwargs:
+            request_fields[source_name] = _safe_trace_value(kwargs[source_name])
     emit_log(log, f"{stage}: {method.upper()} {compact_url(url)}")
     try:
         response = session.request(method.upper(), url, **kwargs)
     except Exception as exc:
         detail = safe_log_text(exc)
+        _emit_request_trace(stage, {
+            "请求方法": method.upper(), "请求地址": compact_url(url),
+            "请求字段": request_fields, "请求结果": "网络异常", "异常信息": detail,
+            "耗时毫秒": round((time.perf_counter() - started) * 1000),
+        })
         emit_log(log, f"{stage}: request error={detail}")
+        # curl_cffi occasionally fails during the TLS handshake for a browser
+        # impersonation profile (typically ``invalid library``/``TLS connect
+        # error``).  The request never received an HTTP response, so retry it
+        # once with a plain curl session while preserving headers, cookies and
+        # proxy settings.  This mirrors the known-good UPI extractor fallback
+        # and prevents a transient fingerprint failure from exhausting the
+        # whole payment task.
+        if _is_tls_impersonation_error(exc) and CurlCffiSession is not None:
+            fallback = None
+            try:
+                fallback = CurlCffiSession()
+                fallback.trust_env = getattr(session, "trust_env", False)
+                if hasattr(session, "verify"):
+                    fallback.verify = session.verify
+                fallback.headers.update(dict(getattr(session, "headers", {}) or {}))
+                fallback.cookies.update(getattr(session, "cookies", {}) or {})
+                proxies = getattr(session, "proxies", None)
+                if proxies:
+                    fallback.proxies.update(dict(proxies))
+                emit_log(log, f"{stage}: TLS impersonation failed; retrying plain curl session")
+                response = fallback.request(method.upper(), url, **kwargs)
+                _emit_request_trace(stage, {
+                    "璇锋眰鏂规硶": method.upper(),
+                    "璇锋眰鍦板潃": compact_url(url),
+                    "fallback": "plain-curl",
+                    "鍝嶅簲鐘舵€佺爜": int(response.status_code),
+                })
+                return response
+            except Exception as fallback_exc:
+                detail = f"{detail}; plain-curl fallback failed: {safe_log_text(fallback_exc)}"
+            finally:
+                safe_close(fallback)
         if is_network_exception(exc):
             raise NetworkError(stage, detail) from exc
         raise
@@ -266,7 +361,25 @@ def stage_http_request(
         log,
         f"{stage}: HTTP {response.status_code} elapsed={time.perf_counter() - started:.2f}s",
     )
+    _emit_request_trace(stage, {
+        "请求方法": method.upper(),
+        "请求地址": compact_url(url),
+        "请求字段": request_fields,
+        "响应状态码": int(response.status_code),
+        "响应成功": 200 <= int(response.status_code) < 400,
+        "耗时毫秒": round((time.perf_counter() - started) * 1000),
+        "响应结果": _trace_response_payload(response),
+    })
     return response
+
+
+def _is_tls_impersonation_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return (
+        "tls connect error" in text
+        or "openssl_internal:invalid library" in text
+        or ("ssl" in text and "impersonat" in text)
+    )
 
 
 def is_network_exception(exc: BaseException) -> bool:
@@ -335,9 +448,11 @@ class DefaultTransportFactory:
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
-                "Cookie": f"oai-did={device_id}",
             }
         )
+        # Keep oai-did in the cookie jar so Checkout response cookies remain
+        # attached when the same session switches to the Update proxy.
+        session.cookies.set("oai-did", device_id, domain="chatgpt.com")
         set_proxy_url(session, proxy)
         return session
 

@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from ..auth import account_email, normalize_access_token
 from ..application import extract_payment_link
-from ..errors import ExtractionCancelled, NetworkError
+from ..errors import ConfigurationError, ExtractionCancelled, NetworkError, ProtocolError
 from ..logging_utils import log_context
 from ..models import ExtractionConfig, PaymentLinkResult
 from .events import EVENT_HISTORY_SIZE, make_event, redact_text, utc_timestamp
@@ -56,6 +56,80 @@ def _has_nonzero_amount(result: dict[str, Any] | None) -> bool:
         return False
 
 
+def chinese_failure_reason(value: Any) -> str:
+    text = str(value or "").strip()
+    lowered = text.casefold()
+    mappings = (
+        ("checkout_creation_rate_limited", "Checkout 创建次数过多，账号已被限流，请稍后再试或更换账号"),
+        ("too many checkout attempts", "Checkout 创建次数过多，账号已被限流，请稍后再试或更换账号"),
+        ("rate limit", "请求过于频繁，账号或出口 IP 已被限流，请稍后再试"),
+        ("manual approval blocked", "ChatGPT 结账审批被服务端拒绝；服务端未提供具体原因，可能是账号资格、支付方式、账单信息、金额状态或风险控制校验未通过"),
+        ("结账审批被服务端拒绝", "ChatGPT 结账审批被服务端拒绝；服务端未提供具体原因，可能是账号资格、支付方式、账单信息、金额状态或风险控制校验未通过"),
+        ("未返回目标支付方式", "该账号在当前国家或代理出口下没有所选支付方式资格"),
+        ("未提供目标支付方式", "该账号在当前国家或代理出口下没有所选支付方式资格"),
+        ("target payment method", "该账号在当前国家或代理出口下没有所选支付方式资格"),
+        ("billing country must match request country", "账单国家与账号或请求国家不一致，请选择与账号注册地区一致的国家"),
+        ("this promotion is not available", "当前账号或地区不支持该优惠活动"),
+        ("promo eligibility rejected", "当前账号不具备优惠资格"),
+        ("state=not_eligible", "当前账号不具备优惠资格"),
+        ("does not offer", "当前 Checkout 没有提供所选支付方式"),
+        ("proxy connect aborted", "代理连接被中止，代理可能失效或不支持目标站点"),
+        ("socks handshake", "SOCKS 代理握手失败，代理不可用或协议配置错误"),
+        ("operation timed out", "请求超时，代理速度过慢或目标站点无响应"),
+        ("connection timed out", "连接超时，代理速度过慢或无法连接目标站点"),
+        ("timed out", "请求超时，代理速度过慢或目标站点无响应"),
+        ("redirect poll timeout", "等待支付跳转链接超时"),
+        ("connection closed", "连接被提前关闭，代理链路不稳定"),
+        ("connection reset", "连接被重置，代理链路不稳定"),
+        ("http 401", "身份凭据已失效或无权限（HTTP 401）"),
+        ("http 403", "请求被目标站点拒绝（HTTP 403）"),
+        ("http 429", "请求过于频繁，已被限流（HTTP 429）"),
+    )
+    for marker, message in mappings:
+        if marker in lowered:
+            methods = re.search(r"methods=([^\n;]+)", text, flags=re.IGNORECASE)
+            return f"{message}；可用方式：{methods.group(1)}" if methods else message
+    return f"提链失败：{text}" if text else "提链失败，未返回详细原因"
+
+
+def _looks_like_network_error(value: Any) -> bool:
+    lowered = str(value or "").casefold()
+    return any(marker in lowered for marker in (
+        "timeout", "timed out", "proxy connect", "socks handshake",
+        "connection closed", "connection reset", "could not connect",
+    ))
+
+
+def classify_failure(exc: Exception, stage: str | None = None) -> dict[str, Any]:
+    """Return a stable failure class shared by API output and retry policy."""
+    text = str(exc or "").casefold()
+    network = isinstance(exc, NetworkError) or _looks_like_network_error(text)
+    if network:
+        category = "network_error"
+    elif "promo eligibility" in text or "trial eligibility rejected" in text or "not_eligible" in text or "promotion is not available" in text:
+        category = "eligibility_rejected"
+    elif "approval blocked" in text or ("审批" in text and "拒绝" in text):
+        category = "final_approval_rejected"
+    elif any(marker in text for marker in ("amount", "金额", "应付", "currency", "币种", "账单不是", "not zero", "non-zero")):
+        category = "amount_or_currency_mismatch"
+    elif isinstance(exc, ConfigurationError):
+        category = "configuration_error"
+    elif isinstance(exc, ProtocolError):
+        category = "protocol_error"
+    else:
+        category = "unexpected_error"
+    return {
+        "category": category,
+        # All extraction failures consume the configured proxy-rotation retries.
+        # Category and network_error remain diagnostic fields only.
+        "retryable": True,
+        "network_error": network,
+        "stage": str(stage or getattr(exc, "stage", "") or "unknown"),
+        "error_kind": type(exc).__name__,
+        "http_status": getattr(exc, "status_code", None),
+    }
+
+
 @dataclass
 class TaskRecord:
     task_id: str
@@ -74,9 +148,13 @@ class TaskRecord:
     failure_stage: str | None = None
     error_kind: str | None = None
     error_http_status: int | None = None
+    failure_category: str | None = None
+    retryable: bool = False
     account_email: str = ""
     session_kind: str | None = None
     retry_of: str | None = None
+    attempt: int = 1
+    logs: list[dict[str, Any]] = field(default_factory=list)
 
 
 class TaskManager:
@@ -186,7 +264,7 @@ class TaskManager:
         with self._lock:
             self._cleanup_locked()
             record = self._tasks.get(task_id)
-            return self._snapshot_locked(record) if record else None
+            return self._snapshot_locked(record, include_logs=True) if record else None
 
     def list(self) -> list[dict[str, Any]]:
         """Return all non-expired task snapshots without exposing task config."""
@@ -271,6 +349,31 @@ class TaskManager:
                 record.status = "cancel_requested"
                 self._publish_locked(task_id, "task.cancel_requested", {"status": record.status})
             return self._snapshot_locked(record)
+
+    def cancel_all(self) -> dict[str, Any]:
+        with self._lock:
+            self._cleanup_locked()
+            task_ids: list[str] = []
+            for record in self._tasks.values():
+                if record.status in TERMINAL_STATES:
+                    continue
+                record.cancel_event.set()
+                task_ids.append(record.task_id)
+                if record.status == "queued":
+                    if record.future is not None:
+                        record.future.cancel()
+                    record.status = "cancelled"
+                    record.stage = "cancelled"
+                    record.finished_at = utc_timestamp()
+                    self._publish_locked(record.task_id, "task.cancelled", {
+                        "status": record.status, "progress": record.progress, "reason": "bulk",
+                    })
+                elif record.status in {"running", "cancel_requested"}:
+                    record.status = "cancel_requested"
+                    self._publish_locked(record.task_id, "task.cancel_requested", {
+                        "status": record.status, "reason": "bulk",
+                    })
+            return {"ok": True, "cancelled_count": len(task_ids), "task_ids": task_ids}
 
     def delete(self, task_id: str) -> dict[str, Any]:
         with self._lock:
@@ -371,13 +474,48 @@ class TaskManager:
                 {"status": record.status, "progress": record.progress},
             )
             self._publish_locked(task_id, "task.log", {"message": "task started"})
+            self._append_log_locked(record, "started", "任务开始", "success", {
+                "attempt": record.attempt,
+                "billing_country": record.config.country,
+                "payment_method": record.config.payment_method,
+            })
             task_log.info("task started")
+
+        if self._extractor is extract_payment_link:
+            from .proxy_probe import probe_proxy
+            proxy_targets = [("checkout_proxy_probe", "Checkout 代理出口检测", record.config.checkout_proxy)]
+            if record.config.apply_checkout_update:
+                proxy_targets.append(("update_proxy_probe", "Update 代理出口检测", record.config.update_proxy))
+            for probe_step, probe_label, proxy_url in proxy_targets:
+                try:
+                    probe = probe_proxy(proxy_url, timeout=5.0).to_dict()
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            self._append_log_locked(current, probe_step, probe_label, "success", {
+                                "代理地址": self._proxy_preview(proxy_url),
+                                "实际出口IP": probe.get("ip", ""),
+                                "出口国家代码": probe.get("country_code") or probe.get("country") or "",
+                                "出口地区": probe.get("region", ""),
+                                "出口城市": probe.get("city", ""),
+                                "??????": probe.get("latency_ms"),
+                                "HTTP???": probe.get("http_status"),
+                                "TLS??": probe.get("tls_version"),
+                            })
+                except Exception as exc:
+                    with self._lock:
+                        current = self._tasks.get(task_id)
+                        if current is not None:
+                            self._append_log_locked(current, probe_step, probe_label, "warning", {
+                                "代理地址": self._proxy_preview(proxy_url),
+                                "检测失败原因": redact_text(exc, self._secrets(current.config)),
+                            })
 
         try:
             result = self._extractor(
                 record.config,
                 cancel_event=record.cancel_event,
-                stage_callback=lambda stage: self._stage(task_id, stage),
+                stage_callback=lambda stage, details=None: self._stage(task_id, stage, details or {}),
             )
             with self._lock:
                 record = self._tasks.get(task_id)
@@ -391,6 +529,11 @@ class TaskManager:
                     record.progress = STAGE_PROGRESS[record.stage]
                     record.result = result.to_dict() if hasattr(result, "to_dict") else dict(result)
                     record.finished_at = utc_timestamp()
+                    self._append_log_locked(record, "completed", "提链完成", "success", {
+                        "amount_due": record.result.get("amount_due"),
+                        "currency": record.result.get("currency"),
+                        "is_zero_amount": record.result.get("amount_due_minor") == 0,
+                    })
                     self._publish_locked(
                         task_id,
                         "task.succeeded",
@@ -408,6 +551,7 @@ class TaskManager:
                 if record is not None:
                     self._finish_cancelled_locked(record, str(exc))
         except Exception as exc:
+            should_retry = False
             with self._lock:
                 record = self._tasks.get(task_id)
                 if record is None:
@@ -419,30 +563,88 @@ class TaskManager:
                     str(exc),
                     flags=re.IGNORECASE,
                 )
+                explicit_status = getattr(exc, "status_code", None)
                 record.error_http_status = (
-                    int(status_match.group(1)) if status_match else None
+                    int(explicit_status)
+                    if isinstance(explicit_status, int)
+                    else (int(status_match.group(1)) if status_match else None)
                 )
-                record.status = "failed"
-                record.stage = "failed"
-                record.error = redact_text(exc, self._secrets(record.config))
-                record.network_error = isinstance(exc, NetworkError)
-                record.finished_at = utc_timestamp()
-                self._publish_locked(
-                    task_id,
-                    "task.failed",
-                    {
-                        "status": record.status,
-                        "error": record.error,
-                        "network_error": record.network_error,
-                        "failure_stage": record.failure_stage,
-                        "error_kind": record.error_kind,
-                        "error_http_status": record.error_http_status,
-                        "progress": record.progress,
-                    },
-                )
-                task_log.error("task failed: {}", record.error)
+                raw_error = redact_text(exc, self._secrets(record.config))
+                classification = classify_failure(exc, record.failure_stage)
+                record.network_error = bool(classification["network_error"])
+                record.failure_category = str(classification["category"])
+                record.retryable = bool(classification["retryable"])
+                if record.retryable and record.attempt <= record.config.auto_retry_count and not record.cancel_event.is_set():
+                    retry_index = record.attempt - 1
+                    checkout_proxy = record.config.retry_checkout_proxies[retry_index]
+                    update_proxy = record.config.retry_update_proxies[retry_index]
+                    record.config = replace(
+                        record.config,
+                        checkout_proxy=checkout_proxy,
+                        update_proxy=update_proxy,
+                    )
+                    reason = chinese_failure_reason(raw_error)
+                    self._append_log_locked(record, "attempt_failed", "本次提链尝试失败", "error", {
+                        "失败阶段": record.failure_stage or "",
+                        "错误类型": record.error_kind or "",
+                        "HTTP状态码": record.error_http_status,
+                        "中文原因": reason,
+                        "原始错误": raw_error,
+                    })
+                    record.attempt += 1
+                    record.status = "queued"
+                    record.stage = "queued"
+                    record.progress = 0
+                    record.error = None
+                    record.finished_at = None
+                    self._publish_locked(task_id, "task.log", {
+                        "message": f"第 {record.attempt - 1} 次提链失败：{reason}；已自动更换代理，开始第 {record.attempt} 次尝试",
+                    })
+                    task_log.warning(
+                        "attempt {} failed: {}; automatically retrying attempt {}",
+                        record.attempt - 1,
+                        reason,
+                        record.attempt,
+                    )
+                    should_retry = True
+                else:
+                    record.status = "failed"
+                    record.stage = "failed"
+                    record.error = chinese_failure_reason(raw_error)
+                    record.finished_at = utc_timestamp()
+                    self._append_log_locked(record, "failed", "提链失败", "error", {
+                        "failure_stage": record.failure_stage or "",
+                        "error_kind": record.error_kind or "",
+                        "http_status": record.error_http_status,
+                        "message": record.error,
+                        "failure_category": record.failure_category,
+                        "retryable": record.retryable,
+                    })
+                if should_retry:
+                    pass
+                else:
+                    self._publish_locked(
+                        task_id,
+                        "task.failed",
+                        {
+                            "status": record.status,
+                            "error": record.error,
+                            "network_error": record.network_error,
+                            "failure_stage": record.failure_stage,
+                            "error_kind": record.error_kind,
+                            "error_http_status": record.error_http_status,
+                            "failure_category": record.failure_category,
+                            "retryable": record.retryable,
+                            "progress": record.progress,
+                            "attempt": record.attempt,
+                            "max_attempts": record.config.auto_retry_count + 1,
+                        },
+                    )
+                    task_log.error("task failed: {}", record.error)
+            if should_retry:
+                self._run_with_slot(task_id)
 
-    def _stage(self, task_id: str, stage: str) -> None:
+    def _stage(self, task_id: str, stage: str, details: dict[str, Any] | None = None) -> None:
         with self._lock:
             record = self._tasks.get(task_id)
             if record is None or record.status in TERMINAL_STATES:
@@ -458,6 +660,14 @@ class TaskManager:
                         "progress": record.progress,
                     },
                 )
+                self._append_log_locked(record, "checkout_kind", "识别结账类型", "success", {
+                    "session_kind": record.session_kind,
+                })
+                return
+            if stage == "http_request":
+                trace = details or {}
+                status = "success" if trace.get("响应成功", trace.get("请求结果") != "网络异常") else "warning"
+                self._append_log_locked(record, stage, "接口请求与响应", status, trace)
                 return
             record.stage = str(stage)
             record.progress = STAGE_PROGRESS.get(record.stage, record.progress)
@@ -469,6 +679,41 @@ class TaskManager:
                     "status": record.status,
                     "progress": record.progress,
                 },
+            )
+            labels = {
+                "billing_profile": "生成账单资料",
+                "eligibility_check": "开始检测试用资格",
+                "eligibility_confirmed": "账号具备试用资格",
+                "eligibility_skipped": "未执行试用资格检测",
+                "checkout": "创建 Checkout",
+                "checkout_created": "Checkout 创建成功",
+                "checkout_update": "更新 Checkout 国家与促销",
+                "checkout_update_result": "Checkout 国家与促销更新结果",
+                "stripe_init": "初始化 Stripe",
+                "elements_session": "获取支付方式与 Elements Session",
+                "payment_method_validation": "校验目标支付方式是否可用",
+                "oaics_payment_channels": "识别 OAICS 标准/自定义支付通道",
+                "oaics_custom_method": "按目标支付方式读取 OAICS 自定义通道",
+                "taxes": "计算税费与应付金额",
+                "payment_confirmation": "创建支付方式并确认",
+                "wallet_pre_confirm": "钱包协议 pre_confirm 校验通过",
+                "paypal_promo_sync": "等待 PayPal 优惠金额同步",
+                "redirect_resolution": "解析支付跳转链接",
+                "result_summary": "汇总实际提链结果",
+                "completed": "流程完成",
+            }
+            log_status = (
+                "warning"
+                if record.stage == "payment_method_validation"
+                and (details or {}).get("校验通过") is False
+                else "success"
+            )
+            self._append_log_locked(
+                record,
+                record.stage,
+                labels.get(record.stage, record.stage),
+                log_status,
+                details or {},
             )
             log_context(component="task", task_id=task_id, stage=record.stage).info("task stage")
 
@@ -499,7 +744,25 @@ class TaskManager:
                     except queue.Empty:
                         pass
 
-    def _snapshot_locked(self, record: TaskRecord) -> dict[str, Any]:
+    @staticmethod
+    def _proxy_preview(value: str) -> str:
+        match = re.match(r"^(\w+://)(?:[^@/]+@)?([^/]+)", str(value or ""))
+        return f"{match.group(1)}***@{match.group(2)}" if match and "@" in value else (f"{match.group(1)}{match.group(2)}" if match else "已配置")
+
+    @staticmethod
+    def _append_log_locked(record: TaskRecord, step: str, label: str, status: str, details: dict[str, Any]) -> None:
+        record.logs.append({
+            "timestamp": utc_timestamp(),
+            "step": step,
+            "label": label,
+            "status": status,
+            "details": details,
+            "attempt": record.attempt,
+        })
+        if len(record.logs) > 300:
+            del record.logs[:-300]
+
+    def _snapshot_locked(self, record: TaskRecord, *, include_logs: bool = False) -> dict[str, Any]:
         snapshot: dict[str, Any] = {
             "ok": True,
             "task_id": record.task_id,
@@ -512,6 +775,8 @@ class TaskManager:
             "account_email": record.account_email,
             "payment_method": record.config.payment_method,
             "billing_country": record.config.country,
+            "attempt": record.attempt,
+            "max_attempts": record.config.auto_retry_count + 1,
         }
         if record.session_kind:
             snapshot["session_kind"] = record.session_kind
@@ -528,6 +793,10 @@ class TaskManager:
             snapshot["failure_stage"] = record.failure_stage
             snapshot["error_kind"] = record.error_kind
             snapshot["error_http_status"] = record.error_http_status
+            snapshot["failure_category"] = record.failure_category
+            snapshot["retryable"] = record.retryable
+        if include_logs:
+            snapshot["logs"] = list(record.logs)
         return snapshot
 
     def _cleanup_locked(self) -> None:

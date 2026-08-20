@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import random
+import re
+import time
+from dataclasses import replace
 from typing import Callable
 import uuid
 from typing import Any
+from urllib.parse import unquote, urljoin, urlsplit
 
 from ..checkout import (
     chatgpt_success_return_url,
@@ -45,7 +49,11 @@ from ..stripe_common import (
     stripe_provider_poll,
     stripe_confirm_return_url,
 )
-from ..transport import response_json, safe_close, set_proxy_url, stage_http_request
+from ..transport import new_session, response_json, safe_close, set_proxy_url, stage_http_request
+
+
+class CheckoutSessionUpdated(RuntimeError):
+    """Signal that Stripe must restart against the Checkout Update session."""
 
 
 def cs_elements_session(
@@ -202,8 +210,12 @@ def cs_snapshot_billing(
         str(checkout.get("processor_entity") or ""),
     )
     try:
-        response = chatgpt.post(
+        response = stage_http_request(
+            chatgpt,
+            "ChatGPT checkout/snapshot",
+            "POST",
             "https://chatgpt.com/backend-api/payments/checkout/snapshot",
+            log,
             json={
                 "snapshot": {
                     "billing_address": {
@@ -269,6 +281,7 @@ def cs_checkout_taxes(
 
 def stripe_create_payment_method(
     stripe: Any,
+    config: ExtractionConfig,
     checkout: CheckoutData,
     billing: dict[str, str],
     ctx: StripeContext,
@@ -305,7 +318,7 @@ def stripe_create_payment_method(
         "_stripe_version": STRIPE_VERSION_BASE,
     }
     if payment_method == "ideal":
-        body["ideal[bank]"] = "n26"
+        body["ideal[bank]"] = config.ideal_bank
     response = stage_http_request(
         stripe,
         "Stripe payment_methods",
@@ -324,6 +337,58 @@ def stripe_create_payment_method(
     return payment_method_id
 
 
+def stripe_wallet_pre_confirm(
+    stripe: Any,
+    checkout: CheckoutData,
+    payment_method: str,
+    log: Any | None,
+) -> dict[str, Any]:
+    response = stage_http_request(
+        stripe,
+        f"Stripe {payment_method} pre_confirm",
+        "POST",
+        f"https://api.stripe.com/v1/payment_pages/{checkout['cs_id']}/pre_confirm",
+        log,
+        data={
+            "eid": str(uuid.uuid4()),
+            "payment_method_type": payment_method,
+            "key": stripe_key(checkout),
+            "_stripe_version": STRIPE_VERSION_FULL,
+        },
+        headers=cs_stripe_headers(),
+        timeout=DEFAULT_TIMEOUT,
+    )
+    payload = response_json(response, f"Stripe {payment_method} pre_confirm")
+    if response.status_code >= 400:
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        raise ProtocolError(
+            response.status_code,
+            f"Stripe {payment_method} pre_confirm failed: {safe_log_text(error)}",
+        )
+    return payload
+
+
+def resolve_momo_provider_url(stripe: Any, source_url: str, log: Any | None) -> str:
+    current = str(source_url or "").strip()
+    for _ in range(12):
+        if (urlsplit(current).hostname or "").casefold() == "payment.momo.vn":
+            return current
+        response = stage_http_request(
+            stripe, "MoMo 跳转解析", "GET", current, log,
+            allow_redirects=False, timeout=DEFAULT_TIMEOUT,
+        )
+        location = str(getattr(response, "headers", {}).get("Location") or "").strip()
+        if response.status_code in {301, 302, 303, 307, 308} and location:
+            current = urljoin(current, location)
+            continue
+        text = str(getattr(response, "text", "") or "").replace(r"\/", "/").replace("&amp;", "&")
+        match = re.search(r"https://payment\.momo\.vn/v2/gateway/pay\?[^\s\"'<>]+", text, re.I)
+        if match:
+            return unquote(match.group(0))
+        break
+    return current
+
+
 def stripe_confirm_cs_live(
     stripe: Any,
     checkout: CheckoutData,
@@ -331,6 +396,7 @@ def stripe_confirm_cs_live(
     ctx: StripeContext,
     hosted_url: str,
     payment_method: str,
+    payment_method_id: str,
     billing: dict[str, str],
     log: Any | None,
 ) -> dict[str, Any]:
@@ -394,6 +460,40 @@ def stripe_confirm_cs_live(
     consent_collection = init_payload.get("consent_collection") or {}
     if consent_collection.get("terms_of_service") not in (None, "", "none"):
         body["consent[terms_of_service]"] = "accepted"
+    if payment_method in {"paypal", "upi"} and payment_method_id.startswith("pm_"):
+        # Always confirm the exact pre-created PM.  A same-account comparison
+        # showed that the approved non-Update PayPal submission used Stripe's
+        # compact Hosted Checkout template, while the Update submission added
+        # a second full Elements context and was rejected.  Keep the template
+        # identical across paid and zero-amount PayPal sessions; only the
+        # server-provided amount/session identifiers differ.
+        for key in tuple(body):
+            if key.startswith("payment_method_data["):
+                body.pop(key, None)
+        body["payment_method"] = payment_method_id
+        body = {
+            "eid": "NA",
+            "payment_method": payment_method_id,
+            "expected_amount": str(amount),
+            "expected_payment_method_type": payment_method,
+            "return_url": stripe_confirm_return_url(checkout, hosted_url),
+            "_stripe_version": STRIPE_VERSION_FULL,
+            "guid": str(ctx.get("guid") or uuid.uuid4().hex),
+            "muid": str(ctx.get("muid") or uuid.uuid4().hex),
+            "sid": str(ctx.get("sid") or uuid.uuid4().hex),
+            "key": stripe_key(checkout),
+            "version": runtime,
+            "init_checksum": str(init_payload.get("init_checksum") or ctx.get("init_checksum") or ""),
+            "client_attribution_metadata[client_session_id]": str(ctx.get("stripe_js_id") or ""),
+            "client_attribution_metadata[checkout_session_id]": checkout["cs_id"],
+            "client_attribution_metadata[merchant_integration_source]": "checkout",
+            "client_attribution_metadata[merchant_integration_version]": "custom_checkout",
+            "client_attribution_metadata[payment_method_selection_flow]": "automatic",
+            "client_attribution_metadata[checkout_config_id]": checkout_config_id,
+            "link_brand": "link",
+        }
+        if consent_collection.get("terms_of_service") not in (None, "", "none"):
+            body["consent[terms_of_service]"] = "accepted"
     response = stage_http_request(
         stripe,
         "Stripe payment_pages confirm",
@@ -409,47 +509,61 @@ def stripe_confirm_cs_live(
     return response_json(response, "Stripe confirm")
 
 
-def chatgpt_approve(chatgpt: Any, checkout: CheckoutData, log: Any | None) -> None:
+def chatgpt_approve(
+    chatgpt: Any,
+    checkout: CheckoutData,
+    log: Any | None,
+    retry_proxies: tuple[str, ...] = (),
+    access_token: str = "",
+) -> None:
     path = "/backend-api/payments/checkout/approve"
     processor = processor_entity_for_country(
         str(checkout.get("billing_country") or "GB"),
         str(checkout.get("processor_entity") or ""),
     )
-    try:
-        stage_http_request(
-            chatgpt,
-            "ChatGPT sentinel ping",
-            "POST",
-            "https://chatgpt.com/backend-api/sentinel/ping",
-            log,
-            json={},
-            headers={"Referer": "https://chatgpt.com/"},
+    proxies = tuple(dict.fromkeys(p for p in retry_proxies if str(p).strip()))
+    # For an updated checkout, the first proxy is deliberately the Update
+    # proxy: that is the IP which mutated the server-side checkout session.
+    # Approving it from the old Checkout IP was consistently returned blocked.
+    attempts = proxies or (None,)
+    for approval_attempt, approval_proxy in enumerate(attempts, start=1):
+        # Use a fresh HTTP client per approval attempt. Reusing curl-cffi's
+        # pooled connection after rotating a 1024proxy endpoint can produce
+        # CONNECT-aborted errors even though Checkout/Stripe succeeded.
+        approval_session = new_session()
+        approval_session.headers.update(dict(getattr(chatgpt, "headers", {}) or {}))
+        try:
+            approval_session.cookies.update(getattr(chatgpt, "cookies", {}) or {})
+        except Exception:
+            pass
+        current_proxy = approval_proxy or str(
+            (getattr(chatgpt, "proxies", {}) or {}).get("https") or ""
+        )
+        set_proxy_url(approval_session, current_proxy)
+        if approval_attempt > 1:
+            emit_log(log, f"ChatGPT checkout approve blocked; switched proxy for retry {approval_attempt}")
+        response = stage_http_request(
+            approval_session, "ChatGPT checkout approve", "POST", "https://chatgpt.com" + path, log,
+            json={"checkout_session_id": checkout["cs_id"], "processor_entity": processor},
+            headers={
+                "Authorization": f"Bearer {access_token}" if access_token else "",
+                "Content-Type": "application/json",
+                "oai-language": "en-GB",
+                "Referer": f"https://chatgpt.com/checkout/{processor}/{checkout['cs_id']}",
+                "x-openai-target-path": path,
+                "x-openai-target-route": path,
+            },
             timeout=DEFAULT_TIMEOUT,
         )
-    except Exception:
-        pass
-    response = stage_http_request(
-        chatgpt,
-        "ChatGPT checkout approve",
-        "POST",
-        "https://chatgpt.com" + path,
-        log,
-        json={"checkout_session_id": checkout["cs_id"], "processor_entity": processor},
-        headers={
-            "Referer": f"https://chatgpt.com/checkout/{processor}/{checkout['cs_id']}",
-            "x-openai-target-path": path,
-            "x-openai-target-route": path,
-        },
-        timeout=DEFAULT_TIMEOUT,
-    )
-    if response.status_code >= 400:
-        raise ProtocolError(response.status_code, f"ChatGPT approve failed: {response.text[:500]}")
-    result = str(response_json(response, "ChatGPT approve").get("result") or "")
-    if result == "blocked":
-        raise ProtocolError(409, "ChatGPT manual approval blocked")
-    if result != "approved":
-        raise ProtocolError(502, f"ChatGPT approve returned unexpected result: {result or '?'}")
+        if response.status_code >= 400:
+            raise ProtocolError(response.status_code, f"ChatGPT approve failed: {response.text[:500]}")
+        result = str(response_json(response, "ChatGPT approve").get("result") or "")
+        if result == "approved":
+            return
+        if result != "blocked":
+            raise ProtocolError(502, f"ChatGPT checkout approval returned unknown result: {result or 'empty'}")
 
+    raise ProtocolError(409, "ChatGPT checkout approval blocked after rotating all configured proxies")
 
 def provider_redirect_after_confirm(
     chatgpt: Any,
@@ -459,7 +573,20 @@ def provider_redirect_after_confirm(
     payment_method: str,
     log: Any | None,
     ctx: StripeContext | None = None,
+    approval_retry_proxies: tuple[str, ...] = (),
+    after_approval: Callable[[], None] | None = None,
+    skip_approval: bool = False,
+    approval_token: str = "",
 ) -> str:
+    # Approval wallets need materially longer than ordinary redirect methods.
+    # GoPay is commonly released only after OpenAI's approval endpoint has
+    # completed; MoMo's pre-confirmed redirect can also take up to a minute.
+    poll_timeout = {
+        "gopay": 90,
+        "momo": 60,
+        "kakao_pay": 60,
+    }.get(payment_method, PROVIDER_POLL_TIMEOUT_SECONDS)
+    emit_log(log, f"{payment_method} 钱包跳转轮询：最长等待 {poll_timeout} 秒")
     redirect = extract_redirect_to_url(confirm_payload)
     if redirect:
         return redirect
@@ -470,13 +597,25 @@ def provider_redirect_after_confirm(
             return redirect
     submission = find_submission_attempt(confirm_payload)
     if str(submission.get("state") or "") == "requires_approval":
-        chatgpt_approve(chatgpt, checkout, log)
-        return stripe_provider_poll(stripe, checkout, payment_method, PROVIDER_POLL_TIMEOUT_SECONDS, log, ctx)
+        if skip_approval:
+            return stripe_provider_poll(stripe, checkout, payment_method, poll_timeout, log, ctx)
+        chatgpt_approve(chatgpt, checkout, log, approval_retry_proxies, approval_token)
+        if after_approval:
+            after_approval()
+        return stripe_provider_poll(stripe, checkout, payment_method, poll_timeout, log, ctx)
     try:
-        return stripe_provider_poll(stripe, checkout, payment_method, PROVIDER_POLL_TIMEOUT_SECONDS, log, ctx)
+        return stripe_provider_poll(stripe, checkout, payment_method, poll_timeout, log, ctx)
     except ProviderRequiresApproval:
-        chatgpt_approve(chatgpt, checkout, log)
-        return stripe_provider_poll(stripe, checkout, payment_method, PROVIDER_POLL_TIMEOUT_SECONDS, log, ctx)
+        if skip_approval:
+            raise ProtocolError(
+                409,
+                "Stripe provider still requires approval after Checkout Update; "
+                "the original approval was not accepted by the updated session",
+            ) from None
+        chatgpt_approve(chatgpt, checkout, log, approval_retry_proxies, approval_token)
+        if after_approval:
+            after_approval()
+        return stripe_provider_poll(stripe, checkout, payment_method, poll_timeout, log, ctx)
 
 
 def extract_cs_live_provider(
@@ -487,24 +626,55 @@ def extract_cs_live_provider(
     billing: dict[str, str],
     log: Any | None,
     *,
-    stage_callback: Callable[[str], None] | None = None,
+    stage_callback: Callable[..., None] | None = None,
+    perform_post_approval_update: bool = True,
+    skip_approval: bool = False,
 ) -> dict[str, str]:
     payment_method = normalize_payment_method(config.payment_method)
     init_payload, stripe_js_id = stripe_init(config, checkout, log, stripe)
+    # Proven sequence: bootstrap Stripe first, then apply the merchant update,
+    # refresh Stripe against that updated checkout, and only then confirm and
+    # request approval. Updating after approval invalidates the Stripe attempt.
+    update_before_confirmation = config.apply_checkout_update and perform_post_approval_update
+    if update_before_confirmation:
+        if stage_callback:
+            stage_callback("checkout_update", {
+                "status": "stripe_bootstrapped_updating_before_confirmation",
+                "checkout_session_id": checkout.get("cs_id"),
+            })
+        update_config = replace(config, update_proxy=config.checkout_proxy)
+        update_result = update_checkout(update_config, chatgpt, checkout, log) or {"success": True}
+        init_payload, stripe_js_id = stripe_init(config, checkout, log, stripe)
+        refreshed_totals = extract_checkout_totals(init_payload)
+        if stage_callback:
+            stage_callback("checkout_update_result", {
+                "success": update_result.get("success", True),
+                "sequence": "stripe_init_then_checkout_update_then_stripe_refresh",
+                "amount_due_minor": refreshed_totals.get("due"),
+                "checkout_session_id": checkout.get("cs_id"),
+            })
     totals = extract_checkout_totals(init_payload)
     checkout["payable_amount_minor"] = totals.get("due")
     checkout["currency"] = str(totals.get("currency") or checkout.get("currency") or "GBP").upper()
-    ensure_payment_method_offered(init_payload, payment_method, "cs_live Stripe init")
+    ensure_payment_method_offered(
+        init_payload, payment_method, "CS Checkout 的 Stripe 初始化", stage_callback
+    )
     hosted_url = str(init_payload.get("stripe_hosted_url") or "").strip()
     if not hosted_url:
         raise ProtocolError(502, "cs_live Stripe init missing stripe_hosted_url")
     ctx = stripe_context(init_payload, checkout, stripe_js_id)
     initial_elements_amount = str(ctx.get("checkout_amount") or "0")
     if stage_callback:
-        stage_callback("elements_session")
+        stage_callback("elements_session", {
+            "服务端支付方式": payment_method_types(init_payload),
+            "Stripe币种": str(init_payload.get("currency") or "").upper(),
+            "Stripe应付最小金额": totals.get("due"),
+        })
     elements_payload = cs_elements_session(stripe, checkout, init_payload, ctx, log)
     if elements_payload:
-        ensure_payment_method_offered(elements_payload, payment_method, "cs_live Elements session")
+        ensure_payment_method_offered(
+            elements_payload, payment_method, "CS Checkout 的 Elements Session", stage_callback
+        )
     if stage_callback:
         stage_callback("taxes")
     cs_update_tax_region(stripe, checkout, ctx, billing, log)
@@ -512,20 +682,76 @@ def extract_cs_live_provider(
     cs_checkout_taxes(config, chatgpt, checkout, billing, log)
     cs_snapshot_billing(chatgpt, checkout, billing, log)
     final_elements_amount = str(ctx.get("checkout_amount") or "0")
+    if payment_method in {"kakao_pay", "momo"} and config.apply_checkout_update:
+        try:
+            wallet_amount = int(final_elements_amount)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(502, f"{payment_method} 无法识别最终应付金额：{final_elements_amount}") from exc
+        if wallet_amount != 0:
+            raise ProtocolError(409, f"{payment_method} 试用账单不是 0：amount={wallet_amount}")
     if final_elements_amount != initial_elements_amount:
         refreshed_elements = cs_elements_session(stripe, checkout, init_payload, ctx, log, reuse_session=True)
         if refreshed_elements:
-            ensure_payment_method_offered(refreshed_elements, payment_method, "cs_live refreshed Elements session")
+            ensure_payment_method_offered(
+                refreshed_elements,
+                payment_method,
+                "CS Checkout 刷新后的 Elements Session",
+                stage_callback,
+            )
     else:
         emit_log(log, f"CS Elements refresh skipped: amount unchanged ({final_elements_amount})")
     if stage_callback:
         stage_callback("payment_confirmation")
-    payment_method_id = stripe_create_payment_method(stripe, checkout, billing, ctx, payment_method, log)
+    if payment_method in {"kakao_pay", "momo"}:
+        pre_confirm_payload = stripe_wallet_pre_confirm(stripe, checkout, payment_method, log)
+        if stage_callback:
+            stage_callback("wallet_pre_confirm", {
+                "钱包类型": payment_method,
+                "pre_confirm通过": True,
+                "pre_confirm返回字段": sorted(pre_confirm_payload.keys()),
+            })
+    payment_method_id = stripe_create_payment_method(stripe, config, checkout, billing, ctx, payment_method, log)
     confirm_payload = stripe_confirm_cs_live(
-        stripe, checkout, init_payload, ctx, hosted_url, payment_method, billing, log
+        stripe, checkout, init_payload, ctx, hosted_url, payment_method, payment_method_id, billing, log
     )
+    update_applied = update_before_confirmation
+
+    def update_approved_checkout() -> None:
+        nonlocal update_applied
+        if update_applied or not config.apply_checkout_update or not perform_post_approval_update:
+            return
+        update_applied = True
+        previous_session_id = str(checkout.get("cs_id") or "")
+        if stage_callback:
+            stage_callback("checkout_update", {
+                "status": "stripe_approved_updating_same_checkout",
+                "checkout_session_id": checkout.get("cs_id"),
+            })
+        # Merchant-side update must originate from the same Checkout identity
+        # that produced the approved Stripe attempt.  A different Update IP
+        # causes the server to invalidate the approval attempt.
+        update_config = replace(config, update_proxy=config.checkout_proxy)
+        update_result = update_checkout(update_config, chatgpt, checkout, log) or {"success": True}
+        if stage_callback:
+            stage_callback("checkout_update_result", {
+                "success": update_result.get("success", True),
+                "stripe_approval": "approved",
+                "previous_checkout_session_id": previous_session_id,
+                "updated_checkout_session_id": checkout.get("cs_id"),
+                "next_step": "restart_stripe_with_updated_checkout_session",
+            })
+        raise CheckoutSessionUpdated(str(checkout.get("cs_id") or ""))
+
     stripe_redirect = provider_redirect_after_confirm(
-        chatgpt, stripe, checkout, confirm_payload, payment_method, log, ctx
+        chatgpt, stripe, checkout, confirm_payload, payment_method, log, ctx,
+        (
+            (config.checkout_proxy,) + config.retry_checkout_proxies + config.retry_update_proxies
+            if config.apply_checkout_update
+            else (config.checkout_proxy,) + config.retry_checkout_proxies
+        ),
+        update_approved_checkout,
+        skip_approval,
+        config.access_token,
     )
     if stage_callback:
         stage_callback("redirect_resolution")
@@ -534,8 +760,11 @@ def extract_cs_live_provider(
         stripe,
         stripe_redirect,
         preferred_hosts=provider_config["preferred_hosts"],
+        max_hops=12 if payment_method in {"paypal", "gopay", "momo"} else 5,
         log=log,
     )
+    if payment_method == "momo":
+        provider_url = resolve_momo_provider_url(stripe, provider_url or stripe_redirect, log)
     if payment_method == "paypal" and not is_paypal_ba_approval_url(provider_url):
         raise ProtocolError(502, "PayPal BA 链解析失败：Stripe 中转地址未返回 agreements/approve?ba_token=BA- 链接")
     url = provider_url or stripe_redirect

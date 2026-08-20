@@ -52,6 +52,8 @@ class AccountPlanResult:
     renews_at: datetime | None
     plus_trial_eligible: bool
     plus_trial_campaign_id: str | None
+    plus_promotion_kind: str | None = None
+    plus_promotion_kind: str | None = None
     http_status: int = 200
     attempt_count: int = 1
     elapsed_ms: int = 0
@@ -160,11 +162,27 @@ def parse_accounts_check(
     subscription_plan = (
         str(raw_subscription_plan) if raw_subscription_plan else None
     )
-    is_free = (plan_type or "").casefold() == "free" or (
-        subscription_plan or ""
-    ).casefold() == "chatgptfreeplan"
+    subscription_key = (subscription_plan or "").casefold()
+    has_active_subscription = bool(entitlement.get("has_active_subscription"))
+    subscription_is_plus = "plus" in subscription_key and "free" not in subscription_key
+    # The JWT/account claim can remain `free` after a successful upgrade. The
+    # entitlement is the live source of truth for active paid subscriptions.
+    if has_active_subscription and subscription_is_plus:
+        plan_type = "plus"
+    is_free = (plan_type or "").casefold() == "free" or subscription_key == "chatgptfreeplan"
     account_id = account.get("account_id")
     campaign_id = plus_campaign.get("id") if plus_campaign else None
+    # ``eligible_promo_campaigns.plus`` is broader than a free trial.  Some
+    # accounts receive a discounted/half-price campaign; those must not be
+    # shown as trial-eligible or fed into the trial workflow.
+    campaign_text = json.dumps(plus_campaign or {}, ensure_ascii=False).casefold()
+    free_trial_campaign = bool(plus_campaign) and any(
+        marker in campaign_text
+        for marker in ("trial", "free_month", "month_free", "100%", "zero_amount")
+    )
+    if plus_campaign and not free_trial_campaign:
+        campaign_id_text = str(plus_campaign.get("id") or "").casefold()
+        free_trial_campaign = campaign_id_text.endswith("-free") or "trial" in campaign_id_text
     return AccountPlanResult(
         checked_at=(checked_at or datetime.now(timezone.utc)).astimezone(timezone.utc),
         account_id=(
@@ -174,13 +192,12 @@ def parse_accounts_check(
         ),
         current_plan_type=plan_type,
         subscription_plan=subscription_plan,
-        has_active_subscription=bool(
-            entitlement.get("has_active_subscription")
-        ),
+        has_active_subscription=has_active_subscription,
         expires_at=_parse_datetime(entitlement.get("expires_at")),
         renews_at=_parse_datetime(entitlement.get("renews_at")),
-        plus_trial_eligible=bool(is_free and plus_campaign),
+        plus_trial_eligible=bool(is_free and free_trial_campaign),
         plus_trial_campaign_id=str(campaign_id) if campaign_id else None,
+        plus_promotion_kind=("trial" if free_trial_campaign else "discount" if plus_campaign else None),
     )
 
 

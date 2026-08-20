@@ -50,7 +50,9 @@ def extract_checkout_totals(payload: Any) -> dict[str, Any]:
 
 def expected_amount(payload: Any) -> str:
     due = extract_checkout_totals(payload).get("due")
-    return str(due) if due is not None else "0"
+    if due is None:
+        raise ProtocolError(502, "Stripe 未返回可验证的应付金额，不能按 0 元继续提链")
+    return str(due)
 
 
 def checkout_payable_amount(checkout: CheckoutData) -> tuple[int, str]:
@@ -64,10 +66,12 @@ def checkout_payable_amount(checkout: CheckoutData) -> tuple[int, str]:
         from .flows.oaics import openai_checkout_init_payload
 
         minor_units = extract_checkout_totals(openai_checkout_init_payload(checkout)).get("due")
+    if minor_units in (None, ""):
+        raise ProtocolError(502, "最终 Checkout 未返回应付金额，无法确认账单是否为 0")
     try:
-        amount = int(minor_units) if minor_units not in (None, "") else 0
-    except (TypeError, ValueError):
-        amount = 0
+        amount = int(minor_units)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError(502, f"最终 Checkout 应付金额格式无效：{minor_units!r}") from exc
     currency = str(state.get("currency") or checkout.get("currency") or "GBP").upper()
     return amount, currency
 
@@ -99,12 +103,30 @@ def payment_method_types(payload: Any) -> list[str]:
     return methods
 
 
-def ensure_payment_method_offered(payload: dict[str, Any], payment_method: str, phase: str) -> None:
+def ensure_payment_method_offered(
+    payload: dict[str, Any],
+    payment_method: str,
+    phase: str,
+    stage_callback: Any | None = None,
+) -> None:
     methods = payment_method_types(payload)
-    if payment_method not in methods:
+    offered = payment_method in methods
+    if stage_callback is not None:
+        stage_callback("payment_method_validation", {
+            "校验阶段": phase,
+            "请求的支付方式": payment_method,
+            "Stripe 实际返回的支付方式": methods,
+            "校验通过": offered,
+            "最终判定": (
+                "目标支付方式可用，可以继续确认支付"
+                if offered
+                else "目标支付方式不可用，无法生成对应的支付跳转链接"
+            ),
+        })
+    if not offered:
         raise ProtocolError(
             409,
-            f"{phase} does not offer {payment_method}; methods={','.join(methods) or '?'}",
+            f"{phase} 未提供目标支付方式 {payment_method}；Stripe 实际支付方式={','.join(methods) or '无'}",
         )
 
 
@@ -200,6 +222,7 @@ def cs_billing_address(billing: dict[str, str], *, country: str | None = None) -
 
 
 def extract_redirect_to_url(payload: Any) -> str:
+    """Extract redirect, deep-link, or QR payload from a Stripe next_action."""
     if not isinstance(payload, dict):
         return ""
     next_action = payload.get("next_action")
@@ -207,6 +230,50 @@ def extract_redirect_to_url(payload: Any) -> str:
         redirect = next_action.get("redirect_to_url")
         if isinstance(redirect, dict) and redirect.get("url"):
             return str(redirect["url"]).strip()
+        # Local wallets can return a deep link or QR payload instead of an
+        # HTTP redirect. Keep the exact provider value so the UI can display
+        # and copy it even when it cannot be opened as a web page.
+        action_keys = (
+            "display_qr_code",
+            "pix_display_qr_code",
+            "upi_display_qr_code",
+            "twint_display_qr_code",
+            "kakao_pay_display_qr_code",
+            "momo_display_qr_code",
+            "momo_handle_redirect_or_display_qr_code",
+            "gopay_display_qr_code",
+            "gopay_redirect",
+            "upi_handle_redirect_or_display_qr_code",
+            "mobile_app_redirect",
+        )
+        value_keys = (
+            "data",
+            "url",
+            "deep_link",
+            "mobile_url",
+            "qr_code_url",
+            "qr_code_data",
+            "hosted_voucher_url",
+            "hosted_instructions_url",
+            "redirect_url",
+        )
+        for action_key in action_keys:
+            action = next_action.get(action_key)
+            if isinstance(action, str) and action.strip():
+                return action.strip()
+            if isinstance(action, dict):
+                for value_key in value_keys:
+                    value = action.get(value_key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+                # UPI and MoMo can wrap their copy value or image/deep-link
+                # inside a nested qr_code object.
+                nested_qr = action.get("qr_code")
+                if isinstance(nested_qr, dict):
+                    for value_key in value_keys:
+                        value = nested_qr.get(value_key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
     for key in ("setup_intent", "payment_intent", "payment_method_object"):
         nested = payload.get(key)
         if isinstance(nested, dict):
@@ -289,7 +356,10 @@ def stripe_provider_poll(
             submission = find_submission_attempt(payload)
             last_state = str(submission.get("state") or "")
             if last_state == "requires_approval":
-                raise ProviderRequiresApproval()
+                raise ProviderRequiresApproval(
+                    f"Stripe {payment_method} submission requires approval: "
+                    f"{safe_log_text(submission, limit=1600)}"
+                )
             if last_state == "failed":
                 raise ProtocolError(502, f"Stripe {payment_method} submission failed: {safe_log_text(submission)}")
         else:
@@ -305,11 +375,12 @@ def stripe_confirm_return_url(checkout: CheckoutData, hosted_url: str) -> str:
         url = f"https://checkout.stripe.com/c/pay/{checkout['cs_id']}"
     parsed = urlsplit(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    if "return_url" in query:
+    # Stripe hosted Checkout expects the nested destination under
+    # success_return_url.  return_url is the confirm field itself and using it
+    # as a hosted-page query key loses the post-provider completion target.
+    if "success_return_url" in query:
         return url
-    query.setdefault("returned_from_redirect", "true")
-    query.setdefault("ui_mode", "custom")
-    query.setdefault("return_url", chatgpt_success_return_url(checkout))
+    query.setdefault("success_return_url", chatgpt_success_return_url(checkout))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 

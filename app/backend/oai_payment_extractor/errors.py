@@ -26,7 +26,9 @@ class ProtocolError(ExtractionError):
 
 
 class ProviderRequiresApproval(ExtractionError):
-    pass
+    def __init__(self, detail: str = "provider requires approval"):
+        self.detail = str(detail)
+        super().__init__(self.detail)
 
 
 class ExtractionCancelled(ExtractionError):

@@ -342,6 +342,7 @@ class MongoResourceStore:
         promotion: str = "",
         country: str = "",
         alive: str = "",
+        global_promotion: str = "",
     ) -> Page[AccountRecord]:
         mongo_query: dict[str, Any] = {}
         if query.strip():
@@ -379,6 +380,8 @@ class MongoResourceStore:
                     {"aliveStatus": {"$exists": False}},
                 ]}
             )
+        if global_promotion in {"eligible", "ineligible", "pending", "failed"}:
+            mongo_query["globalPromotionStatus"] = global_promotion
         total = await self._guard(self.accounts.count_documents(mongo_query))
         cursor = (
             self.accounts.find(mongo_query, {"accessToken": 0})
@@ -415,6 +418,9 @@ class MongoResourceStore:
             "accessTokenConfigured": False,
             "accessTokenExpiresAt": None,
             "accessTokenUpdatedAt": None,
+            "globalPromotionStatus": "pending",
+            "globalPromotionEligible": None,
+            "globalPromotionMessage": "等待 Access Token 和至少 2 个可用代理",
         }
         if incoming.sourceEmailId:
             document["sourceEmailId"] = incoming.sourceEmailId
@@ -460,6 +466,51 @@ class MongoResourceStore:
             },
         ).sort("createdAt", DESCENDING)
         return await self._guard(cursor.to_list(length=None))
+
+    async def payment_extractor_accounts(self) -> list[dict[str, Any]]:
+        """Return selectable account metadata without exposing Access Tokens."""
+        now = utc_now()
+        cursor = self.accounts.find(
+            {
+                "accessTokenConfigured": True,
+                "accessToken": {"$type": "string", "$ne": ""},
+                "accessTokenExpiresAt": {"$gt": now},
+            },
+            {
+                "email": 1,
+                "registrationCountry": 1,
+                "accessTokenExpiresAt": 1,
+                "accountType": 1,
+            },
+        ).sort("createdAt", DESCENDING)
+        documents = await self._guard(cursor.to_list(length=None))
+        return [
+            {
+                "id": str(item["_id"]),
+                "email": str(item.get("email") or ""),
+                "registrationCountry": item.get("registrationCountry"),
+                "accessTokenExpiresAt": item.get("accessTokenExpiresAt"),
+                "accountType": item.get("accountType"),
+            }
+            for item in documents
+        ]
+
+    async def payment_extractor_access_token(self, account_id: str) -> str:
+        document = await self._guard(
+            self.accounts.find_one(
+                {"_id": account_id},
+                {"accessToken": 1, "accessTokenConfigured": 1, "accessTokenExpiresAt": 1},
+            )
+        )
+        if not document or not document.get("accessTokenConfigured"):
+            raise ResourceNotFoundError("账号没有可用 Access Token")
+        expires_at = document.get("accessTokenExpiresAt")
+        if not isinstance(expires_at, datetime) or expires_at <= utc_now():
+            raise ResourceNotFoundError("账号 Access Token 已过期")
+        token = str(document.get("accessToken") or "").strip()
+        if not token:
+            raise ResourceNotFoundError("账号没有可用 Access Token")
+        return token
 
     async def store_account_access_token(
         self,
@@ -547,6 +598,76 @@ class MongoResourceStore:
             raise ResourceNotFoundError("密码对应账号不存在")
         return updated_at
 
+    async def claim_pending_global_promotion_check(self) -> dict[str, Any] | None:
+        now = utc_now()
+        return await self._guard(
+            self.accounts.find_one_and_update(
+                {
+                    "globalPromotionStatus": "pending",
+                    "accessTokenConfigured": True,
+                    "accessToken": {"$type": "string", "$ne": ""},
+                    "accessTokenExpiresAt": {"$gt": now},
+                },
+                {"$set": {
+                    "globalPromotionStatus": "running",
+                    "globalPromotionStartedAt": now,
+                    "globalPromotionMessage": "正在通过多个国家的代理检测试用资格",
+                }},
+                projection={"accessToken": 1},
+                sort=[("createdAt", ASCENDING)],
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+
+    async def queue_global_promotion_checks(self, ids: list[str]) -> dict[str, int]:
+        unique_ids = list(dict.fromkeys(str(value) for value in ids if str(value)))
+        if not unique_ids:
+            return {"requested": 0, "queued": 0, "skipped": 0}
+        result = await self._guard(self.accounts.update_many(
+            {
+                "_id": {"$in": unique_ids},
+                "accessTokenConfigured": True,
+                "accessToken": {"$type": "string", "$ne": ""},
+            },
+            {"$set": {
+                "globalPromotionStatus": "pending",
+                "globalPromotionEligible": None,
+                "globalPromotionMessage": "已手动加入全局试用资格检测队列",
+            }},
+        ))
+        queued = int(result.modified_count)
+        return {"requested": len(unique_ids), "queued": queued, "skipped": len(unique_ids) - queued}
+
+    async def store_global_promotion_pending(self, account_id: str, message: str) -> None:
+        await self._guard(self.accounts.update_one({"_id": account_id}, {"$set": {
+            "globalPromotionStatus": "pending",
+            "globalPromotionEligible": None,
+            "globalPromotionMessage": message,
+        }}))
+
+    async def store_global_promotion_result(
+        self,
+        account_id: str,
+        *,
+        eligible: bool,
+        status: str,
+        results: list[dict[str, Any]],
+    ) -> None:
+        countries = list(dict.fromkeys(str(item.get("country") or "ZZ") for item in results))
+        await self._guard(self.accounts.update_one({"_id": account_id}, {"$set": {
+            "globalPromotionStatus": status,
+            "globalPromotionEligible": eligible,
+            "globalPromotionCheckedAt": utc_now(),
+            "globalPromotionProxyCount": len(results),
+            "globalPromotionCountries": countries,
+            "globalPromotionResults": results,
+            "globalPromotionMessage": (
+                "所有代理出口均检测到试用资格" if eligible
+                else "并非所有代理出口都检测到试用资格" if status == "ineligible"
+                else "部分代理检测异常，请稍后重新检测"
+            ),
+        }}))
+
     async def claim_account_plan_check(self, account_id: str) -> dict[str, Any] | None:
         now = utc_now()
         return await self._guard(
@@ -606,6 +727,68 @@ class MongoResourceStore:
             )
         )
 
+    async def claim_account_checkout_type_check(self, account_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        return await self._guard(
+            self.accounts.find_one_and_update(
+                {
+                    "_id": account_id,
+                    "accessTokenConfigured": True,
+                    "accessToken": {"$type": "string", "$ne": ""},
+                    "$or": [
+                        {"checkoutTypeCheckStatus": {"$ne": "running"}},
+                        {"checkoutTypeCheckStartedAt": {"$lte": now - timedelta(minutes=5)}},
+                    ],
+                },
+                {"$set": {
+                    "checkoutTypeCheckStatus": "running",
+                    "checkoutTypeCheckStartedAt": now,
+                    "checkoutTypeErrorCode": None,
+                    "checkoutTypeHttpStatus": None,
+                }},
+                projection={"accessToken": 1, "registrationCountry": 1},
+                return_document=ReturnDocument.AFTER,
+            )
+        )
+
+    async def claim_account_oaics_scan(self, account_id: str) -> dict[str, Any] | None:
+        now = utc_now()
+        return await self._guard(self.accounts.find_one_and_update(
+            {
+                "_id": account_id,
+                "accessTokenConfigured": True,
+                "accessToken": {"$type": "string", "$ne": ""},
+                "$or": [
+                    {"oaicsScanStatus": {"$ne": "running"}},
+                    {"oaicsScanStartedAt": {"$lte": now - timedelta(minutes=30)}},
+                ],
+            },
+            {"$set": {
+                "oaicsScanStatus": "running", "oaicsScanStartedAt": now,
+                "oaicsScanMessage": "正在通过全部可用代理检测 OAICS",
+                "oaicsScanTotal": 0, "oaicsScanSuccess": 0,
+                "oaicsScanCountryStats": [], "oaicsScanResults": [],
+            }},
+            projection={"accessToken": 1}, return_document=ReturnDocument.AFTER,
+        ))
+
+    async def store_account_oaics_scan_result(
+        self, account_id: str, *, results: list[dict[str, Any]], country_stats: list[dict[str, Any]]
+    ) -> None:
+        successes = sum(item.get("checkoutType") == "oaics" for item in results)
+        await self._guard(self.accounts.update_one({"_id": account_id}, {"$set": {
+            "oaicsScanStatus": "completed", "oaicsScanCheckedAt": utc_now(),
+            "oaicsScanTotal": len(results), "oaicsScanSuccess": successes,
+            "oaicsScanCountryStats": country_stats, "oaicsScanResults": results,
+            "oaicsScanMessage": f"全部代理检测完成，OAICS {successes}/{len(results)}",
+        }}))
+
+    async def store_account_oaics_scan_failure(self, account_id: str, message: str) -> None:
+        await self._guard(self.accounts.update_one({"_id": account_id}, {"$set": {
+            "oaicsScanStatus": "failed", "oaicsScanCheckedAt": utc_now(),
+            "oaicsScanMessage": message,
+        }}))
+
     async def store_account_alive_result(
         self,
         account_id: str,
@@ -659,6 +842,7 @@ class MongoResourceStore:
             "planExpiresAt": result.expires_at,
             "planRenewsAt": result.renews_at,
             "promotionEligible": result.plus_trial_eligible,
+            "promotionKind": result.plus_promotion_kind,
             "promotionCampaignId": result.plus_trial_campaign_id,
         }
         normalized_plan = (result.current_plan_type or "").casefold()
@@ -702,6 +886,7 @@ class MongoResourceStore:
                         "checkoutTypeCheckedAt": result.checked_at,
                         "checkoutTypeErrorCode": None,
                         "checkoutTypeHttpStatus": None,
+                        "checkoutTypeCheckStatus": "success",
                     }
                 },
             )
@@ -721,6 +906,7 @@ class MongoResourceStore:
                     "checkoutTypeErrorCode": error.code,
                     "checkoutTypeHttpStatus": error.http_status,
                     "checkoutTypeCheckedAt": utc_now(),
+                    "checkoutTypeCheckStatus": "failed",
                 }},
             )
         )
@@ -1078,6 +1264,35 @@ class MongoResourceStore:
             cursor = cursor.limit(max(1, limit))
         return await self._guard(cursor.to_list(length=limit))
 
+    async def payment_extractor_proxy_pool(self, country: str, group: str) -> list[str]:
+        query: dict[str, Any] = {
+            "enabled": True,
+            "status": {"$ne": "quarantined"},
+        }
+        if country:
+            query = {"$and": [query, proxy_country_filter(country)]}
+        if group:
+            query = {"$and": [query, {"group": normalize_proxy_group(group)}]}
+        documents = await self._guard(
+            self.proxies.find(query).sort([("latencyMs", ASCENDING), ("createdAt", DESCENDING)]).to_list(length=None)
+        )
+        lines: list[str] = []
+        for item in documents:
+            scheme = str(item.get("scheme") or "http").lower()
+            if scheme not in SUPPORTED_PROXY_SCHEMES:
+                scheme = "http"
+            host = str(item.get("host") or "").strip()
+            port = int(item.get("port") or 0)
+            if not host or not port:
+                continue
+            username = str(item.get("username") or "")
+            password = str(item.get("password") or "")
+            auth = ""
+            if username or password:
+                auth = f"{quote(username, safe='')}:{quote(password, safe='')}@"
+            lines.append(f"{scheme}://{auth}{host}:{port}")
+        return lines
+
     async def record_proxy_test(
         self,
         proxy_id: str,
@@ -1087,17 +1302,44 @@ class MongoResourceStore:
         country: str | None = None,
     ) -> None:
         changes: dict[str, Any] = {
-            "status": "available" if available else "quarantined",
             "latencyMs": latency_ms if available else None,
             "lastCheckedAt": utc_now(),
         }
         if available and country:
             changes["country"] = normalize_country_code(country)
-        update: dict[str, Any] = {"$set": changes}
         if available:
+            changes["status"] = "available"
             changes["consecutiveFailures"] = 0
+            update: dict[str, Any] | list[dict[str, Any]] = {"$set": changes}
         else:
-            update["$inc"] = {"consecutiveFailures": 1}
+            # A single timeout is not enough evidence to disable a proxy.
+            # Keep a previously healthy proxy selectable until repeated
+            # failures reach the configured quarantine threshold.
+            threshold = max(
+                2, int(os.getenv("AUTOREGISTER_PROXY_DELETE_AFTER_FAILURES", "3"))
+            )
+            next_failures = {"$add": [{"$ifNull": ["$consecutiveFailures", 0]}, 1]}
+            update = [
+                {
+                    "$set": {
+                        **changes,
+                        "consecutiveFailures": next_failures,
+                        "status": {
+                            "$cond": [
+                                {"$gte": [next_failures, threshold]},
+                                "quarantined",
+                                {
+                                    "$cond": [
+                                        {"$eq": ["$status", "available"]},
+                                        "available",
+                                        "unknown",
+                                    ]
+                                },
+                            ]
+                        },
+                    }
+                }
+            ]
         await self._guard(self.proxies.update_one({"_id": proxy_id}, update))
 
     async def delete_repeatedly_failed_proxies(self, threshold: int) -> int:
@@ -1405,6 +1647,15 @@ class MongoResourceStore:
 
     @staticmethod
     def _account_record(document: dict[str, Any]) -> AccountRecord:
+        campaign_id = str(document.get("promotionCampaignId") or "")
+        campaign_key = campaign_id.casefold()
+        stored_kind = document.get("promotionKind")
+        derived_kind = stored_kind or (
+            "discount" if any(marker in campaign_key for marker in ("50-pct", "50_pct", "discount", "half-price")) else None
+        )
+        derived_eligible = document.get("promotionEligible")
+        if derived_kind == "discount":
+            derived_eligible = False
         return AccountRecord(
             id=str(document["_id"]),
             email=document["email"],
@@ -1416,7 +1667,7 @@ class MongoResourceStore:
             createdAt=document["createdAt"],
             accountType=document["accountType"],
             phoneBound=document.get("phoneBound"),
-            promotionEligible=document.get("promotionEligible"),
+            promotionEligible=derived_eligible,
             accessTokenConfigured=bool(document.get("accessTokenConfigured", False)),
             accessTokenExpiresAt=document.get("accessTokenExpiresAt"),
             accessTokenUpdatedAt=document.get("accessTokenUpdatedAt"),
@@ -1430,16 +1681,32 @@ class MongoResourceStore:
             planExpiresAt=document.get("planExpiresAt"),
             planRenewsAt=document.get("planRenewsAt"),
             promotionCampaignId=document.get("promotionCampaignId"),
+            promotionKind=derived_kind,
             checkoutType=document.get("checkoutType"),
             checkoutTypeDetail=document.get("checkoutTypeDetail"),
             checkoutTypeCheckedAt=document.get("checkoutTypeCheckedAt"),
             checkoutTypeErrorCode=document.get("checkoutTypeErrorCode"),
             checkoutTypeHttpStatus=document.get("checkoutTypeHttpStatus"),
+            checkoutTypeCheckStatus=document.get("checkoutTypeCheckStatus"),
             registrationCountry=document.get("registrationCountry"),
             aliveStatus=document.get("aliveStatus"),
             aliveCheckedAt=document.get("aliveCheckedAt"),
             aliveErrorCode=document.get("aliveErrorCode"),
             aliveHttpStatus=document.get("aliveHttpStatus"),
+            globalPromotionStatus=document.get("globalPromotionStatus"),
+            globalPromotionEligible=document.get("globalPromotionEligible"),
+            globalPromotionCheckedAt=document.get("globalPromotionCheckedAt"),
+            globalPromotionProxyCount=int(document.get("globalPromotionProxyCount") or 0),
+            globalPromotionCountries=list(document.get("globalPromotionCountries") or []),
+            globalPromotionResults=list(document.get("globalPromotionResults") or []),
+            globalPromotionMessage=document.get("globalPromotionMessage"),
+            oaicsScanStatus=document.get("oaicsScanStatus"),
+            oaicsScanCheckedAt=document.get("oaicsScanCheckedAt"),
+            oaicsScanTotal=int(document.get("oaicsScanTotal") or 0),
+            oaicsScanSuccess=int(document.get("oaicsScanSuccess") or 0),
+            oaicsScanCountryStats=list(document.get("oaicsScanCountryStats") or []),
+            oaicsScanResults=list(document.get("oaicsScanResults") or []),
+            oaicsScanMessage=document.get("oaicsScanMessage"),
         )
 
     @staticmethod

@@ -139,7 +139,7 @@ def test_manual_plan_check_persists_success_and_releases_proxy(monkeypatch) -> N
     assert proxies.successes == [("proxy", 321)]
     assert proxies.released == [("proxy", proxies.acquired[0])]
     assert proxies.acquire_options[0]["country"] == "TR"
-    assert resources.checkout_results[0][1].checkout_type == "oaics"
+    assert resources.checkout_results == []
 
 
 def test_country_timezone_offsets_are_consistent() -> None:

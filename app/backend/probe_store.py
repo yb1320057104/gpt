@@ -340,6 +340,57 @@ class MongoProbeStore:
             )
         )
 
+    async def global_promotion_candidates(self, *, limit: int = 5) -> list[ProxyLease]:
+        documents = await self._guard(
+            self.proxies.find(self._available_proxy_filter(utc_now()))
+            .sort([("lastSelectedAt", ASCENDING), ("createdAt", ASCENDING), ("_id", ASCENDING)])
+            .limit(200)
+            .to_list(length=200)
+        )
+        selected: list[dict[str, Any]] = []
+        used_countries: set[str] = set()
+        for document in documents:
+            country = str(document.get("country") or "ZZ").upper()
+            if country != "ZZ" and country not in used_countries:
+                selected.append(document)
+                used_countries.add(country)
+                if len(selected) >= limit:
+                    break
+        selected_ids = {str(item["_id"]) for item in selected}
+        for document in documents:
+            if len(selected) >= limit:
+                break
+            if str(document["_id"]) not in selected_ids:
+                selected.append(document)
+                selected_ids.add(str(document["_id"]))
+        return [
+            ProxyLease(
+                id=str(item["_id"]), host=str(item["host"]), port=int(item["port"]),
+                username=str(item.get("username") or ""), password=str(item.get("password") or ""),
+                country=str(item.get("country") or "ZZ").upper(),
+                group=str(item.get("group") or DEFAULT_PROXY_GROUP),
+                scheme=str(item.get("scheme") or "http").lower(),
+            )
+            for item in selected
+        ]
+
+    async def all_eligible_proxy_candidates(self) -> list[ProxyLease]:
+        documents = await self._guard(
+            self.proxies.find(self._available_proxy_filter(utc_now()))
+            .sort([("country", ASCENDING), ("createdAt", ASCENDING), ("_id", ASCENDING)])
+            .to_list(length=None)
+        )
+        return [
+            ProxyLease(
+                id=str(item["_id"]), host=str(item["host"]), port=int(item["port"]),
+                username=str(item.get("username") or ""), password=str(item.get("password") or ""),
+                country=str(item.get("country") or "ZZ").upper(),
+                group=str(item.get("group") or DEFAULT_PROXY_GROUP),
+                scheme=str(item.get("scheme") or "http").lower(),
+            )
+            for item in documents
+        ]
+
     async def acquire_proxy(
         self,
         owner: str,

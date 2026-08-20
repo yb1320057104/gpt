@@ -149,7 +149,16 @@ class ProxySubscriptionService:
         documents = await self.resources.store.proxy_documents_for_test(
             country, group, limit
         )
-        semaphore = asyncio.Semaphore(12)
+        # Subscription managers such as Resin multiplex many logical nodes on
+        # one local port. A large burst can overload that single entry point
+        # and incorrectly quarantine otherwise healthy nodes.
+        concurrency = max(
+            1, min(12, int(os.getenv("AUTOREGISTER_PROXY_CHECK_CONCURRENCY", "4")))
+        )
+        attempts = max(
+            1, min(5, int(os.getenv("AUTOREGISTER_PROXY_CHECK_ATTEMPTS", "3")))
+        )
+        semaphore = asyncio.Semaphore(concurrency)
 
         async def test_one(document: dict[str, object]) -> ProxyProbeResult | None:
             scheme = str(document.get("scheme") or "http").lower()
@@ -160,9 +169,15 @@ class ProxySubscriptionService:
             auth = f"{username}:{password}@" if username or password else ""
             proxy_url = f"{scheme}://{auth}{host}:{port}"
             async with semaphore:
-                try:
-                    result = await self.probe_proxy(proxy_url, timeout_seconds)
-                except (httpx.HTTPError, ValueError, TypeError, OSError):
+                result: ProxyProbeResult | None = None
+                for attempt in range(attempts):
+                    try:
+                        result = await self.probe_proxy(proxy_url, timeout_seconds)
+                        break
+                    except (httpx.HTTPError, ValueError, TypeError, OSError):
+                        if attempt + 1 < attempts:
+                            await asyncio.sleep(0.25 * (attempt + 1))
+                if result is None:
                     await self.resources.store.record_proxy_test(
                         str(document["_id"]), available=False
                     )
@@ -204,15 +219,39 @@ class ProxySubscriptionService:
             trust_env=False,
             follow_redirects=True,
         ) as client:
-            response = await client.get(
-                "https://ipwho.is/",
-                params={"fields": "success,ip,country_code"},
-            )
-            response.raise_for_status()
-            body = response.json()
-        country = str(body.get("country_code") or "").strip().upper()
-        if body.get("success") is False or not re.fullmatch(r"[A-Z]{2}", country) or country == "ZZ":
-            raise ValueError("proxy country could not be identified")
+            errors: list[Exception] = []
+            country = ""
+            # Prefer the actual automation destination. Public geo APIs are
+            # frequently rate-limited or blocked by otherwise valid proxies.
+            for url, params, response_type in (
+                ("https://chatgpt.com/cdn-cgi/trace", None, "trace"),
+                ("https://api.country.is/", None, "country-is"),
+                (
+                    "https://ipwho.is/",
+                    {"fields": "success,ip,country_code"},
+                    "ipwho",
+                ),
+            ):
+                try:
+                    response = await client.get(url, params=params)
+                    response.raise_for_status()
+                    if response_type == "trace":
+                        match = re.search(r"(?m)^loc=([A-Za-z]{2})\s*$", response.text)
+                        country = match.group(1).upper() if match else ""
+                    else:
+                        body = response.json()
+                        if response_type == "country-is":
+                            country = str(body.get("country") or "").strip().upper()
+                        elif body.get("success") is not False:
+                            country = str(body.get("country_code") or "").strip().upper()
+                    if re.fullmatch(r"[A-Z]{2}", country) and country != "ZZ":
+                        break
+                except (httpx.HTTPError, ValueError, TypeError) as exc:
+                    errors.append(exc)
+            if not re.fullmatch(r"[A-Z]{2}", country) or country == "ZZ":
+                if errors:
+                    raise errors[-1]
+                raise ValueError("proxy country could not be identified")
         return ProxyProbeResult(
             proxy_url=proxy_url,
             country=country,

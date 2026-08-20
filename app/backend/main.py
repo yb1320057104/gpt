@@ -48,6 +48,7 @@ from .paypal_agreement_service import (
     PaypalAgreementService,
     PaypalAgreementServiceError,
 )
+from .sandbox_checkout import router as sandbox_checkout_router
 from .pipeline_service import (
     AccountPipelineService,
     HeroSmsSettingsUpdate,
@@ -66,6 +67,7 @@ from .pipeline_service import (
 )
 from .probe_store import MongoProbeStore
 from .plan_check_service import AccountPlanCheckService
+from .global_promotion_service import GlobalPromotionCheckService
 from .account_alive_service import AccountAliveCheckService
 from .proxy_subscription_service import (
     ProxySubscriptionError,
@@ -78,6 +80,8 @@ from .resource_models import (
     AccountRecord,
     AccountPlanCheckInput,
     AccountPlanCheckResult,
+    AccountCheckoutTypeCheckInput,
+    AccountCheckoutTypeCheckResult,
     AccountAliveCheckInput,
     AccountAliveCheckResult,
     BulkIdsInput,
@@ -201,6 +205,7 @@ def create_app(
     proxy_health_scheduler = ProxyHealthScheduler(proxy_subscription_service)
     probe_store = MongoProbeStore(mongo)
     plan_check_service = AccountPlanCheckService(resource_store, probe_store)
+    global_promotion_service = GlobalPromotionCheckService(resource_store, probe_store)
     alive_check_service = AccountAliveCheckService(resource_store, probe_store)
     extractor_service = payment_extractor_service or PaymentExtractorService()
     agreement_service = paypal_agreement_service or PaypalAgreementService()
@@ -230,9 +235,11 @@ def create_app(
         await mongo.start()
         await account_pipeline.start()
         await proxy_health_scheduler.start()
+        await global_promotion_service.start()
         try:
             yield
         finally:
+            await global_promotion_service.stop()
             await proxy_health_scheduler.stop()
             await run_manager.shutdown()
             await account_pipeline.stop()
@@ -247,6 +254,7 @@ def create_app(
         openapi_url="/api/openapi.json",
         lifespan=lifespan,
     )
+    app.include_router(sandbox_checkout_router)
 
     @app.middleware("http")
     async def payment_workbench_auth(request: Request, call_next):
@@ -677,6 +685,20 @@ def create_app(
     def payment_extractor_defaults(request: Request) -> dict:
         return request.app.state.payment_extractor_service.options()
 
+    @app.get("/api/payment-extractor/accounts")
+    async def payment_extractor_accounts() -> dict:
+        mongo.require_online()
+        return {"ok": True, "items": await resource_store.payment_extractor_accounts()}
+
+    @app.get("/api/payment-extractor/proxy-pool")
+    async def payment_extractor_proxy_pool(
+        country: Annotated[str, Query(max_length=2)] = "",
+        group: Annotated[str, Query(max_length=128)] = "",
+    ) -> dict:
+        mongo.require_online()
+        proxies = await resource_store.payment_extractor_proxy_pool(country, group)
+        return {"ok": True, "proxies": proxies, "count": len(proxies)}
+
     @app.put("/api/payment-extractor/concurrency")
     def payment_extractor_concurrency(
         payload: PaymentExtractorConcurrencyUpdate,
@@ -714,14 +736,19 @@ def create_app(
             raise extractor_error(exc) from exc
 
     @app.post("/api/payment-extractor/tasks", status_code=202)
-    def create_payment_extractor_task(
+    async def create_payment_extractor_task(
         payload: PaymentExtractorTaskCreate,
         request: Request,
     ) -> dict:
         try:
+            if payload.accountId and not payload.accessToken:
+                token = await resource_store.payment_extractor_access_token(payload.accountId)
+                payload = payload.model_copy(update={"accessToken": token})
             return _task_response(
                 request.app.state.payment_extractor_service.create(payload)
             )
+        except ResourceNotFoundError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except PaymentExtractorServiceError as exc:
             raise extractor_error(exc) from exc
 
@@ -731,6 +758,20 @@ def create_app(
             "ok": True,
             "tasks": request.app.state.payment_extractor_service.list(),
         }
+
+    # Static task collection actions must be registered before /{task_id};
+    # otherwise FastAPI/Starlette can treat "bulk-cancel" as a task id and
+    # return 405 before reaching the intended POST route.
+    @app.post("/api/payment-extractor/tasks/bulk-cancel")
+    def cancel_all_payment_extractor_tasks(request: Request) -> dict:
+        return request.app.state.payment_extractor_service.cancel_all()
+
+    @app.post("/api/payment-extractor/tasks/bulk-delete")
+    def bulk_delete_payment_extractor_tasks(
+        payload: PaymentExtractorBulkDelete,
+        request: Request,
+    ) -> dict:
+        return request.app.state.payment_extractor_service.bulk_delete(payload)
 
     @app.get("/api/payment-extractor/tasks/{task_id}")
     def get_payment_extractor_task(task_id: str, request: Request) -> dict:
@@ -772,13 +813,6 @@ def create_app(
             return request.app.state.payment_extractor_service.delete(task_id)
         except PaymentExtractorServiceError as exc:
             raise extractor_error(exc) from exc
-
-    @app.post("/api/payment-extractor/tasks/bulk-delete")
-    def bulk_delete_payment_extractor_tasks(
-        payload: PaymentExtractorBulkDelete,
-        request: Request,
-    ) -> dict:
-        return request.app.state.payment_extractor_service.bulk_delete(payload)
 
     # Compatibility routes matching the standalone extractor README.  The
     # existing /api/payment-extractor/* routes above remain unchanged for the
@@ -973,9 +1007,14 @@ def create_app(
         promotion: Annotated[str, Query(max_length=32)] = "",
         country: Annotated[str, Query(max_length=2)] = "",
         alive: Annotated[str, Query(pattern="^(|alive|dead|unknown|unchecked)$")] = "",
+        global_promotion: Annotated[
+            str, Query(alias="globalPromotion", pattern="^(|eligible|ineligible|pending|failed)$")
+        ] = "",
     ) -> Page[AccountRecord]:
         mongo.require_online()
-        return await resource_store.list_accounts(page, int(page_size), q, promotion, country, alive)  # type: ignore[arg-type]
+        return await resource_store.list_accounts(
+            page, int(page_size), q, promotion, country, alive, global_promotion
+        )  # type: ignore[arg-type]
 
     @app.post("/api/accounts", response_model=AccountRecord, status_code=201)
     async def create_account(payload: AccountCreate) -> AccountRecord:
@@ -1002,6 +1041,31 @@ def create_app(
         return await request.app.state.plan_check_service.check_accounts(
             payload.ids, proxy_id=payload.proxyId
         )
+
+    @app.post("/api/accounts/check-global-promotion")
+    async def check_account_global_promotions(payload: AccountPlanCheckInput) -> dict[str, int]:
+        mongo.require_online()
+        return await resource_store.queue_global_promotion_checks(payload.ids)
+
+    @app.post(
+        "/api/accounts/check-checkout-type",
+        response_model=AccountCheckoutTypeCheckResult,
+    )
+    async def check_account_checkout_types(
+        request: Request,
+        payload: AccountCheckoutTypeCheckInput,
+    ) -> AccountCheckoutTypeCheckResult:
+        mongo.require_online()
+        return await request.app.state.plan_check_service.check_checkout_types(
+            payload.ids, proxy_id=payload.proxyId
+        )
+
+    @app.post("/api/accounts/check-oaics-all-proxies")
+    async def check_account_oaics_all_proxies(
+        request: Request, payload: AccountCheckoutTypeCheckInput
+    ) -> dict[str, Any]:
+        mongo.require_online()
+        return await request.app.state.plan_check_service.start_oaics_scans(payload.ids)
 
     @app.post(
         "/api/accounts/check-alive",

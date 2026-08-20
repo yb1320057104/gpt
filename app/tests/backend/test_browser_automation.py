@@ -3769,6 +3769,7 @@ def test_registration_checkout_type_uses_current_browser_session(
     assert result.checkout_detail == expected_detail
     assert page.checkout_arguments is not None
     assert page.checkout_arguments["country"] == "JP"
+    assert page.checkout_arguments["currency"] == "JPY"
     assert page.checkout_arguments["token"] == "TEST_AT_DO_NOT_LOG"
     assert page.url == CHATGPT_HOME_URL
     assert "TEST_AT_DO_NOT_LOG" not in repr(result)

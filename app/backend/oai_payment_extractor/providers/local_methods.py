@@ -9,6 +9,10 @@ PIX = ProviderAdapter("pix", "pix_url", ("stripe.com", "pay.openai.com"))
 BLIK = ProviderAdapter("blik", "blik_url", ("stripe.com", "pay.openai.com"))
 TWINT = ProviderAdapter("twint", "twint_url", ("twint.ch", "stripe.com"))
 KAKAO_PAY = ProviderAdapter(
-    "kakao_pay", "kakao_pay_url", ("kakaopay.com", "kakao.com", "stripe.com")
+    "kakao_pay", "kakao_pay_url", ("nicepay.co.kr", "nicepay.com", "kakaopay.com", "kakao.com", "stripe.com")
 )
-MOMO = ProviderAdapter("momo", "momo_url", ("momo.vn", "stripe.com"))
+MOMO = ProviderAdapter(
+    "momo",
+    "momo_url",
+    ("payment.momo.vn", "momo.vn", "stripe.com"),
+)

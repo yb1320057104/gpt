@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { CircleCheck, CopyDocument, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
+import { CircleCheck, CopyDocument, CreditCard, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
 import type { AccountRecord, ExportFormat, ExportScope, ProxyRecord, ResourceQuery } from '@/types'
 import { useAppStore } from '@/stores/app'
@@ -17,6 +17,7 @@ const tableRef = ref<TableInstance>()
 const search = ref('')
 const promotionFilter = ref<ResourceQuery['promotion']>('')
 const aliveFilter = ref<ResourceQuery['alive']>('')
+const globalPromotionFilter = ref<ResourceQuery['globalPromotion']>('')
 const countryFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref<ResourceQuery['pageSize']>(10)
@@ -42,12 +43,16 @@ const copyAtLimit = ref((() => {
   }
 })())
 let searchTimer: ReturnType<typeof setTimeout> | undefined
+let globalPromotionTimer: ReturnType<typeof setInterval> | undefined
 
 const pageAccounts = computed(() => store.accounts)
 const promotionChecking = computed(() => store.accountPromotionChecking)
 const aliveChecking = computed(() => store.accountAliveChecking)
+const checkoutTypeChecking = computed(() => store.accountCheckoutTypeChecking)
 const checkingAccountIds = computed(() => store.accountPromotionCheckingIds)
 const aliveCheckingAccountIds = computed(() => store.accountAliveCheckingIds)
+const checkoutTypeCheckingAccountIds = computed(() => store.accountCheckoutTypeCheckingIds)
+const oaicsStartingIds = ref<string[]>([])
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -72,15 +77,15 @@ function accessTokenStatus(account: AccountRecord) {
 function promotionLabel(account: AccountRecord) {
   if (account.planCheckStatus === 'running') return '查询中'
   if (account.planCheckStatus === 'failed') return '查询失败'
-  if (account.promotionEligible === true) return '可 Plus 试用'
-  if (account.promotionEligible === false) return '不可试用'
+  if (account.promotionKind === 'discount') return '\u0050lus \u4f18\u60e0'
+  if (account.promotionEligible === true) return '\u0050lus \u8bd5\u7528'
   return '未查询'
 }
 
 function promotionTagType(account: AccountRecord) {
   if (account.planCheckStatus === 'failed') return 'danger'
   if (account.planCheckStatus === 'running') return 'warning'
-  if (account.promotionEligible === true) return 'success'
+  if (account.promotionEligible === true) return 'Plus ??'
   return 'info'
 }
 
@@ -92,7 +97,31 @@ function promotionTooltip(account: AccountRecord) {
   return '尚未查询 Plus 试用资格'
 }
 
+function globalPromotionLabel(account: AccountRecord) {
+  if (account.globalPromotionStatus === 'running') return '检测中'
+  if (account.globalPromotionStatus === 'eligible') return '全局可试用'
+  if (account.globalPromotionStatus === 'ineligible') return '非全局试用'
+  if (account.globalPromotionStatus === 'failed') return '检测异常'
+  return '待检测'
+}
+
+function globalPromotionTagType(account: AccountRecord) {
+  if (account.globalPromotionStatus === 'eligible') return 'success'
+  if (account.globalPromotionStatus === 'ineligible' || account.globalPromotionStatus === 'failed') return 'danger'
+  if (account.globalPromotionStatus === 'running') return 'warning'
+  return 'info'
+}
+
+function globalPromotionTooltip(account: AccountRecord) {
+  const countries = (account.globalPromotionCountries || []).map(countryLabel).join('、')
+  const summary = account.globalPromotionMessage || '等待 Access Token 和至少 2 个可用代理'
+  const count = account.globalPromotionProxyCount || 0
+  const checked = account.globalPromotionCheckedAt ? `；检测时间：${formatDate(account.globalPromotionCheckedAt)}` : ''
+  return `${summary}${count ? `；已检测 ${count} 个代理` : ''}${countries ? `；国家：${countries}` : ''}${checked}`
+}
+
 function checkoutTypeLabel(account: AccountRecord) {
+  if (account.checkoutTypeCheckStatus === 'running') return '检测中'
   if (account.checkoutTypeDetail === 'stripe_cs_live') return 'CS Live'
   if (account.checkoutTypeDetail === 'stripe_cs_test') return 'CS Test'
   if (account.checkoutTypeDetail === 'stripe_checkout') return 'Stripe Checkout'
@@ -127,7 +156,69 @@ function checkoutTypeTooltip(account: AccountRecord) {
     const detail = account.checkoutTypeDetail ? `；详细类型：${checkoutTypeLabel(account)}` : ''
     return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}${detail}`
   }
-  return '点击“检测选中资格”时会同时检测结账类型'
+  return '尚未单独检测账单类型'
+}
+
+function oaicsScanLabel(account: AccountRecord) {
+  if (account.oaicsScanStatus === 'running') return '检测中'
+  if (account.oaicsScanStatus === 'failed') return '检测失败'
+  if (account.oaicsScanStatus === 'completed') {
+    return `OAICS ${account.oaicsScanSuccess || 0}/${account.oaicsScanTotal || 0}`
+  }
+  return '未检测'
+}
+
+function oaicsScanTooltip(account: AccountRecord) {
+  const stats = account.oaicsScanCountryStats || []
+  const lines = stats.map((item) =>
+    `${countryLabel(item.country)}：${item.oaics}/${item.total}，成功率 ${item.successRate}%（CS ${item.cs}，失败 ${item.failed}）`,
+  )
+  const header = account.oaicsScanMessage || '尚未使用全部代理检测 OAICS'
+  const checked = account.oaicsScanCheckedAt ? `检测时间：${formatDate(account.oaicsScanCheckedAt)}` : ''
+  return [header, checked, ...lines].filter(Boolean).join('\n')
+}
+
+async function checkOaicsAllProxies(ids: string[]) {
+  if (!ids.length) return
+  oaicsStartingIds.value = [...ids]
+  try {
+    const result = await dataGateway.checkAccountOaicsAllProxies(ids)
+    ElMessage.success(`OAICS 全代理检测已进入后台：启动 ${result.started}，跳过 ${result.skipped}`)
+    await loadPage()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : 'OAICS 全代理检测启动失败')
+  } finally {
+    oaicsStartingIds.value = []
+  }
+}
+
+async function checkCheckoutTypes(ids: string[]) {
+  if (!ids.length || checkoutTypeChecking.value) return
+  if (ids.length > 100) {
+    ElMessage.warning('单次最多检测 100 个账号')
+    return
+  }
+  try {
+    const result = promotionProxyId.value
+      ? await store.checkAccountCheckoutTypes(ids, promotionProxyId.value)
+      : await store.checkAccountCheckoutTypes(ids)
+    const message = `账单类型检测完成：成功 ${result.succeeded}，失败 ${result.failed}，跳过 ${result.skipped}`
+    if (result.failed || result.skipped) ElMessage.warning(message)
+    else ElMessage.success(message)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '账单类型检测失败')
+  }
+}
+
+async function checkGlobalPromotions(ids: string[]) {
+  if (!ids.length) return
+  try {
+    const result = await dataGateway.checkAccountGlobalPromotions(ids)
+    ElMessage.success(`全局试用检测已入队：${result.queued}，跳过 ${result.skipped}`)
+    await loadPage()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '全局试用检测启动失败')
+  }
 }
 
 function aliveLabel(account: AccountRecord) {
@@ -243,6 +334,7 @@ async function loadPage() {
       promotion: promotionFilter.value,
       country: countryFilter.value,
       alive: aliveFilter.value,
+      globalPromotion: globalPromotionFilter.value,
     })
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
@@ -299,6 +391,12 @@ function changeCountryFilter(value: string | number | boolean | undefined) {
 
 function changeAliveFilter(value: string | number | boolean | undefined) {
   aliveFilter.value = String(value || '') as ResourceQuery['alive']
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeGlobalPromotionFilter(value: string | number | boolean | undefined) {
+  globalPromotionFilter.value = String(value || '') as ResourceQuery['globalPromotion']
   currentPage.value = 1
   void loadPage()
 }
@@ -379,6 +477,13 @@ watch(pageAccounts, () => void syncPageSelection(), { flush: 'post', immediate: 
 watch([currentPage, pageSize], () => void loadPage())
 onMounted(() => {
   void loadPage()
+  globalPromotionTimer = setInterval(() => {
+    if (pageAccounts.value.some((account) =>
+      ['pending', 'running'].includes(account.globalPromotionStatus || '') || account.oaicsScanStatus === 'running',
+    )) {
+      void loadPage()
+    }
+  }, 5000)
   void dataGateway.listProxies({ page: 1, pageSize: 100, q: '' }).then((page) => {
     promotionProxies.value = page.items.filter((proxy) => proxy.enabled)
   }).catch(() => {
@@ -387,6 +492,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
+  if (globalPromotionTimer) clearInterval(globalPromotionTimer)
 })
 </script>
 
@@ -435,6 +541,15 @@ onBeforeUnmount(() => {
             />
           </el-select>
           <el-button
+            type="success"
+            plain
+            :icon="Search"
+            :disabled="selectedIds.length === 0"
+            @click="checkGlobalPromotions([...selectedIds])"
+          >
+            全局试用检测
+          </el-button>
+          <el-button
             type="warning"
             plain
             :icon="MagicStick"
@@ -453,6 +568,26 @@ onBeforeUnmount(() => {
             @click="checkAlive([...selectedIds])"
           >
             验活选中账号
+          </el-button>
+          <el-button
+            type="primary"
+            plain
+            :icon="CreditCard"
+            :loading="checkoutTypeChecking"
+            :disabled="selectedIds.length === 0 || checkoutTypeChecking"
+            @click="checkCheckoutTypes([...selectedIds])"
+          >
+            检测选中账单类型
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :icon="Search"
+            :loading="oaicsStartingIds.length > 0"
+            :disabled="selectedIds.length === 0 || oaicsStartingIds.length > 0"
+            @click="checkOaicsAllProxies([...selectedIds])"
+          >
+            OAICS 全代理检测
           </el-button>
           <el-button
             type="danger"
@@ -543,6 +678,18 @@ onBeforeUnmount(() => {
             <el-option label="检测异常" value="unknown" />
             <el-option label="未检测" value="unchecked" />
           </el-select>
+          <el-select
+            :model-value="globalPromotionFilter"
+            clearable
+            placeholder="筛选全局优惠"
+            style="width: 170px"
+            @change="changeGlobalPromotionFilter"
+          >
+            <el-option label="全局可试用" value="eligible" />
+            <el-option label="非全局试用" value="ineligible" />
+            <el-option label="待检测" value="pending" />
+            <el-option label="检测异常" value="failed" />
+          </el-select>
           <el-button type="primary" plain :disabled="store.accountTotal === 0" @click="openExport('all')">导出全部</el-button>
         </div>
       </div>
@@ -606,6 +753,20 @@ onBeforeUnmount(() => {
             </el-tooltip>
           </template>
         </el-table-column>
+        <el-table-column label="OAICS 全代理" width="155">
+          <template #default="{ row }">
+            <el-tooltip :content="oaicsScanTooltip(row)" placement="top" :show-after="200">
+              <el-tag
+                :type="row.oaicsScanStatus === 'completed' && row.oaicsScanSuccess > 0 ? 'success' : row.oaicsScanStatus === 'failed' ? 'danger' : row.oaicsScanStatus === 'running' ? 'warning' : 'info'"
+                effect="plain"
+                round
+                style="white-space: pre-line"
+              >
+                {{ oaicsScanLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column label="手机号状态" width="128">
           <template #default="{ row }">
             <el-tag
@@ -624,6 +785,15 @@ onBeforeUnmount(() => {
             <el-tooltip :content="promotionTooltip(row)">
               <el-tag :type="promotionTagType(row)" effect="plain" round>
                 {{ promotionLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="全局优惠" width="145">
+          <template #default="{ row }">
+            <el-tooltip :content="globalPromotionTooltip(row)">
+              <el-tag :type="globalPromotionTagType(row)" effect="plain" round>
+                {{ globalPromotionLabel(row) }}
               </el-tag>
             </el-tooltip>
           </template>
@@ -676,6 +846,32 @@ onBeforeUnmount(() => {
                   :loading="checkingAccountIds.includes(row.id)"
                   :disabled="!hasValidAccessToken(row) || promotionChecking"
                   @click="checkPromotions([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="单独检测账单类型">
+              <span>
+                <el-button
+                  text
+                  type="primary"
+                  :icon="CreditCard"
+                  aria-label="检测账单类型"
+                  :loading="checkoutTypeCheckingAccountIds.includes(row.id)"
+                  :disabled="!hasValidAccessToken(row) || checkoutTypeChecking"
+                  @click="checkCheckoutTypes([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="使用代理池全部可用代理检测 OAICS，并按国家统计成功率">
+              <span>
+                <el-button
+                  text
+                  type="warning"
+                  :icon="Search"
+                  aria-label="OAICS 全代理检测"
+                  :loading="oaicsStartingIds.includes(row.id) || row.oaicsScanStatus === 'running'"
+                  :disabled="!hasValidAccessToken(row) || row.oaicsScanStatus === 'running'"
+                  @click="checkOaicsAllProxies([row.id])"
                 />
               </span>
             </el-tooltip>

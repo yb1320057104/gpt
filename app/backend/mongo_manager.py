@@ -21,6 +21,15 @@ DEFAULT_MONGO_DATABASE = os.environ.get(
 )
 
 
+def _mongo_timeout_ms() -> int:
+    """Return a practical timeout for remote MongoDB deployments."""
+    raw_value = os.environ.get("AUTOREGISTER_MONGO_TIMEOUT_MS", "10000")
+    try:
+        return max(2000, int(raw_value))
+    except (TypeError, ValueError):
+        return 10000
+
+
 class MongoManager:
     RETRY_DELAYS = (2, 5, 10, 30)
 
@@ -31,6 +40,7 @@ class MongoManager:
     ) -> None:
         self.uri = uri
         self.database_name = database_name
+        self.timeout_ms = _mongo_timeout_ms()
         self.client: AsyncMongoClient[dict[str, Any]] | None = None
         self.online = False
         self.reconnecting = False
@@ -60,9 +70,9 @@ class MongoManager:
         self._stop_event.clear()
         self.client = AsyncMongoClient(
             self.uri,
-            serverSelectionTimeoutMS=2000,
-            connectTimeoutMS=2000,
-            socketTimeoutMS=5000,
+            serverSelectionTimeoutMS=self.timeout_ms,
+            connectTimeoutMS=self.timeout_ms,
+            socketTimeoutMS=max(15000, self.timeout_ms),
             maxPoolSize=20,
             minPoolSize=0,
             retryReads=True,

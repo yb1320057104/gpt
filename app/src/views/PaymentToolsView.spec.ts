@@ -73,6 +73,8 @@ describe('PaymentToolsView', () => {
       concurrency: 4,
       maxConcurrency: 10,
     })
+    vi.spyOn(dataGateway, 'listPaymentExtractorAccounts').mockResolvedValue([])
+    vi.spyOn(dataGateway, 'listProxyGroups').mockResolvedValue([])
     Object.defineProperty(navigator, 'clipboard', {
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
       configurable: true,
@@ -103,7 +105,7 @@ describe('PaymentToolsView', () => {
     vi.restoreAllMocks()
   })
 
-  it('extracts a batch without rendering or persisting full ATs and round-robins both proxy pools', async () => {
+  it('extracts a batch without rendering or persisting full ATs and submits both proxy pools', async () => {
     const accessTokens = ['ACCESS_TOKEN_ONE_PRIVATE', 'ACCESS_TOKEN_TWO_PRIVATE']
     vi.spyOn(dataGateway, 'extractAccessTokens').mockResolvedValue({
       count: 2,
@@ -155,10 +157,11 @@ describe('PaymentToolsView', () => {
       applyCheckoutUpdate: true,
     })
     expect(create.mock.calls[0]![0].checkoutProxy).toContain('checkout-1.test')
-    expect(create.mock.calls[1]![0].checkoutProxy).toContain('checkout-2.test')
+    expect(create.mock.calls[0]![0].checkoutProxy).toContain('checkout-2.test')
+    expect(create.mock.calls[1]![0].checkoutProxy).toBe(create.mock.calls[0]![0].checkoutProxy)
     expect(create.mock.calls[0]![0].updateProxy).toContain('update-1.test')
-    expect(create.mock.calls[1]![0].updateProxy).toContain('update-2.test')
-    expect(create.mock.calls[0]![0].checkoutProxy).not.toContain('sid-AAAAAAAAAA')
+    expect(create.mock.calls[0]![0].updateProxy).toContain('update-2.test')
+    expect(create.mock.calls[0]![0].rotateCheckoutProxy).toBe(true)
 
     expect(wrapper.text()).not.toContain(accessTokens[0])
     expect(wrapper.text()).not.toContain(accessTokens[1])

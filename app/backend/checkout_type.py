@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
+
+from .oai_payment_extractor.config import country_config
 
 
 CheckoutType = Literal["oaics", "cs"]
@@ -28,6 +31,16 @@ class CheckoutTypeResult:
     checkout_type: CheckoutType
     checked_at: datetime
     checkout_detail: CheckoutTypeDetail | None = None
+    elapsed_ms: int = 0
+
+
+def checkout_currency(country: str) -> str:
+    """Return the currency accepted by the Checkout API for a country."""
+    normalized = str(country or "").strip().upper()
+    try:
+        return str(country_config(normalized)[1]).upper()
+    except Exception as exc:
+        raise CheckoutTypeCheckError("checkout_country_unsupported") from exc
 
 
 def checkout_detail_from_result(
@@ -148,6 +161,8 @@ def check_checkout_type_curl(
     normalized_country = str(country or "").strip().upper()
     if len(normalized_country) != 2:
         raise CheckoutTypeCheckError("checkout_country_missing")
+    started = perf_counter()
+    currency = checkout_currency(normalized_country)
     session = Session(impersonate="chrome")
     session.proxies = {"http": proxy_url, "https": proxy_url}
     try:
@@ -164,7 +179,10 @@ def check_checkout_type_curl(
                 json={
                     "entry_point": "all_plans_pricing_modal",
                     "plan_name": "chatgptplusplan",
-                    "billing_details": {"country": normalized_country},
+                    "billing_details": {
+                        "country": normalized_country,
+                        "currency": currency,
+                    },
                     "checkout_ui_mode": "custom",
                 },
                 allow_redirects=False,
@@ -181,6 +199,12 @@ def check_checkout_type_curl(
             payload = response.json()
         except Exception:
             raise CheckoutTypeCheckError("checkout_type_response_invalid") from None
-        return parse_checkout_type_response(payload)
+        parsed = parse_checkout_type_response(payload)
+        return CheckoutTypeResult(
+            parsed.checkout_type,
+            parsed.checked_at,
+            parsed.checkout_detail,
+            max(0, round((perf_counter() - started) * 1000)),
+        )
     finally:
         session.close()

@@ -100,6 +100,10 @@ def first_value_by_key(payload: Any, key: str) -> Any:
 
 
 def merge_checkout_payload(checkout: CheckoutData, payload: dict[str, Any]) -> None:
+    session_id = extract_checkout_session_id(payload)
+    if session_id:
+        checkout["cs_id"] = session_id
+        checkout["session_kind"] = checkout_session_kind(session_id)
     processor = extract_processor_entity(payload)
     if processor:
         checkout["processor_entity"] = processor
@@ -229,6 +233,23 @@ def update_checkout(
     }
     set_proxy_url(chatgpt, config.update_proxy)
     try:
+        try:
+            stage_http_request(
+                chatgpt,
+                "Update 线路 CSRF 预热",
+                "GET",
+                "https://chatgpt.com/api/auth/csrf",
+                log,
+                headers={
+                    "Accept": "application/json,text/plain,*/*",
+                    "Referer": f"https://chatgpt.com/checkout/{processor}/{checkout['cs_id']}",
+                },
+                timeout=min(DEFAULT_TIMEOUT, 20),
+            )
+        except Exception:
+            # CSRF warmup is best-effort; checkout/update still provides the
+            # authoritative response and detailed request log.
+            pass
         response = stage_http_request(
             chatgpt,
             "ChatGPT checkout/update",
@@ -251,6 +272,9 @@ def update_checkout(
     if payload.get("success") is False:
         raise ProtocolError(409, f"checkout/update rejected: {safe_log_text(payload)}")
     merge_checkout_payload(checkout, payload)
+    # The coupon precheck and checkout/update response can disagree.  Treat
+    # one_click_trial_eligible=false as advisory and let the authoritative
+    # Stripe amount/confirmation checks decide whether the flow can continue.
     return payload
 
 

@@ -7,7 +7,7 @@ from .models import BillingProfile
 
 
 DEFAULT_TIMEOUT = 30
-PROVIDER_POLL_TIMEOUT_SECONDS = 5
+PROVIDER_POLL_TIMEOUT_SECONDS = 20
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -63,11 +63,24 @@ _BILLING_VALUES = {
     "IN": ("Aisha Sharma", "aisha.sharma@example.com", "+919810123456", "24 Park Street", "Kolkata", "West Bengal", "700016"),
     "PL": ("Jan Kowalski", "jan.kowalski@example.com", "+48221234567", "Marszalkowska 1", "Warsaw", "Masovian", "00-001"),
     "CH": ("Alex Meyer", "alex.meyer@example.com", "+41441234567", "Bahnhofstrasse 1", "Zurich", "Zurich", "8001"),
-    "KR": ("Kim Minjun", "minjun.kim@example.com", "+82212345678", "Teheran-ro 1", "Seoul", "Gangnam-gu", "06130"),
+    "KR": ("김민준", "minjun.kim@example.com", "+821012345678", "테헤란로 87", "서울특별시", "강남구", "06164"),
     "VN": ("Nguyen Minh Anh", "minh.anh@example.com", "+842812345678", "1 Le Duan", "Ho Chi Minh City", "Ho Chi Minh", "700000"),
 }
 
 SUPPORTED_COUNTRIES = tuple(COUNTRY_PROFILES)
+
+PAYMENT_METHOD_PROFILES = {
+    "paypal": {"country": None, "currency": None, "result_kind": "redirect"},
+    "gopay": {"country": "ID", "currency": "IDR", "result_kind": "redirect"},
+    "gcash": {"country": "PH", "currency": "PHP", "result_kind": "redirect"},
+    "ideal": {"country": "NL", "currency": "EUR", "result_kind": "redirect"},
+    "upi": {"country": "IN", "currency": "INR", "result_kind": "qr_or_deep_link"},
+    "pix": {"country": "BR", "currency": "BRL", "result_kind": "qr_or_deep_link"},
+    "blik": {"country": "PL", "currency": "PLN", "result_kind": "confirmation", "enabled": False},
+    "twint": {"country": "CH", "currency": "CHF", "result_kind": "qr_or_deep_link"},
+    "kakao_pay": {"country": "KR", "currency": "KRW", "result_kind": "qr_or_deep_link"},
+    "momo": {"country": "VN", "currency": "VND", "result_kind": "qr_or_deep_link"},
+}
 
 
 def country_config(country: str) -> tuple[str, str, str, str]:
@@ -107,17 +120,33 @@ def currency_minor_scale(currency: str) -> int:
 def payment_currency(country: str, payment_method: str) -> str:
     """Resolve currencies that differ by payment method within one country."""
     method = str(payment_method or "").strip().lower()
-    if method == "pix" and str(country or "").upper() == "BR":
-        return "BRL"
+    profile = PAYMENT_METHOD_PROFILES.get(method) or {}
+    expected_country = profile.get("country")
+    if expected_country and str(country or "").upper() == expected_country:
+        return str(profile["currency"])
     return country_config(country)[1]
+
+
+def payment_method_profile(payment_method: str) -> dict[str, str | bool | None]:
+    method = normalize_payment_method(payment_method)
+    return dict(PAYMENT_METHOD_PROFILES[method])
+
+
+def validate_payment_country(payment_method: str, country: str) -> None:
+    profile = payment_method_profile(payment_method)
+    if profile.get("enabled") is False:
+        raise ConfigurationError("BLIK 需要一次性支付验证码，当前安全模式下暂不开放自动提交")
+    expected = profile.get("country")
+    actual = str(country or "").upper()
+    if expected and actual != expected:
+        raise ConfigurationError(
+            f"{payment_method} 仅支持账单国家 {expected}，当前选择为 {actual or '未设置'}"
+        )
 
 
 def normalize_payment_method(value: str) -> str:
     method = str(value or "paypal").strip().lower() or "paypal"
-    supported = {
-        "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
-        "twint", "kakao_pay", "momo",
-    }
+    supported = set(PAYMENT_METHOD_PROFILES)
     if method not in supported:
         raise ConfigurationError("payment_method must be one of " + ", ".join(sorted(supported)))
     return method

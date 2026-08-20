@@ -18,6 +18,8 @@ from .oai_payment_extractor.config import (
     SUPPORTED_COUNTRIES,
     country_config,
     normalize_payment_method,
+    payment_method_profile,
+    validate_payment_country,
 )
 from .oai_payment_extractor.errors import ConfigurationError
 from .oai_payment_extractor.logging_utils import configure_logging
@@ -86,6 +88,11 @@ class PaymentExtractorTaskCreate(ExtractorModel):
         max_length=MAX_TOKEN_CHARS,
         validation_alias=AliasChoices("accessToken", "access_token", "token"),
     )
+    accountId: str = Field(
+        default="",
+        max_length=128,
+        validation_alias=AliasChoices("accountId", "account_id"),
+    )
     checkoutProxy: str = Field(
         default="",
         max_length=MAX_PROXY_POOL_CHARS,
@@ -131,6 +138,13 @@ class PaymentExtractorTaskCreate(ExtractorModel):
         default=False,
         validation_alias=AliasChoices("rotateUpdateProxy", "rotate_update_proxy"),
     )
+    autoRetryCount: int = Field(
+        default=0,
+        ge=0,
+        le=10,
+        validation_alias=AliasChoices("autoRetryCount", "auto_retry_count"),
+    )
+    idealBank: str = Field(default="n26", max_length=64)
 
     @field_validator("accessToken")
     @classmethod
@@ -140,7 +154,7 @@ class PaymentExtractorTaskCreate(ExtractorModel):
             return ""
         return normalize_bearer_token(normalize_session_json(text))
 
-    @field_validator("checkoutProxy", "updateProxy", "stripeHcaptchaToken")
+    @field_validator("accountId", "checkoutProxy", "updateProxy", "stripeHcaptchaToken", "idealBank")
     @classmethod
     def trim_text(cls, value: str) -> str:
         return value.strip()
@@ -502,7 +516,11 @@ class PaymentExtractorService:
             "ok": True,
             "countries": countries,
             "paymentMethods": [
-                {"value": key, "label": label}
+                {
+                    "value": key,
+                    "label": label,
+                    **payment_method_profile(key),
+                }
                 for key, label in PAYMENT_METHOD_LABELS.items()
             ],
             "country": self.force_country or self.default_country,
@@ -558,13 +576,15 @@ class PaymentExtractorService:
 
     def create(self, payload: PaymentExtractorTaskCreate) -> dict[str, Any]:
         access_token = payload.accessToken or self.default_access_token
+        checkout_pool = payload.checkoutProxy or self.default_checkout_proxy
+        update_pool = payload.updateProxy or self.default_update_proxy
         checkout_proxy = self._pick_proxy(
-            payload.checkoutProxy or self.default_checkout_proxy,
+            checkout_pool,
             update=False,
             rotate=payload.rotateCheckoutProxy,
         )
         update_proxy = self._pick_proxy(
-            payload.updateProxy or self.default_update_proxy,
+            update_pool,
             update=True,
             rotate=payload.rotateUpdateProxy,
         )
@@ -573,6 +593,23 @@ class PaymentExtractorService:
             # session for this task.  The frontend may provide a separate
             # update pool, but cross-session egress changes raise payment risk.
             update_proxy = checkout_proxy
+        retry_checkout_proxies: list[str] = []
+        retry_update_proxies: list[str] = []
+        for _ in range(payload.autoRetryCount):
+            next_checkout = self._pick_proxy(
+                checkout_pool,
+                update=False,
+                rotate=payload.rotateCheckoutProxy,
+            )
+            next_update = self._pick_proxy(
+                update_pool,
+                update=True,
+                rotate=payload.rotateUpdateProxy,
+            )
+            if self.sticky_task_proxy and next_checkout:
+                next_update = next_checkout
+            retry_checkout_proxies.append(next_checkout or checkout_proxy)
+            retry_update_proxies.append(next_update or update_proxy)
         country = self.force_country or payload.country or self.default_country
         # A caller-supplied billing country is authoritative.  Proxy usernames
         # may contain an egress hint such as ``region-BR``, but that describes
@@ -600,9 +637,15 @@ class PaymentExtractorService:
             raise PaymentExtractorServiceError(
                 "update_proxy_required", "启用 Checkout Update 时必须填写 Update 代理", http_status=422
             )
-        self._ensure_bridge_for(checkout_proxy, update_proxy)
+        self._ensure_bridge_for(
+            checkout_proxy,
+            update_proxy,
+            *retry_checkout_proxies,
+            *retry_update_proxies,
+        )
         try:
             method = normalize_payment_method(payment_method)
+            validate_payment_country(method, country)
             config = ExtractionConfig(
                 access_token=_normalize_token(access_token),
                 checkout_proxy=checkout_proxy,
@@ -613,6 +656,10 @@ class PaymentExtractorService:
                 apply_checkout_update=apply_checkout_update,
                 verbose=False,
                 oaics_only=payload.checkoutMode == "oaics_only",
+                auto_retry_count=payload.autoRetryCount,
+                retry_checkout_proxies=tuple(retry_checkout_proxies),
+                retry_update_proxies=tuple(retry_update_proxies),
+                ideal_bank=payload.idealBank or "n26",
             )
         except (ConfigurationError, ValueError) as exc:
             raise PaymentExtractorServiceError(
@@ -643,6 +690,9 @@ class PaymentExtractorService:
 
     def cancel(self, task_id: str) -> dict[str, Any]:
         return self._task_action(lambda: self.manager.cancel(task_id))
+
+    def cancel_all(self) -> dict[str, Any]:
+        return _camelize(self.manager.cancel_all())
 
     def retry(
         self, task_id: str, payload: PaymentExtractorTaskRetry
@@ -769,7 +819,10 @@ class PaymentExtractorService:
     def _public_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         source = dict(snapshot)
         configured_proxy = str(source.pop("checkout_proxy", "") or "")
+        structured_logs = source.pop("logs", None)
         public = _camelize(source)
+        if structured_logs is not None:
+            public["logs"] = structured_logs
         if configured_proxy:
             public["checkoutProxyConfigured"] = True
             public["checkoutProxyPreview"] = _proxy_preview(configured_proxy)
