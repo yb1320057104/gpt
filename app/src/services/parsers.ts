@@ -24,9 +24,9 @@ function redactLine(value: string) {
       : `${emailCandidate.slice(0, 8) || '无邮箱'}----••••`
   }
   const proxyParts = trimmed.split(':')
-  if (/^(?:https?|socks5h?):\/\//i.test(trimmed)) {
+  if (/^(?:https?|socks5h?):\/\//i.test(trimmed) || trimmed.includes('@')) {
     try {
-      const url = new URL(trimmed)
+      const url = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`)
       return `${url.protocol}//ACCOUNT:TOKEN@${url.hostname}:${url.port}`
     } catch {
       return '代理 URL 格式不可识别'
@@ -120,9 +120,9 @@ export function parseProxyImport(
     let password = ''
     let port = 0
     let scheme: ProxyScheme = 'http'
-    if (value.includes('://')) {
+    if (value.includes('://') || value.includes('@') || /^\[.*\]:\d+$/.test(value)) {
       try {
-        const url = new URL(value)
+        const url = new URL(value.includes('://') ? value : `http://${value}`)
         const parsedScheme = url.protocol.replace(':', '').toLowerCase()
         if (!['http', 'https', 'socks5', 'socks5h'].includes(parsedScheme)) throw new Error('unsupported scheme')
         scheme = parsedScheme as ProxyScheme
@@ -136,19 +136,33 @@ export function parseProxyImport(
       }
     } else {
       const parts = value.split(':')
-      if (parts.length < 4) {
-        errors.push({ line, reason: '代理必须是 URL 或 host:port:username:password', preview: redactLine(value) })
+      if (parts.length === 2) {
+        host = parts[0]?.trim() ?? ''
+        port = Number(parts[1])
+      } else if (parts.length >= 4 && /^\d+$/.test(parts[1] ?? '')) {
+        const [hostRaw, portRaw, usernameRaw, ...passwordParts] = parts
+        host = hostRaw?.trim() ?? ''
+        username = usernameRaw?.trim() ?? ''
+        password = passwordParts.join(':').trim()
+        port = Number(portRaw)
+      } else if (parts.length === 4 && /^\d+$/.test(parts[3] ?? '')) {
+        const [usernameRaw, passwordRaw, hostRaw, portRaw] = parts
+        host = hostRaw?.trim() ?? ''
+        username = usernameRaw?.trim() ?? ''
+        password = passwordRaw?.trim() ?? ''
+        port = Number(portRaw)
+      } else {
+        errors.push({ line, reason: '代理格式无法识别', preview: redactLine(value) })
         return
       }
-      const [hostRaw, portRaw, usernameRaw, ...passwordParts] = parts
-      host = hostRaw?.trim() ?? ''
-      username = usernameRaw?.trim() ?? ''
-      password = passwordParts.join(':').trim()
-      port = Number(portRaw)
     }
 
-    if (!host || !username || !password) {
-      errors.push({ line, reason: '主机、用户名和密码不能为空', preview: redactLine(value) })
+    if (!host) {
+      errors.push({ line, reason: '代理主机不能为空', preview: redactLine(value) })
+      return
+    }
+    if ((username && !password) || (!username && password)) {
+      errors.push({ line, reason: '代理用户名和密码必须同时填写', preview: redactLine(value) })
       return
     }
     if (!Number.isInteger(port) || port < 1 || port > 65535) {

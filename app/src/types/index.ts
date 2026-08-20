@@ -33,6 +33,7 @@ export interface AccountRecord {
   aliveCheckedAt?: string | null
   aliveErrorCode?: string | null
   aliveHttpStatus?: number | null
+  alive15mVerifiedAt?: string | null
   globalPromotionStatus?: 'pending' | 'running' | 'eligible' | 'ineligible' | 'failed' | null
   globalPromotionEligible?: boolean | null
   globalPromotionCheckedAt?: string | null
@@ -240,7 +241,12 @@ export interface ExecutionSettingsInput {
   taskTimeoutSeconds: number
 }
 
-export type ExportFormat = 'credentials' | 'mail-links' | 'mail-links-totp' | 'access-tokens'
+export type ExportFormat =
+  | 'credentials'
+  | 'password-mail-links'
+  | 'mail-links'
+  | 'mail-links-totp'
+  | 'access-tokens'
 export type ExportScope = 'single' | 'selected' | 'all'
 
 export interface AccountExport {

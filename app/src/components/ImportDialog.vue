@@ -24,12 +24,12 @@ const submitting = ref(false)
 const isEmail = computed(() => props.kind === 'email')
 const title = computed(() => (isEmail.value ? '导入邮箱' : '导入代理'))
 const formatHint = computed(() =>
-  isEmail.value ? '邮箱----接码地址 或 邮箱----mail.com 密码' : 'socks5://用户名:密码@主机:端口 或 host:port:username:password',
+  isEmail.value ? '邮箱----接码地址 或 邮箱----mail.com 密码' : '支持 HTTP(S)/SOCKS5；省略协议时自动按 HTTP 解析',
 )
 const placeholder = computed(() =>
   isEmail.value
     ? 'demo@example.com----https://example.invalid/inbox/demo\nuser@gardener.com----mail.com-password'
-    : 'socks5://demo-user:demo-password@proxy.example.com:10000\n\n或粘贴 proxies: 开头的 YAML',
+    : 'host:port\nhost:port:username:password\nusername:password@host:port\nusername:password:host:port\n\n也支持带协议 URL 或 proxies: 开头的 YAML',
 )
 const yamlProxyCount = computed(() => {
   if (isEmail.value || !/^\s*proxies\s*:/m.test(rawText.value)) return 0

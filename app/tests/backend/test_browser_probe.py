@@ -24,12 +24,18 @@ from backend.browser_automation import (
     ProxyNavigationError,
     SecurityNavigationError,
     SecurityNavigationResult,
+    TargetChallengeError,
     TotpEnrollmentChallenge,
     TotpEnrollmentResult,
     VerificationStepError,
     VerificationSubmitResult,
 )
-from backend.browser_probe import ArtifactWriter, BrowserProbeRunner, ProbeFailure
+from backend.browser_probe import (
+    ArtifactWriter,
+    BrowserProbeRunner,
+    ProbeFailure,
+    should_submit_registration_password,
+)
 from backend.chatgpt_plan import AccountPlanResult, PlanCheckError
 from backend.errors import InsufficientEmailsError
 from backend.mailbox_client import (
@@ -58,6 +64,12 @@ class FakeMongo:
         self.online = False
 
 
+def test_auth_bootstrap_signup_forces_password_completion() -> None:
+    assert should_submit_registration_password(False, "auth_bootstrap_signup") is True
+    assert should_submit_registration_password(False, "next_step") is False
+    assert should_submit_registration_password(True, None) is True
+
+
 class FakeStore:
     def __init__(self, proxies: list[ProxyLease], *, lock_available: bool = True) -> None:
         self.proxies = deque(proxies)
@@ -65,6 +77,7 @@ class FakeStore:
         self.acquired: list[str] = []
         self.released: list[str] = []
         self.successes: list[str] = []
+        self.registration_rejections: list[tuple[str, str, str | None]] = []
         self.count_countries: list[str | None] = []
         self.acquire_countries: list[str | None] = []
         self.lock_released = False
@@ -105,6 +118,17 @@ class FakeStore:
 
     async def record_proxy_success(self, proxy_id: str, _latency_ms: int) -> None:
         self.successes.append(proxy_id)
+
+    async def record_proxy_registration_rejection(
+        self,
+        proxy_id: str,
+        *,
+        code: str,
+        observed_country: str | None = None,
+        cooldown_seconds: int = 21_600,
+    ) -> None:
+        del cooldown_seconds
+        self.registration_rejections.append((proxy_id, code, observed_country))
 
 
 class FakeRoxy:
@@ -935,15 +959,18 @@ def test_runner_retries_transient_roxy_browser_create_failure(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    "error_code",
+    ("error_code", "error_type"),
     [
-        "email_continue_timeout",
-        "email_form_reset",
-        "email_post_submit_reset",
+        ("email_continue_timeout", EmailStepError),
+        ("email_form_reset", EmailStepError),
+        ("email_post_submit_reset", EmailStepError),
+        ("auth_session_invalid", PasswordStepError),
+        ("password_next_step_unknown", PasswordStepError),
     ],
 )
-def test_runner_rotates_proxy_after_transient_email_submission_failure(
+def test_runner_rotates_proxy_after_transient_registration_failure(
     error_code: str,
+    error_type: type[EmailStepError] | type[PasswordStepError],
     tmp_path: Path,
 ) -> None:
     fake_store = FakeStore([proxy("p1"), proxy("p2")])
@@ -952,9 +979,9 @@ def test_runner_rotates_proxy_after_transient_email_submission_failure(
     submitted_emails: list[str] = []
     outcomes = deque(
         [
-            EmailStepError(
+            error_type(
                 error_code,
-                "等待邮箱提交后的下一步页面超时",
+                "注册页面进入了可重试的异常状态",
             ),
             AutomationResult(
                 "203.0.*.*",
@@ -991,6 +1018,112 @@ def test_runner_rotates_proxy_after_transient_email_submission_failure(
     assert fake_store.released == ["p1", "p2"]
     assert submitted_emails == ["person@example.com", "person@example.com"]
     assert fake_resources.completed == [("email-id", runner.owner)]
+
+
+def test_runner_rotates_and_cools_down_proxy_after_target_challenge(
+    tmp_path: Path,
+) -> None:
+    fake_store = FakeStore([proxy("p1"), proxy("p2")])
+    fake_resources = FakeResourceStore()
+    fake_roxy = FakeRoxy()
+    outcomes = deque(
+        [
+            TargetChallengeError(
+                "检测到人机验证或挑战页，探测已停止",
+                stage="login",
+                wait_ms=60_000,
+            ),
+            AutomationResult(
+                "203.0.*.*",
+                "https://auth.openai.com/email-verification",
+                123,
+                "verification",
+                1_500,
+                FIXED_SUBMITTED_AT,
+            ),
+        ]
+    )
+    runner = BrowserProbeRunner(
+        settings(),
+        workspace_id=None,
+        hold_seconds=0,
+        artifact_writer=ArtifactWriter(tmp_path),
+        mongo_manager=FakeMongo(),  # type: ignore[arg-type]
+        mailbox_client=FakeMailboxClient(),  # type: ignore[arg-type]
+        roxy_factory=lambda *_args, **_kwargs: fake_roxy,  # type: ignore[arg-type]
+        automation_factory=lambda *_args, **_kwargs: FakeAutomation(
+            outcomes.popleft(), []
+        ),  # type: ignore[arg-type]
+    )
+    runner.store = fake_store  # type: ignore[assignment]
+    runner.resources = fake_resources  # type: ignore[assignment]
+
+    result, exit_code = asyncio.run(runner.run())
+
+    assert exit_code == 0
+    assert result["code"] == "account_access_token_extracted"
+    assert result["attempts"] == 2
+    assert result["attemptErrors"][0]["code"] == "target_challenge_detected"
+    assert fake_store.acquired == ["p1", "p2"]
+    assert fake_store.registration_rejections == [
+        ("p1", "target_challenge_detected", None)
+    ]
+
+
+def test_runner_rotates_immediately_after_egress_country_mismatch(
+    tmp_path: Path,
+) -> None:
+    fake_store = FakeStore([proxy("p1"), proxy("p2")])
+    fake_resources = FakeResourceStore()
+    fake_roxy = FakeRoxy()
+    mismatch = ProxyNavigationError(
+        stage="ip_country",
+        code="egress_country_mismatch",
+        message="代理实际出口国家 JP 与注册国家 GB 不一致",
+        exception_type="CountryMismatch",
+        elapsed_ms=10,
+        timeout_ms=None,
+        net_error=None,
+        expected_country="GB",
+        observed_country="JP",
+    )
+    outcomes = deque(
+        [
+            mismatch,
+            AutomationResult(
+                "203.0.*.*",
+                "https://auth.openai.com/email-verification",
+                123,
+                "verification",
+                1_500,
+                FIXED_SUBMITTED_AT,
+            ),
+        ]
+    )
+    runner = BrowserProbeRunner(
+        settings(),
+        workspace_id=None,
+        hold_seconds=0,
+        artifact_writer=ArtifactWriter(tmp_path),
+        mongo_manager=FakeMongo(),  # type: ignore[arg-type]
+        mailbox_client=FakeMailboxClient(),  # type: ignore[arg-type]
+        roxy_factory=lambda *_args, **_kwargs: fake_roxy,  # type: ignore[arg-type]
+        automation_factory=lambda *_args, **_kwargs: FakeAutomation(
+            outcomes.popleft(), []
+        ),  # type: ignore[arg-type]
+        registration_country="GB",
+    )
+    runner.store = fake_store  # type: ignore[assignment]
+    runner.resources = fake_resources  # type: ignore[assignment]
+
+    result, exit_code = asyncio.run(runner.run())
+
+    assert exit_code == 0
+    assert result["attempts"] == 2
+    assert fake_store.acquired == ["p1", "p2"]
+    assert fake_store.registration_rejections == [
+        ("p1", "egress_country_mismatch", "JP")
+    ]
 
 
 def test_runner_records_terminal_transient_email_failure(tmp_path: Path) -> None:

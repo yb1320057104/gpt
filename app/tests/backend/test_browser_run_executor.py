@@ -19,10 +19,29 @@ from backend.run_manager import (
     RunManager,
     _RoxyCircuitOpened,
     _RunCancellationRequested,
+    browser_worker_start_delay_seconds,
 )
 from backend.resource_models import RunState
 from backend.run_store import MongoRunStore, MongoRunWorkerStore
 from backend.settings_store import StoredExecutionSettings
+
+
+@pytest.mark.parametrize(
+    ("sequence", "concurrency", "expected"),
+    [
+        (1, 5, 0),
+        (2, 5, 5),
+        (5, 5, 20),
+        (6, 5, 0),
+        (3, 1, 0),
+    ],
+)
+def test_browser_worker_start_delay_seconds(
+    sequence: int,
+    concurrency: int,
+    expected: int,
+) -> None:
+    assert browser_worker_start_delay_seconds(sequence, concurrency) == expected
 
 
 class FakeProcess:
@@ -144,6 +163,7 @@ def test_browser_executor_caps_concurrency_and_spawns_once_per_email(tmp_path: P
     active = 0
     max_active = 0
     launches: list[dict[str, str | int]] = []
+    logs: list[tuple[str, dict[str, Any]]] = []
 
     def fake_worker(config, event_queue, cancel_event) -> None:
         nonlocal active, max_active
@@ -161,6 +181,18 @@ def test_browser_executor_caps_concurrency_and_spawns_once_per_email(tmp_path: P
                 }
             )
             ordinal = len(launches)
+        event_queue.put(
+            {
+                "type": "login_diagnostic",
+                "workerId": config["workerId"],
+                "details": {
+                    "event": "continue_click_result",
+                    "outcome": "click_succeeded",
+                    "networkTrace": "POST auth.openai.com/u/login/identifier -> 200",
+                    "privateUnexpectedField": "must-not-be-logged",
+                },
+            }
+        )
         event_queue.put(
             {
                 "type": "stage",
@@ -238,7 +270,9 @@ def test_browser_executor_caps_concurrency_and_spawns_once_per_email(tmp_path: P
             resources=resources,  # type: ignore[arg-type]
             database_call=database_call,
             record_result=record_result,
-            append_log=lambda *_args, **_kwargs: None,
+            append_log=lambda _run_id, _level, event, _message, **kwargs: logs.append(
+                (event, kwargs.get("details", {}))
+            ),
             save_state=lambda: __import__("asyncio").sleep(0),
             kind="browser_probe",
             workspace_ids=(10,),
@@ -268,6 +302,14 @@ def test_browser_executor_caps_concurrency_and_spawns_once_per_email(tmp_path: P
     assert state.failed == state.pending == state.activeWorkers == 0
     assert sorted(resources.released) == [f"email-{index}" for index in range(1, 6)]
     assert probe_store.workspace_release_calls == []
+    diagnostic_logs = [details for event, details in logs if event == "login_diagnostic"]
+    assert len(diagnostic_logs) == 5
+    assert all(
+        details["diagnosticEvent"] == "continue_click_result"
+        and details["outcome"] == "click_succeeded"
+        and "privateUnexpectedField" not in details
+        for details in diagnostic_logs
+    )
     launched_documents = [
         worker_store.documents[str(item["workerId"])] for item in launches
     ]

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import random
 import re
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +47,20 @@ CHATGPT_MFA_ACTIVATE_URL = (
     "https://chatgpt.com/backend-api/accounts/mfa/user/activate_enrollment"
 )
 CHATGPT_MODELS_URL = "https://chatgpt.com/backend-api/models"
+LOW_TRAFFIC_BLOCKED_URL_PATTERNS = (
+    "*://*.browser-intake-datadoghq.com/*",
+    "*://*.statsigapi.net/*",
+    "*://*.featuregates.org/*",
+    "*://*.segment.io/*",
+    "*://*.segment.com/*",
+    "*://*.sentry.io/*",
+    "*://chatgpt.com/*.png*",
+    "*://chatgpt.com/*.jpg*",
+    "*://chatgpt.com/*.jpeg*",
+    "*://chatgpt.com/*.webp*",
+    "*://chatgpt.com/*.woff*",
+    "*://chatgpt.com/*.woff2*",
+)
 SESSION_RESPONSE_MAX_BYTES = 65_536
 ACCESS_TOKEN_MAX_CHARS = 16_384
 VERIFICATION_PATTERN = re.compile(
@@ -235,6 +250,11 @@ AUTH_RETRY_PAGE_PATTERN = re.compile(
     r"tekrar\s+dene|yeniden\s+dene|önce\s+dene",
     re.IGNORECASE,
 )
+AUTH_INVALID_STATE_PATTERN = re.compile(
+    r"session\s+ended|sign-in\s+session\s+is\s+no\s+longer\s+valid|"
+    r"error_code\s*:\s*invalid_state|\binvalid_state\b",
+    re.IGNORECASE,
+)
 ACCOUNT_DEACTIVATED_PATTERN = re.compile(
     r"account_deactivated|"
     r"account.{0,80}(?:deleted|deactivated|disabled)|"
@@ -263,6 +283,8 @@ class ProxyNavigationError(RuntimeError):
         elapsed_ms: int,
         timeout_ms: int | None,
         net_error: str | None,
+        expected_country: str | None = None,
+        observed_country: str | None = None,
     ) -> None:
         super().__init__(message)
         self.stage = stage
@@ -272,6 +294,8 @@ class ProxyNavigationError(RuntimeError):
         self.elapsed_ms = elapsed_ms
         self.timeout_ms = timeout_ms
         self.net_error = net_error
+        self.expected_country = expected_country
+        self.observed_country = observed_country
 
     def as_attempt_error(self, *, attempt: int, proxy_id: str) -> dict[str, Any]:
         return {
@@ -284,6 +308,8 @@ class ProxyNavigationError(RuntimeError):
             "netError": self.net_error,
             "elapsedMs": self.elapsed_ms,
             "timeoutMs": self.timeout_ms,
+            "expectedCountry": self.expected_country,
+            "observedCountry": self.observed_country,
         }
 
 
@@ -651,6 +677,27 @@ def sanitize_url(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def safe_login_network_event(
+    kind: str,
+    url: str,
+    method: str,
+    *,
+    status: int | None = None,
+    failure: str | None = None,
+) -> str | None:
+    parsed = urlsplit(str(url))
+    host = (parsed.hostname or "").casefold()
+    if host not in {"chatgpt.com", "auth.openai.com"}:
+        return None
+    path = parsed.path[:160] or "/"
+    safe_method = str(method or "GET").upper()[:12]
+    if kind == "response" and status is not None:
+        return f"{safe_method} {host}{path} -> {int(status)}"
+    net_error = NET_ERROR_PATTERN.search(str(failure or ""))
+    safe_failure = net_error.group(0).upper() if net_error else "REQUEST_FAILED"
+    return f"{safe_method} {host}{path} -> {safe_failure}"
+
+
 def contains_challenge(text: str) -> bool:
     lowered = text.casefold()
     return any(marker in lowered for marker in CHALLENGE_MARKERS)
@@ -750,6 +797,11 @@ class CdpBrowserAutomation:
         random_randint: Callable[[int, int], int] | None = None,
         delay_sleep: Callable[[float], Awaitable[Any]] | None = None,
         utc_now: Callable[[], datetime] | None = None,
+        diagnostic_callback: (
+            Callable[[str, dict[str, Any]], Awaitable[Any]] | None
+        ) = None,
+        low_traffic_enabled: bool = True,
+        expected_egress_country: str | None = None,
     ) -> None:
         if (
             pre_fill_delay_min_seconds < 0
@@ -790,6 +842,9 @@ class CdpBrowserAutomation:
         normalized_screen_hint = str(signup_screen_hint).strip().casefold()
         if normalized_screen_hint not in {"login_or_signup", "signup"}:
             raise ValueError("注册 screen_hint 配置无效")
+        normalized_country = str(expected_egress_country or "").strip().upper()
+        if normalized_country and not re.fullmatch(r"[A-Z]{2}", normalized_country):
+            raise ValueError("预期出口国家必须是两位国家码")
         self.ws_endpoint = ws_endpoint
         self.screenshot_path = Path(screenshot_path)
         self.playwright_factory = playwright_factory
@@ -828,9 +883,63 @@ class CdpBrowserAutomation:
         self.random_randint = random_randint or random.randint
         self.delay_sleep = delay_sleep or asyncio.sleep
         self.utc_now = utc_now or (lambda: datetime.now(timezone.utc))
+        self.diagnostic_callback = diagnostic_callback
+        self.low_traffic_enabled = bool(low_traffic_enabled)
+        self.expected_egress_country = normalized_country or None
         self._playwright: Any = None
         self._browser: Any = None
         self._active_page: Any = None
+        self._traffic_cdp_session: Any = None
+        self._traffic_filter_installed = False
+        self._traffic_filter_error = False
+        self._traffic_downloaded_bytes = 0
+        self._traffic_blocked_requests = 0
+
+    async def _emit_diagnostic(self, event: str, **details: Any) -> None:
+        if self.diagnostic_callback is None:
+            return
+        details = {
+            **details,
+            "trafficFilterInstalled": self._traffic_filter_installed,
+            "trafficFilterError": self._traffic_filter_error,
+            "trafficDownloadedBytes": self._traffic_downloaded_bytes,
+            "trafficBlockedRequests": self._traffic_blocked_requests,
+        }
+        with suppress(Exception):
+            await self.diagnostic_callback(event, details)
+
+    async def _install_low_traffic_filter(self, page: Any) -> None:
+        if not self.low_traffic_enabled or self._traffic_cdp_session is not None:
+            return
+        try:
+            context = getattr(page, "context", None)
+            session_factory = getattr(context, "new_cdp_session", None)
+            if not callable(session_factory):
+                self._traffic_filter_error = True
+                return
+            session = await session_factory(page)
+
+            def loading_finished(params: dict[str, Any]) -> None:
+                self._traffic_downloaded_bytes += max(
+                    0,
+                    int(params.get("encodedDataLength") or 0),
+                )
+
+            def loading_failed(params: dict[str, Any]) -> None:
+                if params.get("blockedReason"):
+                    self._traffic_blocked_requests += 1
+
+            session.on("Network.loadingFinished", loading_finished)
+            session.on("Network.loadingFailed", loading_failed)
+            await session.send("Network.enable")
+            await session.send(
+                "Network.setBlockedURLs",
+                {"urls": list(LOW_TRAFFIC_BLOCKED_URL_PATTERNS)},
+            )
+            self._traffic_cdp_session = session
+            self._traffic_filter_installed = True
+        except Exception:
+            self._traffic_filter_error = True
 
     async def __aenter__(self) -> "CdpBrowserAutomation":
         if self.playwright_factory is None:
@@ -1880,8 +1989,114 @@ class CdpBrowserAutomation:
             )
         return None
 
+    async def _recover_via_openai_auth(
+        self,
+        page: Any,
+        email: str,
+    ) -> dict[str, str | int | bool]:
+        try:
+            result = await page.evaluate(
+                """
+                async ({ email }) => {
+                  const csrfResponse = await fetch('/api/auth/csrf', {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: {accept: 'application/json'},
+                  });
+                  const csrf = await csrfResponse.json().catch(() => ({}));
+                  const csrfToken = String(csrf.csrfToken || '');
+                  if (!csrfResponse.ok || !csrfToken) {
+                    return {ok:false, stage:'csrf', status:csrfResponse.status || 0};
+                  }
+                  const deviceCookie = document.cookie
+                    .split(';')
+                    .map(value => value.trim())
+                    .find(value => value.startsWith('oai-did='));
+                  const deviceId = deviceCookie
+                    ? decodeURIComponent(deviceCookie.slice('oai-did='.length))
+                    : crypto.randomUUID();
+                  const query = new URLSearchParams({
+                    prompt: 'login',
+                    'ext-oai-did': deviceId,
+                    auth_session_logging_id: crypto.randomUUID(),
+                    'ext-passkey-client-capabilities': '0111',
+                    screen_hint: 'signup',
+                    login_hint: email,
+                  });
+                  const body = new URLSearchParams({
+                    callbackUrl: 'https://chatgpt.com/',
+                    csrfToken,
+                    json: 'true',
+                  });
+                  const signinResponse = await fetch(
+                    `/api/auth/signin/openai?${query.toString()}`,
+                    {
+                      method: 'POST',
+                      credentials: 'include',
+                      redirect: 'follow',
+                      headers: {
+                        accept: 'application/json',
+                        'content-type': 'application/x-www-form-urlencoded',
+                      },
+                      body: body.toString(),
+                    },
+                  );
+                  const payload = await signinResponse.json().catch(() => ({}));
+                  return {
+                    ok: signinResponse.ok && Boolean(payload.url),
+                    stage: 'signin',
+                    status: signinResponse.status || 0,
+                    url: String(payload.url || ''),
+                  };
+                }
+                """,
+                {"email": email},
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stage": "evaluate",
+                "status": 0,
+                "exceptionType": _safe_exception_type(exc),
+            }
+
+        if not isinstance(result, dict):
+            return {"ok": False, "stage": "response", "status": 0}
+        auth_url = str(result.get("url") or "")
+        parsed = urlsplit(auth_url)
+        if (
+            not result.get("ok")
+            or parsed.scheme != "https"
+            or (parsed.hostname or "").casefold()
+            not in {"auth.openai.com", "chatgpt.com"}
+        ):
+            return {
+                "ok": False,
+                "stage": str(result.get("stage") or "response")[:32],
+                "status": int(result.get("status") or 0),
+            }
+        try:
+            await page.goto(
+                auth_url,
+                wait_until="domcontentloaded",
+                timeout=self.login_navigation_timeout_ms,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "stage": "navigation",
+                "status": int(result.get("status") or 0),
+                "exceptionType": _safe_exception_type(exc),
+            }
+        return {
+            "ok": True,
+            "stage": "navigation",
+            "status": int(result.get("status") or 0),
+        }
+
     async def submit_email_and_continue(self, email: str) -> AutomationResult:
         page = await self._page()
+        await self._install_low_traffic_filter(page)
         started = monotonic()
         stage_started = monotonic()
         try:
@@ -1935,6 +2150,25 @@ class CdpBrowserAutomation:
                 timeout_ms=None,
             ) from None
 
+        if (
+            self.expected_egress_country is not None
+            and egress_country != self.expected_egress_country
+        ):
+            raise ProxyNavigationError(
+                stage="ip_country",
+                code="egress_country_mismatch",
+                message=(
+                    f"代理实际出口国家 {egress_country} 与注册国家 "
+                    f"{self.expected_egress_country} 不一致"
+                ),
+                exception_type="CountryMismatch",
+                elapsed_ms=max(0, int((monotonic() - stage_started) * 1000)),
+                timeout_ms=None,
+                net_error=None,
+                expected_country=self.expected_egress_country,
+                observed_country=egress_country,
+            )
+
         signup_bootstrap_started_at_utc: datetime | None = None
         if self.signup_screen_hint == "signup":
             signup_bootstrap_started_at_utc = self.utc_now()
@@ -1978,6 +2212,14 @@ class CdpBrowserAutomation:
         email_form_ready_wait_ms = 0
         email_pre_continue_stable_waits_ms: list[int] = []
         email_form_stability_reset_count = 0
+
+        await self._emit_diagnostic(
+            "login_page_ready",
+            url=sanitize_url(page.url),
+            egressCountry=egress_country,
+            challengeObserved=login_challenge_observed,
+            bodyLength=len(body_text),
+        )
 
         def stability_diagnostics() -> dict[str, Any]:
             return {
@@ -2083,10 +2325,20 @@ class CdpBrowserAutomation:
             email_form_stability_reset_count += (
                 ready_result.stability_reset_count
             )
+            await self._emit_diagnostic(
+                "email_form_ready",
+                fillAttempt=fill_attempt,
+                state=ready_result.status,
+                waitMs=ready_result.wait_ms,
+                stabilityResets=ready_result.stability_reset_count,
+                challengeObserved=ready_result.challenge_observed,
+                url=sanitize_url(page.url),
+            )
             if ready_result.status == "next_step":
                 if ready_result.next_step is None:
                     raise RuntimeError("邮箱页面恢复状态缺失")
-                email_continue_recovery_state = "next_step"
+                if email_continue_recovery_state is None:
+                    email_continue_recovery_state = "next_step"
                 return build_result(ready_result.next_step)
             if ready_result.status == "challenge_timeout":
                 await self._safe_screenshot(page)
@@ -2125,6 +2377,14 @@ class CdpBrowserAutomation:
                     **stability_diagnostics(),
                 )
 
+            await self._emit_diagnostic(
+                "email_filled",
+                fillAttempt=fill_attempt,
+                valueLength=len(filled_value),
+                valueMatched=True,
+                url=sanitize_url(page.url),
+            )
+
             email_fill_attempts = fill_attempt
             generated_delay = float(
                 self.random_uniform(
@@ -2160,10 +2420,20 @@ class CdpBrowserAutomation:
             email_form_stability_reset_count += (
                 pre_continue_result.stability_reset_count
             )
+            await self._emit_diagnostic(
+                "pre_continue_stability",
+                fillAttempt=fill_attempt,
+                state=pre_continue_result.status,
+                waitMs=pre_continue_result.wait_ms,
+                stabilityResets=pre_continue_result.stability_reset_count,
+                challengeObserved=pre_continue_result.challenge_observed,
+                url=sanitize_url(page.url),
+            )
             if pre_continue_result.status == "next_step":
                 if pre_continue_result.next_step is None:
                     raise RuntimeError("邮箱页面恢复状态缺失")
-                email_continue_recovery_state = "next_step"
+                if email_continue_recovery_state is None:
+                    email_continue_recovery_state = "next_step"
                 return build_result(pre_continue_result.next_step)
             if pre_continue_result.status == "challenge_timeout":
                 await self._safe_screenshot(page)
@@ -2228,6 +2498,18 @@ class CdpBrowserAutomation:
                 and button_still_visible
                 and button_still_enabled
             )
+            await self._emit_diagnostic(
+                "continue_pre_click",
+                fillAttempt=fill_attempt,
+                formStable=form_stable,
+                inputHasValue=bool(value_before_click),
+                inputVisible=input_still_visible,
+                inputEnabled=input_still_enabled,
+                inputEditable=input_still_editable,
+                buttonVisible=button_still_visible,
+                buttonEnabled=button_still_enabled,
+                url=sanitize_url(page.url),
+            )
             if not form_stable:
                 email_form_stability_reset_count += 1
                 if value_before_click != "":
@@ -2254,13 +2536,70 @@ class CdpBrowserAutomation:
             submitted_at_utc = submitted_at_utc.astimezone(timezone.utc)
             email_continue_attempts += 1
             email_continue_attempt_states.append("click_started")
-            click_outcome, observed_step, click_error = (
-                await self._click_email_and_observe(
-                    page,
-                    refreshed_continue_button.first,
-                    final_url,
-                    email,
+            click_started = monotonic()
+            click_initial_url = sanitize_url(page.url)
+            network_trace: list[str] = []
+
+            def record_response(response: Any) -> None:
+                if len(network_trace) >= 12:
+                    return
+                request = getattr(response, "request", None)
+                item = safe_login_network_event(
+                    "response",
+                    str(getattr(response, "url", "")),
+                    str(getattr(request, "method", "GET")),
+                    status=int(getattr(response, "status", 0) or 0),
                 )
+                if item is not None:
+                    network_trace.append(item)
+
+            def record_request_failure(request: Any) -> None:
+                if len(network_trace) >= 12:
+                    return
+                item = safe_login_network_event(
+                    "failure",
+                    str(getattr(request, "url", "")),
+                    str(getattr(request, "method", "GET")),
+                    failure=str(getattr(request, "failure", "")),
+                )
+                if item is not None:
+                    network_trace.append(item)
+
+            page_on = getattr(page, "on", None)
+            page_remove_listener = getattr(page, "remove_listener", None)
+            listeners_attached = callable(page_on)
+            if listeners_attached:
+                page_on("response", record_response)
+                page_on("requestfailed", record_request_failure)
+            try:
+                click_outcome, observed_step, click_error = (
+                    await self._click_email_and_observe(
+                        page,
+                        refreshed_continue_button.first,
+                        final_url,
+                        email,
+                    )
+                )
+            finally:
+                if listeners_attached and callable(page_remove_listener):
+                    page_remove_listener("response", record_response)
+                    page_remove_listener("requestfailed", record_request_failure)
+            click_current_url = sanitize_url(page.url)
+            await self._emit_diagnostic(
+                "continue_click_result",
+                fillAttempt=fill_attempt,
+                clickAttempt=email_continue_attempts,
+                outcome=click_outcome,
+                observedStep=observed_step or "",
+                exceptionType=(
+                    _safe_exception_type(click_error)
+                    if click_error is not None
+                    else ""
+                ),
+                elapsedMs=max(0, int((monotonic() - click_started) * 1000)),
+                url=click_current_url,
+                urlChanged=click_current_url != click_initial_url,
+                networkTrace=" | ".join(network_trace) or "none_observed",
             )
             if click_error is not None:
                 email_continue_click_failures += 1
@@ -2301,6 +2640,13 @@ class CdpBrowserAutomation:
                 if reconciled_step == "email_form_stable":
                     email_continue_recovery_state = "stable_form_retry"
                 elif reconciled_step == "email_form_reset":
+                    await self._emit_diagnostic(
+                        "email_form_reset_observed",
+                        fillAttempt=fill_attempt,
+                        clickAttempt=email_continue_attempts,
+                        url=sanitize_url(page.url),
+                        resetCount=email_post_submit_reset_count + 1,
+                    )
                     email_post_submit_reset_count += 1
                     email_continue_recovery_state = "form_reset"
                 if fill_attempt >= 2 or email_continue_attempts >= 2:
@@ -2334,6 +2680,20 @@ class CdpBrowserAutomation:
                         screenshot_captured=screenshot_captured,
                         **stability_diagnostics(),
                     ) from None
+                if reconciled_step == "email_form_reset":
+                    recovery = await self._recover_via_openai_auth(page, email)
+                    if recovery.get("ok"):
+                        email_continue_recovery_state = "auth_bootstrap_signup"
+                    await self._emit_diagnostic(
+                        "auth_bootstrap_recovery",
+                        fillAttempt=fill_attempt,
+                        clickAttempt=email_continue_attempts,
+                        recoveryOk=bool(recovery.get("ok")),
+                        recoveryStage=str(recovery.get("stage") or ""),
+                        recoveryStatus=int(recovery.get("status") or 0),
+                        exceptionType=str(recovery.get("exceptionType") or ""),
+                        url=sanitize_url(page.url),
+                    )
                 continue
 
             try:
@@ -2360,6 +2720,13 @@ class CdpBrowserAutomation:
                     continue
                 raise
             if next_step == "email_form_reset":
+                await self._emit_diagnostic(
+                    "email_form_reset_observed",
+                    fillAttempt=fill_attempt,
+                    clickAttempt=email_continue_attempts,
+                    url=sanitize_url(page.url),
+                    resetCount=email_post_submit_reset_count + 1,
+                )
                 email_post_submit_reset_count += 1
                 email_continue_recovery_state = "form_reset"
                 if email_continue_recovery_started_at is None:
@@ -2384,8 +2751,28 @@ class CdpBrowserAutomation:
                         screenshot_captured=screenshot_captured,
                         **stability_diagnostics(),
                     )
+                recovery = await self._recover_via_openai_auth(page, email)
+                if recovery.get("ok"):
+                    email_continue_recovery_state = "auth_bootstrap_signup"
+                await self._emit_diagnostic(
+                    "auth_bootstrap_recovery",
+                    fillAttempt=fill_attempt,
+                    clickAttempt=email_continue_attempts,
+                    recoveryOk=bool(recovery.get("ok")),
+                    recoveryStage=str(recovery.get("stage") or ""),
+                    recoveryStatus=int(recovery.get("status") or 0),
+                    exceptionType=str(recovery.get("exceptionType") or ""),
+                    url=sanitize_url(page.url),
+                )
                 continue
 
+            await self._emit_diagnostic(
+                "email_next_step_observed",
+                fillAttempt=fill_attempt,
+                clickAttempt=email_continue_attempts,
+                state=next_step,
+                url=sanitize_url(page.url),
+            )
             if email_continue_recovery_state is None:
                 email_continue_recovery_state = "next_step"
             return build_result(next_step)
@@ -2542,6 +2929,12 @@ class CdpBrowserAutomation:
                 raise TargetChallengeError(
                     "检测到人机验证或挑战页，探测已停止",
                     stage="password",
+                )
+            if AUTH_INVALID_STATE_PATTERN.search(body_text):
+                await self._safe_screenshot(page)
+                raise PasswordStepError(
+                    "auth_session_invalid",
+                    "认证事务状态已失效，需要更换代理后重试",
                 )
             if AUTHENTICATOR_FACTOR_PATTERN.search(body_text):
                 await self._safe_screenshot(page)

@@ -382,6 +382,27 @@ def test_structured_code_is_parsed_when_subject_follows_code_field() -> None:
     assert snapshot.received_offset == "+08:00"
 
 
+def test_freemail_token_endpoint_shape_is_parsed() -> None:
+    snapshot = parse_mailbox_snapshot(
+        """{
+          "success": true,
+          "email": "generated@xiangshengjie.com",
+          "code": "471205",
+          "verification_code": "471205",
+          "received_at": "2026-08-21T10:30:45Z",
+          "receivedAt": "2026-08-21T10:30:45Z",
+          "message_id": 42,
+          "subject": "Your ChatGPT verification code"
+        }""",
+        "application/json; charset=utf-8",
+    )
+
+    assert snapshot.verification_code == "471205"
+    assert snapshot.received_at_utc == datetime(2026, 8, 21, 10, 30, 45, tzinfo=UTC)
+    assert snapshot.received_offset == "+00:00"
+    assert snapshot.service_success is True
+
+
 def test_icloud_privacy_mail_japanese_code_field_needs_no_keyword_match() -> None:
     snapshot = parse_mailbox_snapshot(
         """{

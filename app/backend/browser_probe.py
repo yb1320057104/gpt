@@ -49,6 +49,7 @@ from .mailbox_client import (
 )
 from .mongo_manager import MongoManager
 from .probe_store import MongoProbeStore, ProxyLease
+from .proxy_session import with_registration_sticky_session
 from .resource_service import MongoResourceStore
 from .roxy_client import (
     MANAGED_BROWSER_PREFIX,
@@ -77,12 +78,23 @@ TRANSIENT_REGISTRATION_PROXY_ERRORS = frozenset(
         "continue_click_failed",
         "email_next_step_unknown",
         "email_form_not_stable",
+        "auth_session_invalid",
+        "password_next_step_unknown",
         "verification_continue_click_failed",
         "verification_retry_form_missing",
         "verification_next_step_unknown",
         "verification_form_unchanged_after_click",
     }
 )
+
+
+def should_submit_registration_password(
+    required_by_settings: bool,
+    recovery_state: str | None,
+) -> bool:
+    return bool(
+        required_by_settings or recovery_state == "auth_bootstrap_signup"
+    )
 
 
 def generate_account_password() -> str:
@@ -380,6 +392,7 @@ class BrowserProbeRunner:
                     )
                     if lease is None:
                         break
+                    lease = with_registration_sticky_session(lease)
                     excluded.add(lease.id)
                     last_proxy_id = lease.id
                     self.current_proxy_id = lease.id
@@ -405,10 +418,60 @@ class BrowserProbeRunner:
                                     lease.id,
                                     total_attempts,
                                 )
-                                if attempt < self.settings.proxyRetryCount:
+                                country_mismatch = (
+                                    exc.code == "egress_country_mismatch"
+                                )
+                                if country_mismatch:
+                                    await self.store.record_proxy_registration_rejection(
+                                        lease.id,
+                                        code=exc.code,
+                                        observed_country=exc.observed_country,
+                                    )
+                                if (
+                                    not country_mismatch
+                                    and attempt < self.settings.proxyRetryCount
+                                ):
                                     continue
+                                if (
+                                    registration_proxy_rotations
+                                    >= self.max_registration_proxy_rotations
+                                ):
+                                    raise
+                                registration_proxy_rotations += 1
                                 break
-                            except (EmailStepError, VerificationStepError) as exc:
+                            except TargetChallengeError as exc:
+                                self.attempt_errors.append(
+                                    {
+                                        "attempt": total_attempts,
+                                        "proxyId": lease.id,
+                                        "stage": exc.stage or "login",
+                                        "code": "target_challenge_detected",
+                                        "message": str(exc),
+                                        "exceptionType": type(exc).__name__,
+                                        "waitMs": exc.wait_ms,
+                                    }
+                                )
+                                self._write_attempt_failure(
+                                    workspace.id,
+                                    lease.id,
+                                    total_attempts,
+                                )
+                                await self.store.record_proxy_registration_rejection(
+                                    lease.id,
+                                    code="target_challenge_detected",
+                                )
+                                if (
+                                    registration_proxy_rotations
+                                    >= self.max_registration_proxy_rotations
+                                ):
+                                    raise
+                                registration_proxy_rotations += 1
+                                break
+                            except (
+                                EmailStepError,
+                                PasswordStepError,
+                                VerificationStepError,
+                            ) as exc:
                                 if exc.code not in TRANSIENT_REGISTRATION_PROXY_ERRORS:
                                     if (
                                         isinstance(exc, EmailStepError)
@@ -432,7 +495,11 @@ class BrowserProbeRunner:
                                         "stage": (
                                             "verification_submission"
                                             if isinstance(exc, VerificationStepError)
-                                            else "email_submission"
+                                            else (
+                                                "password_submission"
+                                                if isinstance(exc, PasswordStepError)
+                                                else "email_submission"
+                                            )
                                         ),
                                         "code": exc.code,
                                         "message": exc.message,
@@ -1623,6 +1690,17 @@ class BrowserProbeRunner:
             )
             open_completed = True
             await self._emit_progress("proxy_check", dirId=dir_id)
+
+            async def automation_diagnostic(
+                event: str,
+                details: dict[str, Any],
+            ) -> None:
+                await self._emit_progress(
+                    "login",
+                    dirId=dir_id,
+                    loginDiagnostic={"event": event, **details},
+                )
+
             async with self.automation_factory(
                 opened.ws,
                 self.artifacts.screenshot_path,
@@ -1631,6 +1709,8 @@ class BrowserProbeRunner:
                     if self.settings.requireRegistrationPassword
                     else "login_or_signup"
                 ),
+                diagnostic_callback=automation_diagnostic,
+                expected_egress_country=self.registration_country,
             ) as automation:
                 await self._emit_progress("login", dirId=dir_id)
                 mailbox_baseline: MailboxSnapshot | None = None
@@ -1683,7 +1763,10 @@ class BrowserProbeRunner:
                 registration_next_step = result.next_step
                 verification_requested_at = result.submitted_at_utc
                 if result.next_step == "password":
-                    if self.settings.requireRegistrationPassword:
+                    if should_submit_registration_password(
+                        self.settings.requireRegistrationPassword,
+                        result.email_continue_recovery_state,
+                    ):
                         await self._emit_progress(
                             "password",
                             dirId=dir_id,

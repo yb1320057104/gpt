@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from .chatgpt_plan import PlanCheckError, check_account_plan_curl
@@ -14,6 +15,24 @@ DEAD_ACCOUNT_ERRORS = frozenset({
     "access_token_expired",
     "access_token_unauthorized",
 })
+ALIVE_15M_MIN_AGE = timedelta(minutes=15)
+
+
+def account_reached_alive_15m_age(
+    created_at: object,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return created_at.astimezone(timezone.utc) <= (
+        current.astimezone(timezone.utc) - ALIVE_15M_MIN_AGE
+    )
 
 
 class AccountAliveCheckService:
@@ -111,9 +130,13 @@ class AccountAliveCheckService:
                     id=account_id, status="failed", errorCode=error.code
                 )
 
-            await self.resources.store_account_alive_result(
-                account_id, alive=True, http_status=result.http_status
-            )
+            result_options = {
+                "alive": True,
+                "http_status": result.http_status,
+            }
+            if account_reached_alive_15m_age(source.get("createdAt")):
+                result_options["verified_15m"] = True
+            await self.resources.store_account_alive_result(account_id, **result_options)
             await self.proxies.record_proxy_success(lease.id, result.elapsed_ms)
             return AccountAliveCheckItem(id=account_id, status="alive")
         finally:

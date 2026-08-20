@@ -275,6 +275,11 @@ class MongoProbeStore:
         query: dict[str, Any] = {
             "enabled": True,
             "status": {"$ne": "quarantined"},
+            "$or": [
+                {"registrationBlockedUntil": {"$exists": False}},
+                {"registrationBlockedUntil": None},
+                {"registrationBlockedUntil": {"$lte": now}},
+            ],
         }
         if excluded_ids:
             query["_id"] = {"$nin": sorted(excluded_ids)}
@@ -538,6 +543,36 @@ class MongoProbeStore:
                         "latencyMs": max(0, latency_ms),
                         "lastCheckedAt": utc_now(),
                     }
+                },
+            )
+        )
+
+    async def record_proxy_registration_rejection(
+        self,
+        proxy_id: str,
+        *,
+        code: str,
+        observed_country: str | None = None,
+        cooldown_seconds: int = 21_600,
+    ) -> None:
+        if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return
+        now = utc_now()
+        changes: dict[str, Any] = {
+            "registrationBlockedUntil": now
+            + timedelta(seconds=max(60, cooldown_seconds)),
+            "lastRegistrationFailureAt": now,
+            "lastRegistrationFailureCode": code,
+        }
+        normalized_country = str(observed_country or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", normalized_country):
+            changes["country"] = normalized_country
+        await self._guard(
+            self.proxies.update_one(
+                {"_id": proxy_id},
+                {
+                    "$set": changes,
+                    "$inc": {"registrationFailureCount": 1},
                 },
             )
         )

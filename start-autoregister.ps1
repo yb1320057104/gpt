@@ -28,7 +28,10 @@ $ResinRoot = if ($env:RESIN_ROOT) {
 } else {
     Get-ChildItem -LiteralPath $ProjectBase -Directory | ForEach-Object {
         $candidate = Join-Path $_.FullName 'Resin'
-        if (Test-Path -LiteralPath (Join-Path $candidate 'resin.exe')) { $candidate }
+        if (
+            (Test-Path -LiteralPath (Join-Path $candidate 'resin.exe')) -or
+            (Test-Path -LiteralPath (Join-Path $candidate 'cmd\resin'))
+        ) { $candidate }
     } | Select-Object -First 1
 }
 New-Item -ItemType Directory -Force -Path $RuntimeLogs, $RuntimePids | Out-Null
@@ -138,16 +141,18 @@ if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
 Start-Component 'Easy Proxies' {
     $binary = if ($EasyProxiesRoot) { Join-Path $EasyProxiesRoot 'easy_proxies.exe' } else { '' }
     $safeConfig = Join-Path $App 'proxy-engines\easy-proxies.yaml'
+    $sourceConfig = if ($EasyProxiesRoot) { Join-Path $EasyProxiesRoot 'config.yaml' } else { '' }
+    $config = if (Test-Path -LiteralPath $safeConfig) { $safeConfig } elseif ($sourceConfig -and (Test-Path -LiteralPath $sourceConfig)) { $sourceConfig } else { '' }
     if (Test-LocalPort 9091) {
         Write-Host '  already running on 127.0.0.1:9091' -ForegroundColor Green
-    } elseif ($binary -and (Test-Path -LiteralPath $binary) -and (Test-Path -LiteralPath $safeConfig)) {
-        $process = Start-Process -FilePath $binary -ArgumentList '-config', $safeConfig -WorkingDirectory (Split-Path -Parent $safeConfig) -WindowStyle Hidden -PassThru `
+    } elseif ($binary -and $config -and (Test-Path -LiteralPath $binary)) {
+        $process = Start-Process -FilePath $binary -ArgumentList '-config', $config -WorkingDirectory (Split-Path -Parent $config) -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput (Join-Path $RuntimeLogs 'easy-proxies.out.log') `
             -RedirectStandardError (Join-Path $RuntimeLogs 'easy-proxies.err.log')
         Confirm-Started 'Easy Proxies' $process 9091 (Join-Path $RuntimeLogs 'easy-proxies.err.log') 15
         Save-ProcessId 'easy-proxies' $process
     } else {
-        Write-Host '  executable or managed config not found; set EASY_PROXIES_ROOT and verify app\proxy-engines\easy-proxies.yaml' -ForegroundColor Yellow
+        Write-Host '  executable or config not found; set EASY_PROXIES_ROOT and verify config.yaml' -ForegroundColor Yellow
     }
 }
 
@@ -192,6 +197,20 @@ Start-Component 'Resin' {
         Save-ProcessId 'resin' $process
     } else {
         Write-Host "  executable not found: $binary (build with: go build -o resin.exe .\cmd\resin)" -ForegroundColor Yellow
+    }
+}
+
+Start-Component 'Proxy Bridge' {
+    if (Test-LocalPort 18796) {
+        Write-Host '  already running on 127.0.0.1:18796' -ForegroundColor Green
+    } else {
+        $process = Start-Process -FilePath $Python `
+            -ArgumentList '-m', 'backend.oai_iprocket_chain_bridge' `
+            -WorkingDirectory $App -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput (Join-Path $RuntimeLogs 'proxy-bridge.out.log') `
+            -RedirectStandardError (Join-Path $RuntimeLogs 'proxy-bridge.err.log')
+        Confirm-Started 'Proxy Bridge' $process 18796 (Join-Path $RuntimeLogs 'proxy-bridge.err.log') 15
+        Save-ProcessId 'proxy-bridge' $process
     }
 }
 
@@ -272,7 +291,7 @@ Write-Host 'AutoRegister started:' -ForegroundColor Green
 Write-Host '  Page: http://127.0.0.1:5173/launch'
 Write-Host '  Backend: http://127.0.0.1:8000'
 Write-Host '  Roxy API: http://127.0.0.1:50000 (enable it in Roxy first)'
-Write-Host '  Proxy bridge: starts on demand at http://127.0.0.1:18796'
+Write-Host '  Proxy bridge: http://127.0.0.1:18796'
 if (Test-LocalPort 7890) {
     Write-Host '  Local proxy: ready at 127.0.0.1:7890' -ForegroundColor Green
 } else {

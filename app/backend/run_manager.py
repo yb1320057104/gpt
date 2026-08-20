@@ -57,6 +57,7 @@ from .settings_store import SettingsStore, StoredExecutionSettings
 T = TypeVar("T")
 ACTIVE_STATUSES = set(ACTIVE_RUN_STATUSES)
 UNLIMITED_CLEANUP_GRACE_SECONDS = 30.0
+WORKER_START_STAGGER_SECONDS = 5
 ROXY_CIRCUIT_FAILURE_THRESHOLD = 5
 ROXY_INFRASTRUCTURE_FAILURE_CODES = frozenset(
     {
@@ -87,6 +88,14 @@ SAFE_ERROR_STAGES = frozenset(
         "cleanup",
     }
 )
+
+
+def browser_worker_start_delay_seconds(sequence: int, concurrency: int) -> int:
+    safe_concurrency = max(1, int(concurrency))
+    slot = (max(1, int(sequence)) - 1) % safe_concurrency
+    return slot * WORKER_START_STAGGER_SECONDS
+
+
 SAFE_ERROR_OPERATIONS = frozenset(
     {
         "health",
@@ -407,6 +416,10 @@ class BrowserProbeRunExecutor:
                 ),
                 "registrationCountry": context.state.registrationCountry,
                 "registrationProxyGroup": context.state.registrationProxyGroup,
+                "startupDelaySeconds": browser_worker_start_delay_seconds(
+                    sequence,
+                    context.concurrency,
+                ),
             }
             process = self.process_context.Process(
                 target=self.worker_target,
@@ -481,6 +494,86 @@ class BrowserProbeRunExecutor:
             worker_id = str(event.get("workerId") or "")
             handle = active.get(worker_id)
             if handle is None:
+                return
+            if event.get("type") == "login_diagnostic":
+                raw_details = event.get("details")
+                if not isinstance(raw_details, dict):
+                    return
+                diagnostic_event = str(raw_details.get("event") or "")
+                allowed_events = {
+                    "login_page_ready",
+                    "email_form_ready",
+                    "email_filled",
+                    "pre_continue_stability",
+                    "continue_pre_click",
+                    "continue_click_result",
+                    "email_form_reset_observed",
+                    "email_next_step_observed",
+                    "auth_bootstrap_recovery",
+                }
+                if diagnostic_event not in allowed_events:
+                    return
+                allowed_fields = {
+                    "url",
+                    "egressCountry",
+                    "challengeObserved",
+                    "bodyLength",
+                    "fillAttempt",
+                    "state",
+                    "waitMs",
+                    "stabilityResets",
+                    "valueLength",
+                    "valueMatched",
+                    "formStable",
+                    "inputHasValue",
+                    "inputVisible",
+                    "inputEnabled",
+                    "inputEditable",
+                    "buttonVisible",
+                    "buttonEnabled",
+                    "clickAttempt",
+                    "outcome",
+                    "observedStep",
+                    "exceptionType",
+                    "elapsedMs",
+                    "urlChanged",
+                    "networkTrace",
+                    "resetCount",
+                    "recoveryOk",
+                    "recoveryStage",
+                    "recoveryStatus",
+                    "trafficFilterInstalled",
+                    "trafficFilterError",
+                    "trafficDownloadedBytes",
+                    "trafficBlockedRequests",
+                }
+                safe_details: dict[str, str | int | float | bool | None] = {
+                    key: value
+                    for key, value in raw_details.items()
+                    if key in allowed_fields
+                    and (
+                        isinstance(value, (str, int, float, bool))
+                        or value is None
+                    )
+                }
+                context.append_log(
+                    context.state.runId,
+                    (
+                        "warning"
+                        if diagnostic_event == "email_form_reset_observed"
+                        else "info"
+                    ),
+                    "login_diagnostic",
+                    f"登录诊断：{diagnostic_event}",
+                    email=handle.email,
+                    sequence=handle.sequence,
+                    details={
+                        **RunManager.details(context.state),
+                        "stage": "login",
+                        "diagnosticEvent": diagnostic_event,
+                        **safe_details,
+                    },
+                )
                 return
             if event.get("type") == "stage":
                 stage = str(event.get("stage") or "")

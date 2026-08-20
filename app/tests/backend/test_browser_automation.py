@@ -21,6 +21,7 @@ from backend.browser_automation import (
     PROFILE_NAME_LABEL_PATTERN,
     PROFILE_SUBMIT_PATTERN,
     AUTH_RETRY_ACTION_PATTERN,
+    AUTH_INVALID_STATE_PATTERN,
     AUTH_RETRY_PAGE_PATTERN,
     VERIFICATION_PATTERN,
     VERIFICATION_REJECTION_PATTERN,
@@ -35,9 +36,140 @@ from backend.browser_automation import (
     VerificationStepError,
     contains_challenge,
     mask_ip,
+    safe_login_network_event,
     sanitize_url,
 )
 from backend.chatgpt_plan import PlanCheckError
+
+
+def test_safe_login_network_event_removes_query_and_failure_details() -> None:
+    assert safe_login_network_event(
+        "response",
+        "https://auth.openai.com/u/login/identifier?state=private",
+        "post",
+        status=429,
+    ) == "POST auth.openai.com/u/login/identifier -> 429"
+    assert safe_login_network_event(
+        "failure",
+        "https://chatgpt.com/api/auth/signin?csrf=private",
+        "POST",
+        failure="request failed: net::ERR_PROXY_CONNECTION_FAILED private",
+    ) == "POST chatgpt.com/api/auth/signin -> NET::ERR_PROXY_CONNECTION_FAILED"
+    assert (
+        safe_login_network_event(
+            "response",
+            "https://example.com/private?token=private",
+            "GET",
+            status=200,
+        )
+        is None
+    )
+
+
+def test_login_diagnostic_callback_suppresses_callback_failure(tmp_path: Path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def callback(event: str, details: dict[str, object]) -> None:
+        events.append((event, details))
+        raise RuntimeError("logging unavailable")
+
+    automation = CdpBrowserAutomation(
+        "ws://private.invalid",
+        tmp_path / "latest.png",
+        diagnostic_callback=callback,
+    )
+    asyncio.run(automation._emit_diagnostic("continue_pre_click", formStable=True))
+
+    assert events == [
+        (
+            "continue_pre_click",
+            {
+                "formStable": True,
+                "trafficFilterInstalled": False,
+                "trafficFilterError": False,
+                "trafficDownloadedBytes": 0,
+                "trafficBlockedRequests": 0,
+            },
+        )
+    ]
+
+
+def test_low_traffic_filter_installs_cdp_rules_and_counts_bytes(tmp_path: Path) -> None:
+    class FakeSession:
+        def __init__(self) -> None:
+            self.handlers: dict[str, object] = {}
+            self.commands: list[tuple[str, object | None]] = []
+
+        def on(self, event: str, callback: object) -> None:
+            self.handlers[event] = callback
+
+        async def send(self, command: str, params: object | None = None) -> None:
+            self.commands.append((command, params))
+
+    class FakeContext:
+        def __init__(self, session: FakeSession) -> None:
+            self.session = session
+
+        async def new_cdp_session(self, _page: object) -> FakeSession:
+            return self.session
+
+    session = FakeSession()
+    page = type("Page", (), {"context": FakeContext(session)})()
+    automation = CdpBrowserAutomation(
+        "ws://private.invalid",
+        tmp_path / "latest.png",
+    )
+
+    asyncio.run(automation._install_low_traffic_filter(page))
+    session.handlers["Network.loadingFinished"]({"encodedDataLength": 1234})  # type: ignore[operator]
+    session.handlers["Network.loadingFailed"]({"blockedReason": "inspector"})  # type: ignore[operator]
+
+    assert automation._traffic_filter_installed is True
+    assert automation._traffic_downloaded_bytes == 1234
+    assert automation._traffic_blocked_requests == 1
+    assert session.commands[0][0] == "Network.enable"
+    assert session.commands[1][0] == "Network.setBlockedURLs"
+
+
+def test_auth_bootstrap_recovery_navigates_to_trusted_auth_url(tmp_path: Path) -> None:
+    class FakeRecoveryPage:
+        def __init__(self) -> None:
+            self.url = CHATGPT_LOGIN_URL
+            self.goto_urls: list[str] = []
+            self.evaluate_scripts: list[str] = []
+
+        async def evaluate(self, script: str, _args: object) -> dict[str, object]:
+            self.evaluate_scripts.append(script)
+            return {
+                "ok": True,
+                "stage": "signin",
+                "status": 200,
+                "url": "https://auth.openai.com/authorize?state=private",
+            }
+
+        async def goto(self, url: str, **_kwargs: object) -> None:
+            self.goto_urls.append(url)
+            self.url = url
+
+    page = FakeRecoveryPage()
+    automation = CdpBrowserAutomation(
+        "ws://private.invalid",
+        tmp_path / "latest.png",
+    )
+
+    result = asyncio.run(
+        automation._recover_via_openai_auth(page, "private@example.com")
+    )
+
+    assert result == {"ok": True, "stage": "navigation", "status": 200}
+    assert page.goto_urls == ["https://auth.openai.com/authorize?state=private"]
+    assert "screen_hint: 'signup'" in page.evaluate_scripts[0]
+
+
+def test_invalid_auth_transaction_page_is_detected() -> None:
+    assert AUTH_INVALID_STATE_PATTERN.search(
+        "Session ended error_code: invalid_state"
+    )
 
 
 def test_turkish_auth_and_profile_text_patterns() -> None:
@@ -2972,7 +3104,7 @@ def test_click_exception_with_reset_refills_and_retries_once(
     assert result.email_continue_attempts == 2
     assert result.email_post_submit_reset_count == 1
     assert result.email_continue_click_failures == 1
-    assert result.email_continue_recovery_state == "form_reset"
+    assert result.email_continue_recovery_state == "auth_bootstrap_signup"
     assert page.continue_click_invocation_count == 2
 
 
@@ -3617,6 +3749,26 @@ def test_proxy_navigation_errors_are_structured_and_redacted(
     serialized = json.dumps(record)
     assert "PRIVATE_VALUE" not in serialized
     assert "secret.invalid" not in serialized
+
+
+def test_proxy_country_mismatch_stops_before_login_navigation(
+    tmp_path: Path,
+) -> None:
+    page = FakePage(ip_body='{"ip":"203.0.113.9","country_code":"JP"}')
+
+    with pytest.raises(ProxyNavigationError) as exc_info:
+        run_probe(
+            page,
+            tmp_path / "latest.png",
+            expected_egress_country="GB",
+        )
+
+    error = exc_info.value
+    assert error.stage == "ip_country"
+    assert error.code == "egress_country_mismatch"
+    assert error.expected_country == "GB"
+    assert error.observed_country == "JP"
+    assert page.goto_calls == [(IP_CHECK_URL, "domcontentloaded", 90_000)]
 
 
 def test_redaction_helpers_cover_ipv4_ipv6_url_and_challenges() -> None:

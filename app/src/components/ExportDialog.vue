@@ -94,6 +94,10 @@ async function confirmExport() {
           <strong>凭据格式</strong>
           <span>邮箱----密码----TOTP</span>
         </el-radio>
+        <el-radio value="password-mail-links" border>
+          <strong>密码+取码地址</strong>
+          <span>邮箱----密码----取码地址</span>
+        </el-radio>
         <el-radio value="mail-links" border>
           <strong>接码格式</strong>
           <span>邮箱----接码地址</span>

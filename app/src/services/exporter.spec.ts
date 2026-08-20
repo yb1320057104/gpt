@@ -35,6 +35,16 @@ describe('buildAccountExport', () => {
     expect(result.filename).toBe('accounts-1-mail-links-20260808-153000.txt')
   })
 
+  it('exports password and email access link lines', () => {
+    const result = buildAccountExport([account(1)], 'password-mail-links', now)
+    expect(result.content).toBe(
+      'demo1@example.com----password-1----https://example.com/inbox/1',
+    )
+    expect(result.filename).toBe(
+      'accounts-1-password-mail-links-20260808-153000.txt',
+    )
+  })
+
   it('formats local timestamps deterministically', () => {
     expect(formatExportTimestamp(now)).toBe('20260808-153000')
   })

@@ -19,6 +19,7 @@ from backend.resource_models import (
     AccountExportInput,
     AccountPlanCheckItem,
     AccountPlanCheckResult,
+    AccountRecord,
     ProxyGroupUpdate,
 )
 
@@ -414,6 +415,33 @@ def test_proxy_import_accepts_whitespace_separated_socks5_urls() -> None:
     assert store.proxy_groups == ["英国住宅公式 A", "英国住宅公式 A"]
 
 
+def test_proxy_import_accepts_common_scheme_less_http_formats() -> None:
+    store = ImportStore()
+    service = ResourceService(store)  # type: ignore[arg-type]
+    result = asyncio.run(
+        service.import_proxies(
+            "plain.proxy.test:8080\n"
+            "fields.proxy.test:8081:user-one:pass-one\n"
+            "user-two:pass-two@at.proxy.test:8082\n"
+            "user-three:pass-three:tail.proxy.test:8083"
+        )
+    )
+
+    assert result.model_dump() == {
+        "total": 4,
+        "imported": 4,
+        "duplicateCount": 0,
+        "errorCount": 0,
+    }
+    assert store.proxies == {
+        ("plain.proxy.test", 8080, "", ""),
+        ("fields.proxy.test", 8081, "user-one", "pass-one"),
+        ("at.proxy.test", 8082, "user-two", "pass-two"),
+        ("tail.proxy.test", 8083, "user-three", "pass-three"),
+    }
+    assert store.proxy_schemes == ["http", "http", "http", "http"]
+
+
 def test_proxy_upsert_keeps_mutable_fields_out_of_set_on_insert() -> None:
     class CapturingCollection:
         def __init__(self) -> None:
@@ -529,6 +557,42 @@ class AccessTokenExportStore:
                 "accessTokenExpiresAt": now - timedelta(seconds=1),
             },
         ]
+
+
+class PasswordMailLinksExportStore:
+    async def accounts_for_export(self, ids):
+        _ = ids
+        return [
+            AccountRecord(
+                id="account-1",
+                email="person@example.com",
+                chatgptPassword="PASSWORD_FIXTURE",
+                totpSecret="TOTP_FIXTURE",
+                emailAccessUrl="https://mail.example.test/inbox/1",
+                createdAt=datetime.now(timezone.utc),
+                accountType="free",
+            )
+        ]
+
+
+def test_password_mail_links_export_includes_password_and_mailbox_url() -> None:
+    service = ResourceService(PasswordMailLinksExportStore())  # type: ignore[arg-type]
+    result = asyncio.run(
+        service.export_accounts(
+            AccountExportInput(
+                format="password-mail-links",
+                scope="single",
+                ids=["account-1"],
+            )
+        )
+    )
+
+    assert result.content == (
+        "person@example.com----PASSWORD_FIXTURE----"
+        "https://mail.example.test/inbox/1"
+    )
+    assert result.filename.startswith("accounts-1-password-mail-links-")
+    assert result.count == 1
 
 
 def test_access_token_export_contains_only_valid_tokens_and_reports_skips() -> None:

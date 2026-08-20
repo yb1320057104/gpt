@@ -64,6 +64,32 @@ describe('parseProxyImport', () => {
     expect(result.accepted.map((item) => item.scheme)).toEqual(['socks5', 'socks5'])
   })
 
+  it('accepts common scheme-less HTTP proxy formats', () => {
+    const result = parseProxyImport([
+      'plain.proxy.test:8080',
+      'fields.proxy.test:8081:user-one:pass-one',
+      'user-two:pass-two@at.proxy.test:8082',
+      'user-three:pass-three:tail.proxy.test:8083',
+    ].join('\n'))
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.accepted).toEqual([
+      { host: 'plain.proxy.test', port: 8080, username: '', password: '', scheme: 'http' },
+      { host: 'fields.proxy.test', port: 8081, username: 'user-one', password: 'pass-one', scheme: 'http' },
+      { host: 'at.proxy.test', port: 8082, username: 'user-two', password: 'pass-two', scheme: 'http' },
+      { host: 'tail.proxy.test', port: 8083, username: 'user-three', password: 'pass-three', scheme: 'http' },
+    ])
+  })
+
+  it.each(['http', 'https', 'socks5', 'socks5h'] as const)(
+    'preserves an explicit %s scheme',
+    (scheme) => {
+      const result = parseProxyImport(`${scheme}://user:pass@proxy.example.com:8080`)
+      expect(result.errors).toHaveLength(0)
+      expect(result.accepted[0]?.scheme).toBe(scheme)
+    },
+  )
+
   it.each(['host:0:user:pass', 'host:65536:user:pass', 'host:nope:user:pass'])(
     'rejects invalid port in %s',
     (input) => {

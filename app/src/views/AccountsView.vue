@@ -44,6 +44,7 @@ const copyAtLimit = ref((() => {
 })())
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 let globalPromotionTimer: ReturnType<typeof setInterval> | undefined
+let aliveMarkerTimer: ReturnType<typeof setInterval> | undefined
 
 const pageAccounts = computed(() => store.accounts)
 const promotionChecking = computed(() => store.accountPromotionChecking)
@@ -241,6 +242,7 @@ function aliveTagType(account: AccountRecord) {
 function aliveTooltip(account: AccountRecord) {
   const parts: string[] = []
   if (account.aliveCheckedAt) parts.push(`检测时间：${formatDate(account.aliveCheckedAt)}`)
+  if (account.alive15mVerifiedAt) parts.push(`已活15分钟：${formatDate(account.alive15mVerifiedAt)}`)
   if (account.aliveHttpStatus) parts.push(`HTTP：${account.aliveHttpStatus}`)
   if (account.aliveErrorCode) parts.push(`结果：${account.aliveErrorCode}`)
   return parts.join('；') || '尚未检测账号是否有效'
@@ -486,6 +488,17 @@ onMounted(() => {
       void loadPage()
     }
   }, 5000)
+  aliveMarkerTimer = setInterval(() => {
+    const cutoff = Date.now() - 15 * 60 * 1000
+    if (pageAccounts.value.some((account) =>
+      account.accessTokenConfigured
+      && account.aliveStatus !== 'dead'
+      && !account.alive15mVerifiedAt
+      && new Date(account.createdAt).getTime() <= cutoff,
+    )) {
+      void loadPage()
+    }
+  }, 60000)
   void dataGateway.listProxies({ page: 1, pageSize: 100, q: '' }).then((page) => {
     promotionProxies.value = page.items.filter((proxy) => proxy.enabled)
   }).catch(() => {
@@ -495,6 +508,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
   if (globalPromotionTimer) clearInterval(globalPromotionTimer)
+  if (aliveMarkerTimer) clearInterval(aliveMarkerTimer)
 })
 </script>
 
@@ -511,7 +525,7 @@ onBeforeUnmount(() => {
       <StatCard label="账号总数" :value="store.stats.accounts.total" note="MongoDB 全部成功记录" :icon="UserFilled" />
       <StatCard label="今日新增" :value="store.stats.accounts.today" note="按 UTC 日期统计" :icon="Download" tone="green" />
       <StatCard label="TOTP 完整" :value="store.stats.accounts.totpComplete" note="密钥字段完整" :icon="Key" tone="amber" />
-      <StatCard label="可导出" :value="store.stats.accounts.total" note="两种格式均已就绪" :icon="Lock" tone="green" />
+<StatCard label="可导出" :value="store.stats.accounts.total" note="多种格式均已就绪" :icon="Lock" tone="green" />
     </div>
 
     <div class="panel table-panel">
@@ -734,13 +748,18 @@ onBeforeUnmount(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="验活状态" width="125">
+        <el-table-column label="验活状态" width="190">
           <template #default="{ row }">
-            <el-tooltip :content="aliveTooltip(row)">
-              <el-tag :type="aliveTagType(row)" effect="plain" round>
-                {{ aliveLabel(row) }}
+            <div class="alive-status-tags">
+              <el-tooltip :content="aliveTooltip(row)">
+                <el-tag :type="aliveTagType(row)" effect="plain" round>
+                  {{ aliveLabel(row) }}
+                </el-tag>
+              </el-tooltip>
+              <el-tag v-if="row.alive15mVerifiedAt" type="success" effect="dark" round>
+                已活15分钟
               </el-tag>
-            </el-tooltip>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="结账类型" width="145">
@@ -932,6 +951,13 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.alive-status-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
 .account-email {
   display: flex;
   min-width: 0;

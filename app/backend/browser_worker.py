@@ -281,6 +281,17 @@ async def _run_worker(
 
     async def progress(stage: str, details: dict[str, Any]) -> None:
         nonlocal current_stage
+        login_diagnostic = details.get("loginDiagnostic")
+        if isinstance(login_diagnostic, dict):
+            event_queue.put(
+                {
+                    "type": "login_diagnostic",
+                    "runId": config["runId"],
+                    "workerId": config["workerId"],
+                    "details": dict(login_diagnostic),
+                }
+            )
+            return
         mailbox_poll = details.get("mailboxPoll")
         if isinstance(mailbox_poll, dict):
             event_queue.put(
@@ -357,7 +368,16 @@ async def _run_worker(
         registration_proxy_group=str(config.get("registrationProxyGroup") or "") or None,
         two_factor_delay_seconds=20,
     )
-    task = asyncio.create_task(runner.run(), name=f"probe-{config['workerId']}")
+    async def run_with_startup_delay() -> tuple[dict[str, Any], int]:
+        delay_seconds = max(0.0, float(config.get("startupDelaySeconds") or 0))
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        return await runner.run()
+
+    task = asyncio.create_task(
+        run_with_startup_delay(),
+        name=f"probe-{config['workerId']}",
+    )
     cancelled = False
     while not task.done():
         if cancel_event.is_set():

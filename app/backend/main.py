@@ -69,6 +69,7 @@ from .probe_store import MongoProbeStore
 from .plan_check_service import AccountPlanCheckService
 from .global_promotion_service import GlobalPromotionCheckService
 from .account_alive_service import AccountAliveCheckService
+from .account_alive_scheduler import AccountAliveScheduler
 from .proxy_subscription_service import (
     ProxySubscriptionError,
     ProxySubscriptionService,
@@ -207,6 +208,7 @@ def create_app(
     plan_check_service = AccountPlanCheckService(resource_store, probe_store)
     global_promotion_service = GlobalPromotionCheckService(resource_store, probe_store)
     alive_check_service = AccountAliveCheckService(resource_store, probe_store)
+    alive_check_scheduler = AccountAliveScheduler(alive_check_service, resource_store)
     extractor_service = payment_extractor_service or PaymentExtractorService()
     agreement_service = paypal_agreement_service or PaypalAgreementService()
     account_pipeline = pipeline_service or AccountPipelineService(
@@ -236,9 +238,11 @@ def create_app(
         await account_pipeline.start()
         await proxy_health_scheduler.start()
         await global_promotion_service.start()
+        await alive_check_scheduler.start()
         try:
             yield
         finally:
+            await alive_check_scheduler.stop()
             await global_promotion_service.stop()
             await proxy_health_scheduler.stop()
             await run_manager.shutdown()
@@ -286,6 +290,7 @@ def create_app(
     app.state.probe_store = probe_store
     app.state.plan_check_service = plan_check_service
     app.state.alive_check_service = alive_check_service
+    app.state.alive_check_scheduler = alive_check_scheduler
     app.state.payment_extractor_service = extractor_service
     app.state.paypal_agreement_service = agreement_service
     app.state.account_pipeline = account_pipeline

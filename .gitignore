@@ -68,6 +68,12 @@ Thumbs.db
 !/mailcom-manager/data/.gitkeep
 /app/mongodb/mongod.yml
 
+# Local Cloudflare Freemail deployment workspace and credentials
+/freemail-cloudflare/
+/.wrangler-config-freemail/
+/.tmp-npm-cache-freemail/
+/.tmp-doc-review-*/
+
 # Embedded proxy engines: local binaries, subscriptions and generated nodes
 /app/proxy-engines/bin/
 /app/proxy-engines/easy-proxies.yaml

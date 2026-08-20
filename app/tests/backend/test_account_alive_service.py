@@ -1,7 +1,10 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from backend.account_alive_service import AccountAliveCheckService
+from backend.account_alive_service import (
+    AccountAliveCheckService,
+    account_reached_alive_15m_age,
+)
 from backend.chatgpt_plan import AccountPlanResult, PlanCheckError
 from backend.probe_store import ProxyLease
 
@@ -105,3 +108,39 @@ def test_alive_check_keeps_proxy_or_server_errors_unknown(monkeypatch):
 
     assert result.failed == 1
     assert resources.failures == [("account", "plan_http_failed")]
+
+
+def test_account_reached_alive_15m_age_uses_creation_time() -> None:
+    now = datetime(2026, 8, 21, 1, 0, tzinfo=timezone.utc)
+
+    assert account_reached_alive_15m_age(now - timedelta(minutes=15), now=now)
+    assert not account_reached_alive_15m_age(
+        now - timedelta(minutes=14, seconds=59), now=now
+    )
+
+
+def test_alive_check_marks_accounts_older_than_15_minutes(monkeypatch):
+    resources = FakeResources(
+        {
+            "accessToken": "TEST_AT",
+            "registrationCountry": "JP",
+            "createdAt": datetime.now(timezone.utc) - timedelta(minutes=16),
+        }
+    )
+    proxies = FakeProxies(ProxyLease("proxy", "proxy.test", 1000, "", ""))
+    monkeypatch.setattr(
+        "backend.account_alive_service.check_account_plan_curl",
+        lambda *_args, **_kwargs: alive_result(),
+    )
+
+    result = asyncio.run(
+        AccountAliveCheckService(resources, proxies).check_accounts(["account"])
+    )
+
+    assert result.alive == 1
+    assert resources.results == [
+        (
+            "account",
+            {"alive": True, "http_status": 200, "verified_15m": True},
+        )
+    ]

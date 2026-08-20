@@ -11,7 +11,13 @@ PageSize = Literal[10, 20, 50, 100]
 AccountType = Literal["plus", "free"]
 CheckoutType = Literal["oaics", "cs"]
 PlanCheckStatus = Literal["running", "success", "failed"]
-AccountExportFormat = Literal["credentials", "mail-links", "mail-links-totp", "access-tokens"]
+AccountExportFormat = Literal[
+    "credentials",
+    "password-mail-links",
+    "mail-links",
+    "mail-links-totp",
+    "access-tokens",
+]
 ProxyStatus = Literal["available", "unknown", "quarantined"]
 ProxyScheme = Literal["http", "https", "socks5", "socks5h"]
 ProxySubscriptionProvider = Literal["easy-proxies", "resin"]
@@ -95,6 +101,7 @@ class AccountRecord(ApiModel):
     aliveCheckedAt: datetime | None = None
     aliveErrorCode: str | None = None
     aliveHttpStatus: int | None = None
+    alive15mVerifiedAt: datetime | None = None
     globalPromotionStatus: Literal["pending", "running", "eligible", "ineligible", "failed"] | None = None
     globalPromotionEligible: bool | None = None
     globalPromotionCheckedAt: datetime | None = None

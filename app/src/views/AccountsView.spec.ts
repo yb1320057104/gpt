@@ -29,6 +29,27 @@ function account(overrides: Partial<AccountRecord> = {}): AccountRecord {
 }
 
 describe('AccountsView AccessToken controls', () => {
+  it('shows the survived-15-minutes marker after automatic verification', async () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const store = useAppStore()
+    store.accounts = [account({ aliveStatus: 'alive', alive15mVerifiedAt: '2026-08-21T01:15:00.000Z' })]
+    store.accountTotal = 1
+    vi.spyOn(store, 'refreshAccounts').mockResolvedValue({
+      items: store.accounts,
+      total: 1,
+      page: 1,
+      pageSize: 10,
+    })
+
+    const wrapper = mount(AccountsView, {
+      global: { plugins: [pinia, ElementPlus] },
+    })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('已活15分钟')
+  })
+
   it('labels the registration country and keeps legacy accounts identifiable', async () => {
     const pinia = createPinia()
     setActivePinia(pinia)

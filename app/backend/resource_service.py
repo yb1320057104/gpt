@@ -722,10 +722,39 @@ class MongoResourceStore:
                         "aliveHttpStatus": None,
                     }
                 },
-                projection={"accessToken": 1, "registrationCountry": 1},
+                projection={
+                    "accessToken": 1,
+                    "registrationCountry": 1,
+                    "createdAt": 1,
+                },
                 return_document=ReturnDocument.AFTER,
             )
         )
+
+    async def account_ids_due_for_alive_15m_check(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[str]:
+        cutoff = utc_now() - timedelta(minutes=15)
+        cursor = (
+            self.accounts.find(
+                {
+                    "createdAt": {"$lte": cutoff},
+                    "accessToken": {"$type": "string", "$ne": ""},
+                    "aliveStatus": {"$ne": "dead"},
+                    "$or": [
+                        {"alive15mVerifiedAt": None},
+                        {"alive15mVerifiedAt": {"$exists": False}},
+                    ],
+                },
+                {"_id": 1},
+            )
+            .sort("createdAt", ASCENDING)
+            .limit(max(1, min(1000, limit)))
+        )
+        documents = await self._guard(cursor.to_list(length=limit))
+        return [str(document["_id"]) for document in documents]
 
     async def claim_account_checkout_type_check(self, account_id: str) -> dict[str, Any] | None:
         now = utc_now()
@@ -796,16 +825,21 @@ class MongoResourceStore:
         alive: bool,
         error_code: str | None = None,
         http_status: int | None = None,
+        verified_15m: bool = False,
     ) -> None:
+        now = utc_now()
+        updates: dict[str, Any] = {
+            "aliveStatus": "alive" if alive else "dead",
+            "aliveCheckedAt": now,
+            "aliveErrorCode": error_code,
+            "aliveHttpStatus": http_status,
+        }
+        if alive and verified_15m:
+            updates["alive15mVerifiedAt"] = now
         await self._guard(
             self.accounts.update_one(
                 {"_id": account_id},
-                {"$set": {
-                    "aliveStatus": "alive" if alive else "dead",
-                    "aliveCheckedAt": utc_now(),
-                    "aliveErrorCode": error_code,
-                    "aliveHttpStatus": http_status,
-                }},
+                {"$set": updates},
             )
         )
 
@@ -1693,6 +1727,7 @@ class MongoResourceStore:
             aliveCheckedAt=document.get("aliveCheckedAt"),
             aliveErrorCode=document.get("aliveErrorCode"),
             aliveHttpStatus=document.get("aliveHttpStatus"),
+            alive15mVerifiedAt=document.get("alive15mVerifiedAt"),
             globalPromotionStatus=document.get("globalPromotionStatus"),
             globalPromotionEligible=document.get("globalPromotionEligible"),
             globalPromotionCheckedAt=document.get("globalPromotionCheckedAt"),
@@ -1930,9 +1965,9 @@ class ResourceService:
                 continue
             total += 1
             scheme = "http"
-            if "://" in line:
+            if "://" in line or "@" in line or re.fullmatch(r"\[.*\]:\d+", line):
                 try:
-                    parsed = urlsplit(line)
+                    parsed = urlsplit(line if "://" in line else f"http://{line}")
                     scheme = parsed.scheme.lower()
                     host = str(parsed.hostname or "").strip()
                     port = int(parsed.port or 0)
@@ -1942,17 +1977,32 @@ class ResourceService:
                     errors += 1
                     continue
             else:
-                parts = line.split(":", 3)
-                if len(parts) != 4:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    host, port_text = (part.strip() for part in parts)
+                    username = password = ""
+                elif len(parts) >= 4 and parts[1].isdigit():
+                    host, port_text, username, password = (
+                        part.strip() for part in line.split(":", 3)
+                    )
+                elif len(parts) == 4 and parts[3].isdigit():
+                    username, password, host, port_text = (
+                        part.strip() for part in parts
+                    )
+                else:
                     errors += 1
                     continue
-                host, port_text, username, password = (part.strip() for part in parts)
                 try:
                     port = int(port_text)
                 except ValueError:
                     errors += 1
                     continue
-            if not host or not username or not password or port < 1 or port > 65535:
+            if (
+                not host
+                or bool(username) != bool(password)
+                or port < 1
+                or port > 65535
+            ):
                 errors += 1
                 continue
             if scheme not in SUPPORTED_PROXY_SCHEMES:
@@ -2027,6 +2077,12 @@ class ResourceService:
                 for item in records
             )
             suffix = "credentials"
+        elif incoming.format == "password-mail-links":
+            content = "\n".join(
+                f"{item.email}----{item.chatgptPassword}----{item.emailAccessUrl}"
+                for item in records
+            )
+            suffix = "password-mail-links"
         elif incoming.format == "mail-links-totp":
             content = "\n".join(
                 f"{item.email}----{item.emailAccessUrl}----{item.totpSecret}"

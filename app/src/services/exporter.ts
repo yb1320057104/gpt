@@ -23,12 +23,20 @@ export function buildAccountExport(
     .map((account) =>
       format === 'credentials'
         ? `${account.email}----${account.chatgptPassword}----${account.totpSecret}`
+        : format === 'password-mail-links'
+          ? `${account.email}----${account.chatgptPassword}----${account.emailAccessUrl}`
         : format === 'mail-links-totp'
           ? `${account.email}----${account.emailAccessUrl}----${account.totpSecret}`
           : `${account.email}----${account.emailAccessUrl}`,
     )
     .join('\n')
-  const suffix = format === 'credentials' ? 'credentials' : format === 'mail-links-totp' ? 'mail-links-totp' : 'mail-links'
+  const suffix = format === 'credentials'
+    ? 'credentials'
+    : format === 'password-mail-links'
+      ? 'password-mail-links'
+      : format === 'mail-links-totp'
+        ? 'mail-links-totp'
+        : 'mail-links'
 
   return {
     content,
