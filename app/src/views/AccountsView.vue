@@ -75,17 +75,19 @@ function accessTokenStatus(account: AccountRecord) {
 }
 
 function promotionLabel(account: AccountRecord) {
-  if (account.planCheckStatus === 'running') return '查询中'
-  if (account.planCheckStatus === 'failed') return '查询失败'
+  if (account.planCheckStatus === 'running') return '\u68c0\u6d4b\u4e2d'
+  if (account.planCheckStatus === 'failed') return '\u68c0\u6d4b\u5931\u8d25'
   if (account.promotionKind === 'discount') return '\u0050lus \u4f18\u60e0'
   if (account.promotionEligible === true) return '\u0050lus \u8bd5\u7528'
-  return '未查询'
+  if (account.planCheckStatus === 'success') return '\u4e0d\u7b26\u5408\u8d44\u683c'
+  return '\u672a\u67e5\u8be2'
 }
 
 function promotionTagType(account: AccountRecord) {
   if (account.planCheckStatus === 'failed') return 'danger'
   if (account.planCheckStatus === 'running') return 'warning'
-  if (account.promotionEligible === true) return 'Plus ??'
+  if (account.promotionKind === 'discount') return 'primary'
+  if (account.promotionEligible === true) return 'success'
   return 'info'
 }
 
@@ -533,6 +535,7 @@ onBeforeUnmount(() => {
             placeholder="资格检测代理（自动匹配）"
             style="width: 260px"
           >
+            <el-option label="???? 127.0.0.1:7890" value="local7890" />
             <el-option
               v-for="proxy in promotionProxies"
               :key="proxy.id"

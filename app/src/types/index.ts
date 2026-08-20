@@ -240,7 +240,7 @@ export interface ExecutionSettingsInput {
   taskTimeoutSeconds: number
 }
 
-export type ExportFormat = 'credentials' | 'mail-links' | 'access-tokens'
+export type ExportFormat = 'credentials' | 'mail-links' | 'mail-links-totp' | 'access-tokens'
 export type ExportScope = 'single' | 'selected' | 'all'
 
 export interface AccountExport {

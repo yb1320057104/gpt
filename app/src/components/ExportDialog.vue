@@ -98,6 +98,10 @@ async function confirmExport() {
           <strong>接码格式</strong>
           <span>邮箱----接码地址</span>
         </el-radio>
+        <el-radio value="mail-links-totp" border>
+          <strong>&#37038;&#31665;+&#21462;&#30721;&#22320;&#22336;+TOTP</strong>
+          <span>&#37038;&#31665;----&#21462;&#30721;&#22320;&#22336;----TOTP</span>
+        </el-radio>
         <el-radio value="access-tokens" border>
           <strong>AccessToken</strong>
           <span>每行仅一个完整 AT</span>

@@ -2027,6 +2027,12 @@ class ResourceService:
                 for item in records
             )
             suffix = "credentials"
+        elif incoming.format == "mail-links-totp":
+            content = "\n".join(
+                f"{item.email}----{item.emailAccessUrl}----{item.totpSecret}"
+                for item in records
+            )
+            suffix = "mail-links-totp"
         else:
             content = "\n".join(
                 f"{item.email}----{item.emailAccessUrl}" for item in records
