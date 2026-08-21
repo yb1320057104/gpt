@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from manager.imap_client import ImapMailboxService
+import pytest
+import socks
+
+from manager.imap_client import ImapMailboxService, _http_connect
 
 
 RAW_MESSAGE = (
@@ -75,3 +78,74 @@ def test_forwarded_endpoint_preserves_mail_host_for_tls(monkeypatch) -> None:
     assert service.connect_host == "127.0.0.1"
     assert service.connect_port == 1993
     assert service.route == "forwarded"
+
+
+@pytest.mark.parametrize(
+    ("url", "route", "port", "proxy_type", "rdns"),
+    [
+        ("http://127.0.0.1:8080", "http", 8080, 0, False),
+        ("https://proxy.example", "https", 443, 0, False),
+        ("socks4://127.0.0.1", "socks4", 1080, socks.SOCKS4, False),
+        ("socks4a://127.0.0.1", "socks4a", 1080, socks.SOCKS4, True),
+        ("socks5://127.0.0.1:7890", "socks5", 7890, socks.SOCKS5, False),
+        ("socks5h://127.0.0.1:7891", "socks5h", 7891, socks.SOCKS5, True),
+    ],
+)
+def test_proxy_url_formats(url, route, port, proxy_type, rdns) -> None:
+    service = ImapMailboxService(proxy_url=url)
+
+    assert service.route == route
+    assert service.proxy_port == port
+    assert service.proxy_type == proxy_type
+    assert service.proxy_rdns is rdns
+
+
+def test_proxy_credentials_are_url_decoded() -> None:
+    service = ImapMailboxService(
+        proxy_url="http://user%40example.test:p%3Ass@proxy.example:3128"
+    )
+
+    assert service.proxy_username == "user@example.test"
+    assert service.proxy_password == "p:ss"
+
+
+def test_invalid_proxy_scheme_is_rejected() -> None:
+    with pytest.raises(ValueError, match="must use http"):
+        ImapMailboxService(proxy_url="ftp://proxy.example:21")
+
+
+class FakeProxySocket:
+    def __init__(self, response: bytes) -> None:
+        self.response = bytearray(response)
+        self.sent = b""
+
+    def sendall(self, value: bytes) -> None:
+        self.sent += value
+
+    def recv(self, _size: int) -> bytes:
+        if not self.response:
+            return b""
+        return bytes([self.response.pop(0)])
+
+
+def test_http_connect_sends_basic_auth_without_leaking_it_to_target() -> None:
+    connection = FakeProxySocket(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+    _http_connect(
+        connection,
+        "imap.mail.com",
+        993,
+        username="dynamic-user",
+        password="dynamic-password",
+    )
+
+    request = connection.sent.decode("ascii")
+    assert request.startswith("CONNECT imap.mail.com:993 HTTP/1.1\r\n")
+    assert "Proxy-Authorization: Basic " in request
+
+
+def test_http_connect_rejects_proxy_error() -> None:
+    connection = FakeProxySocket(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+
+    with pytest.raises(OSError, match="407 Proxy Authentication Required"):
+        _http_connect(connection, "imap.mail.com", 993, username=None, password=None)

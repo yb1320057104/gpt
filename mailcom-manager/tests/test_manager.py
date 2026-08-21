@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from manager.alias_creator import AliasCreationResult
 from manager.app import create_app
-from manager.imap_client import MailSummary
+from manager.imap_client import ImapMailboxService, MailSummary
 from manager.server_sync import ServerSyncError, ServerSyncResult
 
 
@@ -87,6 +87,52 @@ def test_import_list_and_api_never_return_password(tmp_path: Path) -> None:
     assert "mail-password" not in serialized
     assert "duplicate-password" not in serialized
     assert "password" not in payload["items"][0]
+
+
+def test_imap_proxy_settings_apply_and_survive_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    for name in ("MAILCOM_IMAP_HOST", "MAILCOM_IMAP_PORT", "MAILCOM_IMAP_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    database = tmp_path / "manager.db"
+    cipher = FakeCipher()
+    app = create_app(
+        db_path=database,
+        cipher=cipher,
+        imap_service=ImapMailboxService(proxy_url=""),
+    )
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/settings/imap",
+        json={
+            "imapHost": "imap.mail.com",
+            "imapPort": 993,
+            "proxyEnabled": True,
+            "proxyScheme": "http",
+            "proxyHost": "127.0.0.1",
+            "proxyPort": 8899,
+            "proxyUsername": "dynamic-user",
+            "proxyPassword": "dynamic-password",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["route"] == "http"
+    assert payload["proxyHost"] == "127.0.0.1"
+    assert payload["proxyPort"] == 8899
+    assert payload["proxyHasPassword"] is True
+    assert "dynamic-password" not in response.text
+    settings_file = tmp_path / "imap-settings.json"
+    assert "dynamic-password" not in settings_file.read_text(encoding="utf-8")
+
+    restarted = create_app(db_path=database, cipher=cipher)
+    restarted_settings = TestClient(restarted).get("/api/settings/imap").json()
+    assert restarted_settings["route"] == "http"
+    assert restarted_settings["proxyHost"] == "127.0.0.1"
+    assert restarted_settings["proxyPort"] == 8899
+    assert restarted_settings["proxyHasPassword"] is True
 
 
 def test_server_sync_pushes_complete_snapshot_without_returning_password(

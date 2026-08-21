@@ -344,6 +344,15 @@ def test_mailcom_alias_sync_imports_only_alias_items_with_local_urls() -> None:
                     ),
                 },
                 {
+                    "email": "alias.two@example.com",
+                    "accountEmail": "owner@gardener.com",
+                    "isAlias": True,
+                    "accessUrl": (
+                        "http://127.0.0.1:3211/code/"
+                        "abcdefghijklmnopqrstuvwxyz012345ABCDEFGH"
+                    ),
+                },
+                {
                     "email": "outside@example.com",
                     "accountEmail": "owner@gardener.com",
                     "isAlias": True,
@@ -357,16 +366,22 @@ def test_mailcom_alias_sync_imports_only_alias_items_with_local_urls() -> None:
     )
 
     assert result.model_dump() == {
-        "total": 2,
-        "imported": 1,
+        "total": 3,
+        "imported": 2,
         "duplicateCount": 0,
         "errorCount": 1,
     }
     assert store.emails == {
         "alias.one@example.com|"
-        "http://127.0.0.1:3211/api/mail/latest?email=alias.one%40example.com"
+        "http://127.0.0.1:3211/api/mail/latest?email=alias.one%40example.com",
+        "alias.two@example.com|"
+        "http://127.0.0.1:3211/code/"
+        "abcdefghijklmnopqrstuvwxyz012345ABCDEFGH",
     }
-    assert store.email_sources == [("mailcom_alias", "owner@gardener.com")]
+    assert store.email_sources == [
+        ("mailcom_alias", "owner@gardener.com"),
+        ("mailcom_alias", "owner@gardener.com"),
+    ]
 
 
 def test_proxy_country_inference_and_explicit_import_classification() -> None:

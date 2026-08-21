@@ -9,7 +9,8 @@
 - 批量测试 IMAP 登录
 - 只读查看 INBOX、Spam 和 Junk
 - 提取邮件中的六位验证码
-- 自动使用本机 `127.0.0.1:7897` SOCKS/Mixed 代理（监听存在时）
+- 支持自定义 IMAP 地址、端口及 HTTP/HTTPS/SOCKS4/SOCKS5 代理
+- 未显式配置代理时，自动使用本机 `127.0.0.1:7897` SOCKS/Mixed 代理（监听存在时）
 - 搜索、复制邮箱和删除本地记录
 - REST API 与 Swagger 文档
 - 通过 SSH 将主邮箱、最新密码和别名全量推送到独立服务器
@@ -80,4 +81,41 @@ ALIAS_EMAIL----http://127.0.0.1:3211/code/不可猜测的访问密钥
 - 日志：`data/server.stdout.log`、`data/server.stderr.log`
 - 密码：DPAPI 加密 BLOB，仅当前 Windows 用户可解密
 
-可用 `MAILCOM_IMAP_PROXY=socks5://HOST:PORT` 覆盖默认代理；留空时直接连接。
+## 自定义 IMAP 与代理
+
+启动时可以显式指定 IMAP 地址、端口和代理 URL：
+
+```powershell
+.\mailcom-manager\start.ps1 `
+  -ImapHost "imap.mail.com" `
+  -ImapPort 993 `
+  -ImapProxy "http://用户名:密码@代理IP:端口"
+```
+
+也可以从仓库根目录传入同样的参数：
+
+```powershell
+.\启动MailCom管理器.cmd -ImapProxy "http://用户名:密码@代理IP:端口"
+```
+
+`-ImapProxy` 支持以下格式，用户名和密码可省略；其中包含 `@`、`:` 等特殊字符时需使用 URL 编码：
+
+```text
+http://HOST:PORT
+http://USERNAME:PASSWORD@HOST:PORT
+https://USERNAME:PASSWORD@HOST:PORT
+socks4://HOST:PORT
+socks4a://HOST:PORT
+socks5://HOST:PORT
+socks5h://USERNAME:PASSWORD@HOST:PORT
+```
+
+也可以使用环境变量 `MAILCOM_IMAP_HOST`、`MAILCOM_IMAP_PORT` 和 `MAILCOM_IMAP_PROXY`。显式参数或环境变量优先；没有配置代理时直接连接，但如果启动时检测到本机 `127.0.0.1:7897` 正在监听，则仍自动使用该 SOCKS5 代理。
+
+要明确禁用代理并跳过 `7897` 自动检测，可使用：
+
+```powershell
+.\mailcom-manager\start.ps1 -DirectImap
+```
+
+更改这些参数前需要先停止正在运行的 MailCom Manager。
