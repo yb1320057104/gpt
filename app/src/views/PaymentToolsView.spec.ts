@@ -469,14 +469,15 @@ describe('PaymentToolsView', () => {
         currency: 'USD',
       },
     })
-    const getTask = vi.spyOn(dataGateway, 'getPaymentExtractorTask').mockResolvedValue(completed)
     const open = vi.spyOn(window, 'open').mockImplementation(() => null)
     const wrapper = mountView([running])
     await flushPromises()
+    const listTasks = vi.mocked(dataGateway.listPaymentExtractorTasks)
+    listTasks.mockResolvedValue({ tasks: [completed] })
 
     await vi.advanceTimersByTimeAsync(1200)
     await flushPromises()
-    expect(getTask).toHaveBeenCalledWith('poll-task')
+    expect(listTasks).toHaveBeenCalledTimes(2)
     expect(wrapper.text()).toContain('https://pay.example.test/provider/fixture')
     expect(wrapper.text()).toContain('1.25 USD')
 

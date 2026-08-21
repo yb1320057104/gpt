@@ -1,5 +1,9 @@
 param(
     [int]$Port = 3211,
+    [string]$ImapHost = "",
+    [int]$ImapPort = 0,
+    [string]$ImapProxy = "",
+    [switch]$DirectImap,
     [switch]$NoBrowser
 )
 
@@ -15,9 +19,36 @@ if (-not (Test-Path -LiteralPath $python)) {
 }
 
 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+$customImap = $PSBoundParameters.ContainsKey("ImapHost") -or
+    $PSBoundParameters.ContainsKey("ImapPort") -or
+    $PSBoundParameters.ContainsKey("ImapProxy") -or $DirectImap
+if ($listener -and $customImap) {
+    throw "MailCom Manager is already running. Stop it before changing IMAP settings."
+}
+if ($DirectImap -and $PSBoundParameters.ContainsKey("ImapProxy")) {
+    throw "DirectImap and ImapProxy cannot be used together"
+}
+
+if ($ImapHost) {
+    $env:MAILCOM_IMAP_HOST = $ImapHost
+}
+if ($ImapPort) {
+    if ($ImapPort -lt 1 -or $ImapPort -gt 65535) {
+        throw "IMAP port must be between 1 and 65535"
+    }
+    $env:MAILCOM_IMAP_PORT = "$ImapPort"
+}
+if ($PSBoundParameters.ContainsKey("ImapProxy")) {
+    $env:MAILCOM_IMAP_PROXY = $ImapProxy
+}
+if ($DirectImap) {
+    Remove-Item Env:MAILCOM_IMAP_PROXY -ErrorAction SilentlyContinue
+}
+
 if (-not $listener) {
     $localProxy = Get-NetTCPConnection -LocalPort 7897 -State Listen -ErrorAction SilentlyContinue
-    if ($localProxy -and -not $env:MAILCOM_IMAP_PROXY) {
+    $savedImapSettings = Test-Path -LiteralPath (Join-Path $root "data\imap-settings.json")
+    if ($localProxy -and -not $savedImapSettings -and -not $customImap -and -not $env:MAILCOM_IMAP_PROXY) {
         $env:MAILCOM_IMAP_PROXY = "socks5://127.0.0.1:7897"
     }
     $stdout = Join-Path $root "data\server.stdout.log"

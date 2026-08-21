@@ -31,8 +31,8 @@
       </div>
       <div class="hero-signal">
         <span>IMAP ENDPOINT</span>
-        <strong>imap.mail.com : 993</strong>
-        <small>SSL · READ ONLY · BODY.PEEK</small>
+        <strong id="imapEndpoint">imap.mail.com : 993</strong>
+        <small id="imapRoute">SSL · DIRECT · READ ONLY</small>
       </div>
     </section>
 
@@ -54,6 +54,7 @@
           <button id="refreshButton" class="button ghost">刷新</button>
           <button id="copyRegistrationButton" class="button ghost">复制注册机格式</button>
           <button id="testAllButton" class="button secondary">测试全部</button>
+          <button id="imapSettingsButton" class="button secondary">IMAP / 代理设置</button>
           <button id="serverSyncButton" class="button secondary">推送服务器</button>
           <label class="bulk-concurrency">并发
             <select id="aliasConcurrencySelect" aria-label="分裂邮箱并发数">
@@ -186,6 +187,43 @@
       <footer>
         <button id="cancelServerSync" type="button" class="button ghost">取消</button>
         <button id="submitServerSync" type="submit" class="button primary">开始推送</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="imapSettingsDialog" class="modal imap-settings-modal">
+    <form method="dialog" class="modal-shell" id="imapSettingsForm">
+      <header>
+        <div><span class="eyebrow">CONNECTION SETTINGS</span><h2>IMAP / 动态代理设置</h2></div>
+        <button id="closeImapSettingsDialog" type="button" class="icon-button" aria-label="关闭">×</button>
+      </header>
+      <div class="format-note">
+        <strong>保存后立即生效，重启后自动恢复</strong>
+        <span>代理密码使用 Windows DPAPI 加密保存在本机，页面和 API 不会返回密码。</span>
+      </div>
+      <div class="imap-settings-grid">
+        <label class="wide"><span>IMAP 主机 / IP</span><input id="imapSettingsHost" required maxlength="253" autocomplete="off" value="imap.mail.com"></label>
+        <label><span>IMAP 端口</span><input id="imapSettingsPort" required type="number" min="1" max="65535" value="993"></label>
+        <label class="proxy-toggle wide"><input id="imapProxyEnabled" type="checkbox"><span>启用动态代理</span></label>
+        <label><span>代理协议</span>
+          <select id="imapProxyScheme">
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+            <option value="socks5h">SOCKS5H（远程 DNS）</option>
+            <option value="socks5">SOCKS5</option>
+            <option value="socks4a">SOCKS4A</option>
+            <option value="socks4">SOCKS4</option>
+          </select>
+        </label>
+        <label class="wide"><span>代理 IP / 主机</span><input id="imapProxyHost" maxlength="253" autocomplete="off" placeholder="127.0.0.1"></label>
+        <label><span>代理端口</span><input id="imapProxyPort" type="number" min="1" max="65535" placeholder="7890"></label>
+        <label class="wide"><span>代理用户名（可选）</span><input id="imapProxyUsername" maxlength="512" autocomplete="off"></label>
+        <label class="wide"><span>代理密码（可选）</span><input id="imapProxyPassword" type="password" autocomplete="new-password" placeholder="留空则保留现有密码"></label>
+      </div>
+      <div id="imapSettingsResult" class="inline-result" hidden></div>
+      <footer>
+        <button id="cancelImapSettings" type="button" class="button ghost">取消</button>
+        <button id="submitImapSettings" type="submit" class="button primary">保存并立即应用</button>
       </footer>
     </form>
   </dialog>

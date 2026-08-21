@@ -1882,13 +1882,28 @@ class ResourceService:
             key = normalize_email(email)
             try:
                 parsed = urlsplit(access_url)
-                valid_local_url = (
+                valid_local_base = (
                     parsed.scheme.casefold() == "http"
                     and (parsed.hostname or "").casefold() in {"127.0.0.1", "localhost"}
                     and (parsed.port or 80) == 3211
+                    and parsed.username is None
+                    and parsed.password is None
+                )
+                legacy_url = (
+                    valid_local_base
                     and parsed.path.rstrip("/").casefold() == "/api/mail/latest"
                 )
+                capability_url = (
+                    valid_local_base
+                    and re.fullmatch(r"/code/[A-Za-z0-9_-]{32,128}", parsed.path)
+                    is not None
+                    and not parsed.query
+                    and not parsed.fragment
+                )
+                valid_local_url = legacy_url or capability_url
             except ValueError:
+                legacy_url = False
+                capability_url = False
                 valid_local_url = False
             if (
                 not EMAIL_PATTERN.fullmatch(email)
@@ -1897,7 +1912,7 @@ class ResourceService:
             ):
                 errors += 1
                 continue
-            expected_url = (
+            expected_url = access_url if capability_url else (
                 "http://127.0.0.1:3211/api/mail/latest?"
                 f"{urlencode({'email': email})}"
             )

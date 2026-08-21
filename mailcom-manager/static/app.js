@@ -114,6 +114,86 @@ async function loadStats() {
   $('statAliases').textContent = stats.aliases
 }
 
+function renderImapSettings(settings) {
+  $('imapEndpoint').textContent = `${settings.imapHost} : ${settings.imapPort}`
+  const route = settings.proxyEnabled
+    ? `${settings.proxyScheme.toUpperCase()} · ${settings.proxyHost}:${settings.proxyPort}`
+    : 'DIRECT'
+  $('imapRoute').textContent = `SSL · ${route} · READ ONLY`
+}
+
+function toggleProxyFields() {
+  const enabled = $('imapProxyEnabled').checked
+  for (const id of ['imapProxyScheme', 'imapProxyHost', 'imapProxyPort', 'imapProxyUsername', 'imapProxyPassword']) {
+    $(id).disabled = !enabled
+  }
+}
+
+async function loadImapSettings() {
+  const settings = await api('/api/settings/imap')
+  renderImapSettings(settings)
+  return settings
+}
+
+async function openImapSettings() {
+  try {
+    const settings = await loadImapSettings()
+    $('imapSettingsHost').value = settings.imapHost
+    $('imapSettingsPort').value = settings.imapPort
+    $('imapProxyEnabled').checked = settings.proxyEnabled
+    $('imapProxyScheme').value = settings.proxyScheme || 'http'
+    $('imapProxyHost').value = settings.proxyHost || ''
+    $('imapProxyPort').value = settings.proxyPort || ''
+    $('imapProxyUsername').value = settings.proxyUsername || ''
+    $('imapProxyPassword').value = ''
+    $('imapProxyPassword').placeholder = settings.proxyHasPassword
+      ? '留空则保留现有密码'
+      : '可选'
+    $('imapSettingsResult').hidden = true
+    toggleProxyFields()
+    $('imapSettingsDialog').showModal()
+  } catch (error) { toast(error.message, 'error') }
+}
+
+async function saveImapSettings(event) {
+  event.preventDefault()
+  const proxyEnabled = $('imapProxyEnabled').checked
+  const payload = {
+    imapHost: $('imapSettingsHost').value.trim(),
+    imapPort: Number.parseInt($('imapSettingsPort').value, 10),
+    proxyEnabled,
+    proxyScheme: $('imapProxyScheme').value,
+    proxyHost: $('imapProxyHost').value.trim(),
+    proxyPort: proxyEnabled ? Number.parseInt($('imapProxyPort').value, 10) : null,
+    proxyUsername: $('imapProxyUsername').value,
+    proxyPassword: $('imapProxyPassword').value || null,
+  }
+  if (!payload.imapHost || !Number.isInteger(payload.imapPort)) {
+    return toast('请填写有效的 IMAP 主机和端口', 'error')
+  }
+  if (proxyEnabled && (!payload.proxyHost || !Number.isInteger(payload.proxyPort))) {
+    return toast('请填写有效的代理 IP 和端口', 'error')
+  }
+  const button = $('submitImapSettings')
+  button.disabled = true
+  button.textContent = '正在保存…'
+  try {
+    const settings = await api('/api/settings/imap', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    })
+    renderImapSettings(settings)
+    $('imapProxyPassword').value = ''
+    $('imapSettingsResult').hidden = false
+    $('imapSettingsResult').textContent = `已应用：${settings.proxyEnabled ? `${settings.proxyScheme}://${settings.proxyHost}:${settings.proxyPort}` : 'IMAP 直连'}`
+    toast('IMAP / 代理设置已保存并立即生效')
+  } catch (error) { toast(error.message, 'error') }
+  finally {
+    button.disabled = false
+    button.textContent = '保存并立即应用'
+  }
+}
+
 async function loadAccounts() {
   const params = new URLSearchParams({ q: state.query, page: '1', pageSize: '100' })
   const data = await api(`/api/accounts?${params}`)
@@ -466,6 +546,11 @@ $('importForm').addEventListener('submit', async (event) => {
 $('refreshButton').addEventListener('click', () => loadAccounts().catch((error) => toast(error.message, 'error')))
 $('copyRegistrationButton').addEventListener('click', copyRegistrationLines)
 $('testAllButton').addEventListener('click', testAll)
+$('imapSettingsButton').addEventListener('click', openImapSettings)
+$('imapProxyEnabled').addEventListener('change', toggleProxyFields)
+$('imapSettingsForm').addEventListener('submit', saveImapSettings)
+$('closeImapSettingsDialog').addEventListener('click', () => $('imapSettingsDialog').close())
+$('cancelImapSettings').addEventListener('click', () => $('imapSettingsDialog').close())
 $('serverSyncButton').addEventListener('click', () => {
   $('serverSyncPassword').value = ''
   $('serverSyncResult').hidden = true
@@ -501,5 +586,6 @@ $('searchInput').addEventListener('input', (event) => {
 
 Promise.all([
   loadAccounts(),
+  loadImapSettings(),
   resumeBulkAliases(),
 ]).catch((error) => toast(error.message, 'error'))

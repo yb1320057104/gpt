@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -61,6 +64,66 @@ class ServerSyncResponse(ApiModel):
     accounts: int
     aliases: int
     hostKeySha256: str
+
+
+class ImapSettingsPayload(ApiModel):
+    imapHost: str = Field(min_length=1, max_length=253)
+    imapPort: int = Field(ge=1, le=65535)
+    proxyEnabled: bool = False
+    proxyScheme: Literal["http", "https", "socks4", "socks4a", "socks5", "socks5h"] = "http"
+    proxyHost: str = Field(default="", max_length=253)
+    proxyPort: int | None = Field(default=None, ge=1, le=65535)
+    proxyUsername: str = Field(default="", max_length=512)
+    proxyPassword: SecretStr | None = None
+
+
+def _load_imap_settings(path: Path, cipher: Any) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        encrypted = base64.b64decode(str(data.get("proxyUrlEncrypted") or ""))
+        proxy_url = cipher.decrypt(encrypted) if encrypted else ""
+        return {
+            "host": str(data["imapHost"]),
+            "port": int(data["imapPort"]),
+            "proxy_url": proxy_url,
+        }
+    except Exception:
+        return None
+
+
+def _save_imap_settings(
+    path: Path,
+    cipher: Any,
+    *,
+    host: str,
+    port: int,
+    proxy_url: str,
+) -> None:
+    encrypted = cipher.encrypt(proxy_url) if proxy_url else b""
+    payload = {
+        "imapHost": host,
+        "imapPort": port,
+        "proxyUrlEncrypted": base64.b64encode(encrypted).decode("ascii"),
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _public_imap_settings(mail: Any) -> dict[str, Any]:
+    return {
+        "imapHost": mail.host,
+        "imapPort": mail.port,
+        "proxyEnabled": bool(mail.proxy_host),
+        "proxyScheme": mail.proxy_scheme or "http",
+        "proxyHost": mail.proxy_host,
+        "proxyPort": mail.proxy_port or None,
+        "proxyUsername": mail.proxy_username or "",
+        "proxyHasPassword": bool(mail.proxy_password),
+        "route": mail.route,
+    }
 
 
 def _recipient_matches(value: str, email: str) -> bool:
@@ -141,11 +204,20 @@ def create_app(
         docs_url="/docs",
         redoc_url=None,
     )
-    store = AccountStore(
-        db_path or Path(os.getenv("MAILCOM_MANAGER_DB", str(DEFAULT_DB_PATH))),
-        cipher or DpapiCredentialCipher(),
+    resolved_db_path = db_path or Path(
+        os.getenv("MAILCOM_MANAGER_DB", str(DEFAULT_DB_PATH))
     )
-    mail = imap_service or ImapMailboxService()
+    credential_cipher = cipher or DpapiCredentialCipher()
+    store = AccountStore(resolved_db_path, credential_cipher)
+    settings_path = resolved_db_path.parent / "imap-settings.json"
+    saved_settings = _load_imap_settings(settings_path, credential_cipher)
+    environment_configured = any(
+        os.getenv(name)
+        for name in ("MAILCOM_IMAP_HOST", "MAILCOM_IMAP_PORT", "MAILCOM_IMAP_PROXY")
+    )
+    mail = imap_service or ImapMailboxService(
+        **({} if environment_configured or not saved_settings else saved_settings)
+    )
     application.state.store = store
     application.state.mail = mail
     application.state.alias_creator = alias_creator or MailComAliasCreator()
@@ -173,7 +245,60 @@ def create_app(
             "imapHost": getattr(mail, "host", "imap.mail.com"),
             "imapPort": getattr(mail, "port", 993),
             "imapRoute": mail.route,
+            "imapProxyHost": getattr(mail, "proxy_host", "") or None,
+            "imapProxyPort": getattr(mail, "proxy_port", 0) or None,
         }
+
+    @application.get("/api/settings/imap")
+    async def get_imap_settings() -> dict[str, Any]:
+        return _public_imap_settings(mail)
+
+    @application.put("/api/settings/imap")
+    async def update_imap_settings(payload: ImapSettingsPayload) -> dict[str, Any]:
+        host = payload.imapHost.strip()
+        if not host or any(character.isspace() for character in host):
+            raise HTTPException(status_code=422, detail="IMAP 主机/IP 无效")
+        proxy_url = ""
+        if payload.proxyEnabled:
+            proxy_host = payload.proxyHost.strip()
+            if not proxy_host or payload.proxyPort is None:
+                raise HTTPException(status_code=422, detail="请填写代理 IP/主机和端口")
+            password = payload.proxyPassword.get_secret_value() if payload.proxyPassword else ""
+            if not password and mail.proxy_password and payload.proxyUsername == (mail.proxy_username or ""):
+                password = mail.proxy_password
+            authentication = ""
+            if payload.proxyUsername:
+                authentication = quote(payload.proxyUsername, safe="")
+                if password:
+                    authentication += f":{quote(password, safe='')}"
+                authentication += "@"
+            proxy_address = f"[{proxy_host}]" if ":" in proxy_host else proxy_host
+            proxy_url = (
+                f"{payload.proxyScheme}://{authentication}"
+                f"{proxy_address}:{payload.proxyPort}"
+            )
+        try:
+            configured = ImapMailboxService(
+                host=host,
+                port=payload.imapPort,
+                proxy_url=proxy_url,
+            )
+            await asyncio.to_thread(
+                _save_imap_settings,
+                settings_path,
+                credential_cipher,
+                host=configured.host,
+                port=configured.port,
+                proxy_url=configured.proxy_url,
+            )
+            mail.reconfigure(
+                host=configured.host,
+                port=configured.port,
+                proxy_url=configured.proxy_url,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _public_imap_settings(mail)
 
     @application.get("/api/stats")
     async def stats() -> dict[str, int]:

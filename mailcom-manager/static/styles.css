@@ -178,6 +178,16 @@ textarea:focus { border-color: #4c8978; box-shadow: 0 0 0 3px rgb(98 230 169 / 7
 .server-sync-grid input { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid #2b403b; border-radius: 9px; outline: none; color: var(--text); background: #07100f; }
 .server-sync-grid input:focus { border-color: #4c8978; box-shadow: 0 0 0 3px rgb(98 230 169 / 7%); }
 
+.imap-settings-modal { width: min(700px, calc(100vw - 28px)); }
+.imap-settings-grid { display: grid; grid-template-columns: 1fr 150px; gap: 14px; padding: 8px 22px 4px; }
+.imap-settings-grid label { display: grid; gap: 7px; color: var(--muted); font-size: 11px; }
+.imap-settings-grid label.wide { grid-column: 1; }
+.imap-settings-grid input, .imap-settings-grid select { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid #2b403b; border-radius: 9px; outline: none; color: var(--text); background: #07100f; }
+.imap-settings-grid input:focus, .imap-settings-grid select:focus { border-color: #4c8978; box-shadow: 0 0 0 3px rgb(98 230 169 / 7%); }
+.imap-settings-grid input:disabled, .imap-settings-grid select:disabled { cursor: not-allowed; opacity: .45; }
+.imap-settings-grid .proxy-toggle { display: flex; align-items: center; flex-direction: row; min-height: 38px; color: var(--text); }
+.imap-settings-grid .proxy-toggle input { width: 17px; min-height: 17px; accent-color: var(--green); }
+
 .toast { position: fixed; right: 24px; bottom: 24px; z-index: 20; max-width: min(420px, calc(100vw - 48px)); padding: 12px 15px; border: 1px solid #356153; border-radius: 10px; opacity: 0; color: var(--text); background: #10201d; transform: translateY(12px); transition: .2s; pointer-events: none; font-size: 11px; box-shadow: 0 18px 50px rgb(0 0 0 / 35%); }
 .toast.show { opacity: 1; transform: translateY(0); }
 .toast.error { border-color: #6e3940; color: #ffd4d8; background: #281417; }
@@ -193,7 +203,8 @@ textarea:focus { border-color: #4c8978; box-shadow: 0 0 0 3px rgb(98 230 169 / 7
 }
 
 @media (max-width: 620px) {
-  .server-sync-grid { grid-template-columns: 1fr; }
+  .server-sync-grid, .imap-settings-grid { grid-template-columns: 1fr; }
+  .imap-settings-grid label, .imap-settings-grid label.wide { grid-column: 1; }
 }
 
 @media (max-width: 620px) {
