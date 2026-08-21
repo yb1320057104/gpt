@@ -149,6 +149,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.
 | --- | --- |
 | `HEROSMS_API_KEY` | HeroSMS API Key |
 | `OPLL_WEB_PASSWORD` | 支付工作台请求密码 |
+| `AUTOREGISTER_SOURCE_ADMIN_PASSWORD` | 提链业务后台管理密码（必须自行配置；不会使用源项目硬编码密码） |
+| `AUTOREGISTER_SOURCE_ADMIN_ALLOW_IPS` | 可选，提链业务后台管理 IP 白名单，多个地址用逗号分隔 |
 | `OPLL_CHECKOUT_PROXY` | 默认 Checkout 代理 |
 | `OPLL_UPDATE_PROXY` | 默认资格查询/Update 代理 |
 | `IPROCKET_BRIDGE_PORT` | 特殊代理本机桥端口 |

@@ -700,6 +700,25 @@ def extract_cs_live_provider(
             )
     else:
         emit_log(log, f"CS Elements refresh skipped: amount unchanged ({final_elements_amount})")
+    if payment_method == "card":
+        try:
+            card_amount = int(final_elements_amount)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(502, f"直卡 Checkout 无法识别最终应付金额：{final_elements_amount}") from exc
+        if card_amount != 0:
+            raise ProtocolError(409, f"直卡 Checkout 账单不是 0：amount={card_amount}")
+        if stage_callback:
+            stage_callback("extract_link", {
+                "支付方式": "银行卡 Checkout",
+                "最终应付最小金额": card_amount,
+                "链接类型": "Stripe Checkout 托管链接",
+            })
+        return {
+            "payment_method_id": "",
+            "stripe_redirect_url": hosted_url,
+            "provider_url": hosted_url,
+            "card_url": hosted_url,
+        }
     if stage_callback:
         stage_callback("payment_confirmation")
     if payment_method in {"kakao_pay", "momo"}:

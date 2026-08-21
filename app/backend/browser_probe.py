@@ -511,13 +511,19 @@ class BrowserProbeRunner:
                                     lease.id,
                                     total_attempts,
                                 )
-                                if (
-                                    registration_proxy_rotations
-                                    >= self.max_registration_proxy_rotations
-                                ):
-                                    raise
-                                registration_proxy_rotations += 1
-                                break
+                                # These failures describe browser/page state,
+                                # not the proxy transport. Rotating here made a
+                                # slow Roxy/Ant window churn through the whole
+                                # proxy pool and repeatedly relaunch browsers.
+                                # Retry the same sticky proxy only; if its retry
+                                # budget is exhausted, preserve the real page
+                                # error instead of blaming another proxy.
+                                if attempt < self.settings.proxyRetryCount:
+                                    await self.recovery_sleep(
+                                        self.browser_open_recovery_interval_seconds
+                                    )
+                                    continue
+                                raise
                             automation_result = attempt_result.automation
                             password_submission = attempt_result.password_submission
                             verification = attempt_result.verification

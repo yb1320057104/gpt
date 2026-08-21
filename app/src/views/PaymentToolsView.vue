@@ -45,6 +45,10 @@ interface SavedPreferences {
   concurrency?: number
   autoRetryCount?: number
   idealBank?: string
+  promoCampaignId?: string
+  checkoutUiMode?: 'auto' | 'hosted' | 'custom'
+  requireZero?: boolean
+  gopayBrowserFallback?: boolean
 }
 
 const PREFERENCES_KEY = 'autoregister.payment-extractor.preferences'
@@ -77,6 +81,7 @@ const FALLBACK_COUNTRIES: PaymentExtractorOption[] = [
   { value: 'FR', label: '法国 · EUR' },
 ]
 const FALLBACK_METHODS: PaymentExtractorOption[] = [
+  { value: 'card', label: '银行卡 Checkout', resultKind: 'checkout' },
   { value: 'paypal', label: 'PayPal' },
   { value: 'gopay', label: 'GoPay', country: 'ID', currency: 'IDR' },
   { value: 'gcash', label: 'GCash', country: 'PH', currency: 'PHP' },
@@ -105,6 +110,10 @@ const country = ref('DE')
 const forceCountry = ref('')
 const paymentMethod = ref('paypal')
 const idealBank = ref('n26')
+const promoCampaignId = ref('plus-1-month-free')
+const checkoutUiMode = ref<'auto' | 'hosted' | 'custom'>('auto')
+const requireZero = ref(true)
+const gopayBrowserFallback = ref(false)
 const checkoutProxyPool = ref('')
 const updateProxyPool = ref('')
 const proxySourceUrl = ref('')
@@ -219,6 +228,10 @@ watch(
     concurrency,
     autoRetryCount,
     idealBank,
+    promoCampaignId,
+    checkoutUiMode,
+    requireZero,
+    gopayBrowserFallback,
   ],
   savePreferences,
 )
@@ -263,6 +276,10 @@ function restorePreferences() {
     if (typeof saved.idealBank === 'string' && saved.idealBank.trim()) {
       idealBank.value = saved.idealBank.trim()
     }
+    if (typeof saved.promoCampaignId === 'string') promoCampaignId.value = saved.promoCampaignId.trim() || 'plus-1-month-free'
+    if (saved.checkoutUiMode === 'auto' || saved.checkoutUiMode === 'hosted' || saved.checkoutUiMode === 'custom') checkoutUiMode.value = saved.checkoutUiMode
+    if (typeof saved.requireZero === 'boolean') requireZero.value = saved.requireZero
+    if (typeof saved.gopayBrowserFallback === 'boolean') gopayBrowserFallback.value = saved.gopayBrowserFallback
   } catch {
     // Keep service defaults when browser storage is unavailable or malformed.
   }
@@ -314,6 +331,10 @@ function savePreferences() {
     concurrency: concurrency.value,
     autoRetryCount: autoRetryCount.value,
     idealBank: idealBank.value,
+    promoCampaignId: promoCampaignId.value,
+    checkoutUiMode: checkoutUiMode.value,
+    requireZero: requireZero.value,
+    gopayBrowserFallback: gopayBrowserFallback.value,
   }
   try {
     localStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences))
@@ -434,6 +455,7 @@ function readResultString(result: PaymentExtractorResult | null | undefined, ...
 function resultUrl(task: PaymentExtractorTask) {
   return readResultString(
     task.result,
+    'cardUrl',
     'providerUrl',
     'paypalUrl',
     'gopayUrl',
@@ -446,6 +468,7 @@ function resultUrl(task: PaymentExtractorTask) {
     'kakaoPayUrl',
     'momoUrl',
     'provider_url',
+    'card_url',
     'paypal_url',
     'gopay_url',
     'gcash_url',
@@ -659,6 +682,10 @@ async function submitStoredAccounts() {
         rotateUpdateProxy: rotateUpdateSession.value,
         autoRetryCount: autoRetryCount.value,
         idealBank: idealBank.value,
+        promoCampaignId: promoCampaignId.value,
+        checkoutUiMode: checkoutUiMode.value,
+        requireZero: requireZero.value,
+        gopayBrowserFallback: gopayBrowserFallback.value,
         stripeHcaptchaToken: stripeHcaptchaToken.value.trim(),
         country: country.value,
         paymentMethod: paymentMethod.value,
@@ -817,6 +844,10 @@ async function submitTokenItems(items: ExtractedAccessToken[]) {
         rotateUpdateProxy: rotateUpdateSession.value,
         autoRetryCount: autoRetryCount.value,
         idealBank: idealBank.value,
+        promoCampaignId: promoCampaignId.value,
+        checkoutUiMode: checkoutUiMode.value,
+        requireZero: requireZero.value,
+        gopayBrowserFallback: gopayBrowserFallback.value,
         stripeHcaptchaToken: stripeHcaptchaToken.value.trim(),
         country: country.value,
         paymentMethod: paymentMethod.value,
@@ -1090,6 +1121,12 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="payment-tools">
+    <el-alert
+      class="source-engine-notice"
+      type="success"
+      :closable="false"
+      title="源项目提链协议已并入当前页面：PayPal、GoPay、GCash、直卡 Checkout、PIX 及其他支付方式统一从下方配置并提交。"
+    />
     <div class="page-heading">
       <div>
         <h2>Access Token 提链控制台</h2>
@@ -1393,6 +1430,18 @@ onBeforeUnmount(() => {
               />
             </div>
             <div>
+              <label class="field-label" for="extractor-promo">优惠活动 ID</label>
+              <el-input id="extractor-promo" v-model="promoCampaignId" placeholder="plus-1-month-free" />
+            </div>
+            <div>
+              <label class="field-label" for="extractor-ui-mode">Checkout 界面模式</label>
+              <el-select id="extractor-ui-mode" v-model="checkoutUiMode">
+                <el-option label="自动" value="auto" />
+                <el-option label="Hosted" value="hosted" />
+                <el-option label="Custom" value="custom" />
+              </el-select>
+            </div>
+            <div>
               <label class="field-label" for="extractor-workbench-password">工作台密码（可选）</label>
               <el-input
                 id="extractor-workbench-password"
@@ -1431,6 +1480,8 @@ onBeforeUnmount(() => {
                   @change="updateConcurrency(false)"
                 />
               </div>
+              <el-checkbox v-model="requireZero">只接受 0 元账单</el-checkbox>
+              <el-checkbox v-if="paymentMethod === 'gopay'" v-model="gopayBrowserFallback">GoPay 浏览器回退</el-checkbox>
               <div class="concurrency-control">
                 <span>失败自动重试</span>
                 <el-input-number

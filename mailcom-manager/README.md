@@ -35,6 +35,7 @@ http://127.0.0.1:3211
 - `GET /api/accounts/{id}/messages`
 - `GET /api/accounts/{id}/latest-code`
 - `GET /api/mail/latest?email=邮箱地址`
+- `GET /code/{access_key}`：不可猜测的稳定接码地址，兼容长轮询 `?wait=60`
 - `GET /api/export/registration-lines`
 - `GET /api/export/registration-items`：供本机注册机同步分裂邮箱及其主邮箱归属。
 - `GET /api/accounts/{id}/aliases`
@@ -56,7 +57,7 @@ API 文档：`http://127.0.0.1:3211/docs`
 注册机导入格式：
 
 ```text
-邮箱----http://127.0.0.1:3211/api/mail/latest?email=URL编码后的邮箱
+邮箱----http://127.0.0.1:3211/code/不可猜测的访问密钥
 ```
 
 网页中的“复制注册机格式”会一次复制全部邮箱。
@@ -68,7 +69,7 @@ API 文档：`http://127.0.0.1:3211/docs`
 每个主邮箱和别名都有独立注册机地址：
 
 ```text
-ALIAS_EMAIL----http://127.0.0.1:3211/api/mail/latest?email=ALIAS_EMAIL_ENCODED
+ALIAS_EMAIL----http://127.0.0.1:3211/code/不可猜测的访问密钥
 ```
 
 别名读取会对 `To`、`Delivered-To`、`X-Original-To` 和 `Envelope-To` 收件人字段进行精确匹配，只返回投递给该别名的邮件，避免多个别名之间串验证码。“复制注册机格式”会同时导出主邮箱和所有别名。

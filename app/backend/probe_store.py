@@ -474,7 +474,22 @@ class MongoProbeStore:
         owner: str,
         *,
         lease_seconds: int = 180,
+        country: str | None = None,
     ) -> ProxyLease | None:
+        # `local7890` is a UI sentinel, not a MongoDB proxy document. Treat it
+        # exactly like the launch-page local proxy group so every account-pool
+        # checker can use the same selection.
+        if proxy_id == "local7890" or proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return ProxyLease(
+                id=f"{LOCAL_PROXY_ID_PREFIX}{owner}",
+                host="127.0.0.1",
+                port=7890,
+                username="",
+                password="",
+                country=str(country or "ZZ").upper(),
+                group=LOCAL_PROXY_GROUP,
+                scheme="http",
+            )
         now = utc_now()
         document = await self._guard(
             self.proxies.find_one_and_update(

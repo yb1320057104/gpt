@@ -70,6 +70,7 @@ _BILLING_VALUES = {
 SUPPORTED_COUNTRIES = tuple(COUNTRY_PROFILES)
 
 PAYMENT_METHOD_PROFILES = {
+    "card": {"country": None, "currency": None, "result_kind": "checkout"},
     "paypal": {"country": None, "currency": None, "result_kind": "redirect"},
     "gopay": {"country": "ID", "currency": "IDR", "result_kind": "redirect"},
     "gcash": {"country": "PH", "currency": "PHP", "result_kind": "redirect"},

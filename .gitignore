@@ -3,6 +3,7 @@
 /.reference/
 /.tmp/
 /.pytest_cache/
+/.pytest_*/
 /__pycache__/
 /artifacts/
 **/artifacts/
@@ -67,6 +68,12 @@ Thumbs.db
 /mailcom-manager/data/*
 !/mailcom-manager/data/.gitkeep
 /app/mongodb/mongod.yml
+
+# Protocol-registration local credentials and generated state
+/protocol-registration/config.json
+/protocol-registration/runtime/
+/protocol-registration/sessions/
+/protocol-registration/data/
 
 # Local Cloudflare Freemail deployment workspace and credentials
 /freemail-cloudflare/

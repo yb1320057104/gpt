@@ -12,7 +12,10 @@ from .web.env import load_configured_env, load_env_file
 from .logging_utils import configure_logging, safe_log_text
 from .models import ExtractionConfig
 
-SUPPORTED_PAYMENT_METHODS = ("paypal", "gopay", "gcash")
+SUPPORTED_PAYMENT_METHODS = (
+    "card", "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
+    "twint", "kakao_pay", "momo",
+)
 
 
 def parse_args() -> argparse.Namespace:

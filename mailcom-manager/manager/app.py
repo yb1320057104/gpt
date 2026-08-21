@@ -3,11 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -707,6 +707,29 @@ def create_app(
             "message": selected.public() if selected is not None else None,
         }
 
+    @application.get("/code/{access_key}")
+    async def capability_code(
+        access_key: str,
+        wait: int = Query(default=0, ge=0, le=60),
+    ) -> dict[str, Any]:
+        """Stable, unguessable OTP URL compatible with mail-com-code-api."""
+        email = await asyncio.to_thread(store.email_for_access_key, access_key)
+        if email is None:
+            raise HTTPException(status_code=404, detail="接码地址不存在")
+        deadline = time.monotonic() + wait
+        payload: dict[str, Any]
+        while True:
+            payload = await latest_mail_by_email(email)
+            code = payload.get("verification_code")
+            if code or time.monotonic() >= deadline:
+                message = payload.get("message")
+                return {
+                    **payload,
+                    "code": code,
+                    "mail": message if isinstance(message, dict) else None,
+                }
+            await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
     @application.get("/api/mail/payment-confirmation")
     async def payment_confirmation_by_email(
         email: str = Query(min_length=3, max_length=320),
@@ -771,11 +794,11 @@ def create_app(
         response_class=PlainTextResponse,
     )
     async def export_registration_lines(request: Request) -> PlainTextResponse:
-        emails = await asyncio.to_thread(store.all_mailboxes)
+        items = await asyncio.to_thread(store.registration_items)
         base = str(request.base_url).rstrip("/")
         lines = [
-            f"{email}----{base}/api/mail/latest?{urlencode({'email': email})}"
-            for email in emails
+            f"{item['email']}----{base}/code/{item['accessKey']}"
+            for item in items
         ]
         return PlainTextResponse(
             "\n".join(lines),
@@ -789,11 +812,10 @@ def create_app(
         return {
             "items": [
                 {
-                    **item,
-                    "accessUrl": (
-                        f"{base}/api/mail/latest?"
-                        f"{urlencode({'email': item['email']})}"
-                    ),
+                    "email": item["email"],
+                    "accountEmail": item["accountEmail"],
+                    "isAlias": item["isAlias"],
+                    "accessUrl": f"{base}/code/{item['accessKey']}",
                 }
                 for item in items
             ]

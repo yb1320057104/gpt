@@ -7,6 +7,8 @@ import json
 import os
 import queue
 import re
+from datetime import datetime, timezone
+import base64
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from pathlib import Path
@@ -49,6 +51,7 @@ from .paypal_agreement_service import (
     PaypalAgreementServiceError,
 )
 from .sandbox_checkout import router as sandbox_checkout_router
+from .protocol_registration_service import ProtocolRegistrationService
 from .pipeline_service import (
     AccountPipelineService,
     HeroSmsSettingsUpdate,
@@ -260,6 +263,58 @@ def create_app(
     )
     app.include_router(sandbox_checkout_router)
 
+    def _protocol_mailbox_line(item) -> str:
+        """Convert an email-pool record without changing legacy URL lines."""
+        email = str(item.email or "").strip()
+        access = str(item.accessUrl or "").strip()
+        kind = str(getattr(item, "mailboxKind", "url") or "url").strip().lower()
+        password = str(getattr(item, "mailboxPassword", "") or "").strip()
+        if kind in {"cfworker", "cf_worker"}:
+            return f"cfworker://{email}"
+        if kind in {"gmail", "gmail_imap"} and password:
+            return f"gmail://{email}---{password}"
+        # Keep the existing mail.com/capability URL contract exactly as-is.
+        return f"{email}----{access}"
+
+    async def import_protocol_result(data: dict):
+        email = str(data.get("email") or "").strip().lower()
+        if not email:
+            return
+        try:
+            mailbox = data.get("mailbox") or {}
+            plan_type = str(data.get("plan_type") or "free").lower()
+            account_type = plan_type if plan_type in {"free", "plus"} else "free"
+            account = await resource_service.create_account(AccountCreate(
+                email=email,
+                chatgptPassword=str(data.get("password") or "protocol-managed"),
+                totpSecret=str(data.get("totp_secret") or "not-configured"),
+                emailAccessUrl=str(mailbox.get("token") or mailbox.get("access_url") or "protocol-managed"),
+                accountType=account_type,
+                registrationCountry=(str(data.get("registration_country") or "").strip().upper() or None),
+            ))
+            token = str(data.get("access_token") or "").strip()
+            if token:
+                # Access tokens are normally JWTs, but keep import resilient to
+                # opaque tokens and malformed/stale session artifacts.
+                parts = token.split(".")
+                if len(parts) >= 2:
+                    try:
+                        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+                        claims = json.loads(base64.urlsafe_b64decode(padded).decode())
+                        exp = int(claims.get("exp") or 0)
+                        if exp > 0:
+                            await resource_service.store_account_access_token(
+                                account.id, token, datetime.fromtimestamp(exp, timezone.utc)
+                            )
+                    except (ValueError, KeyError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+                        pass
+        except DuplicateResourceError:
+            return
+        except Exception:
+            return
+
+    app.state.protocol_registration = ProtocolRegistrationService(Path(__file__).resolve().parent, import_protocol_result)
+
     @app.middleware("http")
     async def payment_workbench_auth(request: Request, call_next):
         # Keep the local service open by default, while matching the reference
@@ -272,6 +327,7 @@ def create_app(
             or path in {"/api/proxy/source", "/api/proxy/test"}
             or path.startswith("/api/payment-extractor")
             or path.startswith("/api/pipeline")
+            or path.startswith("/api/protocol-registration")
         )
         if protected and not _password_matches(request, _web_password()):
             return JSONResponse(
@@ -346,6 +402,78 @@ def create_app(
             status="ok" if mongo_health.status == "online" else "degraded",
             mongodb=mongo_health,
         )
+
+    @app.post("/api/protocol-registration/start")
+    async def protocol_registration_start(request: Request) -> dict:
+        payload = await request.json()
+        mailbox_file = str(payload.get("mailboxFile") or "").strip()
+        proxy = str(payload.get("proxy") or "").strip()
+        requested_proxy_pool = payload.get("proxyPool") or payload.get("proxy_pool") or []
+        if isinstance(requested_proxy_pool, str):
+            requested_proxy_pool = [item.strip() for item in requested_proxy_pool.replace(",", "\n").splitlines() if item.strip()]
+        elif not isinstance(requested_proxy_pool, list):
+            requested_proxy_pool = []
+        requested_country = str(payload.get("country") or "").strip().upper()
+        requested_group = str(payload.get("proxyGroup") or "").strip()
+        # Reuse the existing account-pool mailbox and proxy stores when the
+        # caller does not provide an explicit sidecar file/proxy.
+        if not mailbox_file:
+            mailbox_records = await resource_store.emails_for_export(None)
+            mailbox_path = Path(__file__).resolve().parent.parent.parent / "protocol-registration" / "runtime" / "existing-mailboxes.txt"
+            mailbox_path.parent.mkdir(parents=True, exist_ok=True)
+            mailbox_path.write_text(
+                "\n".join(_protocol_mailbox_line(item) for item in mailbox_records),
+                encoding="utf-8",
+            )
+            mailbox_file = str(mailbox_path) if mailbox_records else ""
+        if not proxy and not requested_proxy_pool:
+            candidates = await probe_store.all_eligible_proxy_candidates()
+            if requested_country:
+                candidates = [item for item in candidates if item.country == requested_country]
+            if requested_group:
+                candidates = [item for item in candidates if item.group == requested_group]
+            proxy_values = []
+            for item in candidates:
+                auth = f"{item.username}:{item.password}@" if item.username else ""
+                proxy_values.append(f"{item.scheme}://{auth}{item.host}:{item.port}")
+            requested_proxy_pool = proxy_values
+            proxy = proxy_values[0] if proxy_values else ""
+        return await request.app.state.protocol_registration.start(
+            count=payload.get("count", 1), workers=payload.get("workers", 1),
+            mailbox_file=mailbox_file, proxy=proxy, proxy_pool=requested_proxy_pool,
+        )
+
+    @app.get("/api/protocol-registration/{job_id}")
+    async def protocol_registration_status(job_id: str, request: Request) -> dict:
+        state = request.app.state.protocol_registration.get(job_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail="协议注册任务不存在")
+        return state
+
+    @app.post("/api/protocol-registration/import")
+    async def protocol_registration_import(request: Request) -> dict:
+        """Import one canonical protocol session into the normal account pool."""
+        payload = await request.json()
+        email = str(payload.get("email") or "").strip().lower()
+        if not email:
+            raise HTTPException(status_code=422, detail="协议结果缺少邮箱")
+        account = await resource_service.create_account(AccountCreate(
+            email=email,
+            chatgptPassword=str(payload.get("password") or "protocol-managed"),
+            totpSecret=str(payload.get("totp_secret") or "protocol-managed"),
+            emailAccessUrl=str(payload.get("email_access_url") or payload.get("mailbox_url") or "protocol-managed"),
+            accountType=str(payload.get("account_type") or "free"),
+            registrationCountry=str(payload.get("registration_country") or "") or None,
+        ))
+        token = str(payload.get("access_token") or "").strip()
+        if token:
+            try:
+                claims = json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "==").decode())
+                expires_at = datetime.fromtimestamp(int(claims.get("exp")), timezone.utc)
+                await resource_service.store_account_access_token(account.id, token, expires_at)
+            except Exception:
+                pass
+        return {"ok": True, "account": account.model_dump(mode="json")}
 
     @app.get("/api/paypal-agreement/status")
     async def paypal_agreement_status(request: Request) -> dict:

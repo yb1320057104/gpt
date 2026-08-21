@@ -12,6 +12,7 @@ from .config import (
     currency_minor_scale,
     normalize_payment_method,
     payment_currency,
+    processor_entity_for_country,
     validate_payment_country,
 )
 from .errors import ConfigurationError, ExtractionCancelled, ProtocolError
@@ -91,6 +92,11 @@ def extract_payment_link(
             stage_callback(stage, details or {})
 
     config = _normalize_config(config)
+    # Direct-card extraction is a checkout-link workflow, not a provider
+    # confirmation workflow.  Match the dedicated reference engine's hosted
+    # default without changing the defaults for PayPal/wallet methods.
+    if config.payment_method == "card" and config.checkout_ui_mode == "auto":
+        config = replace(config, checkout_ui_mode="hosted")
     log = stage_logger(config.verbose)
     account = account_email(config.access_token)
     billing = billing_for_country(config.country).to_dict()
@@ -135,6 +141,85 @@ def extract_payment_link(
         if config.oaics_only and checkout["session_kind"] == "stripe_checkout":
             raise ConfigurationError("仅 OAICS 模式下检测到 CS Checkout，任务已失败")
         require_country_currency(checkout, config)
+        if config.payment_method == "card":
+            if config.apply_checkout_update:
+                checkpoint("checkout_update", {
+                    "status": "direct_card_promotion_update",
+                    "checkout_session_id": checkout.get("cs_id"),
+                })
+                update_result = update_checkout(config, chatgpt, checkout, log) or {"success": True}
+                checkpoint("checkout_update_result", {
+                    "status": "direct_card_promotion_updated",
+                    "success": update_result.get("success", True),
+                })
+            require_country_currency(checkout, config)
+            amount_due_minor, amount_currency = checkout_payable_amount(checkout)
+            if config.require_zero and amount_due_minor != 0:
+                if config.retry_checkout_proxies:
+                    next_checkout = config.retry_checkout_proxies[0]
+                    next_update = (
+                        config.retry_update_proxies[0]
+                        if config.retry_update_proxies
+                        else next_checkout
+                    )
+                    checkpoint("direct_card_proxy_retry", {
+                        "reason": "final_bill_nonzero",
+                        "amount_minor": amount_due_minor,
+                        "currency": amount_currency,
+                        "remaining_proxy_pairs": len(config.retry_checkout_proxies),
+                    })
+                    return extract_payment_link(
+                        replace(
+                            config,
+                            checkout_proxy=next_checkout,
+                            update_proxy=next_update,
+                            retry_checkout_proxies=config.retry_checkout_proxies[1:],
+                            retry_update_proxies=config.retry_update_proxies[1:],
+                            auto_retry_count=max(0, config.auto_retry_count - 1),
+                        ),
+                        transport_factory=transport_factory,
+                        cancel_event=cancel_event,
+                        stage_callback=stage_callback,
+                    )
+                raise ProtocolError(
+                    409,
+                    f"direct-card promotion did not produce a zero checkout: "
+                    f"{amount_due_minor} {amount_currency}",
+                )
+            entity = processor_entity_for_country(
+                str(checkout.get("billing_country") or config.country),
+                str(checkout.get("processor_entity") or ""),
+            )
+            checkout_url = f"https://chatgpt.com/checkout/{entity}/{checkout['cs_id']}"
+            scale = currency_minor_scale(amount_currency)
+            checkpoint("extract_link", {
+                "link_type": "direct_card_checkout_link",
+                "checkout_session_id": checkout.get("cs_id"),
+                "amount_minor": amount_due_minor,
+                "currency": amount_currency,
+            })
+            return PaymentLinkResult(
+                checkout_session_id=str(checkout["cs_id"]),
+                session_kind=str(checkout["session_kind"]),
+                payment_method="card",
+                billing_country=config.country,
+                currency=amount_currency,
+                amount_due=amount_due_minor / (10**scale),
+                amount_due_minor=amount_due_minor,
+                billing=BillingProfile(**billing),
+                account_email=account,
+                provider_url=checkout_url,
+                provider_field="card_url",
+                provider_value=checkout_url,
+                extra={
+                    "link": checkout_url,
+                    "order_type": "direct_card",
+                    "link_type": "direct_card_checkout_link",
+                    "amount_verification": "verified_zero" if amount_due_minor == 0 else "verified_nonzero",
+                    "error_stage": "",
+                    "retryable": False,
+                },
+            )
         defer_checkout_update = checkout["session_kind"] in {"stripe_checkout", "openai_custom_checkout"}
         if config.apply_checkout_update and not defer_checkout_update:
             checkpoint("checkout_update", {
@@ -245,7 +330,7 @@ def extract_payment_link(
                 409,
                 f"最终账单币种不符合所选支付方式：要求 {expected_currency}，实际 {amount_currency or '未知'}",
             )
-        if amount_due_minor != 0:
+        if config.require_zero and amount_due_minor != 0:
             raise ProtocolError(
                 409,
                 f"最终账单不是 0 元，已停止返回链接：{amount_due_minor} {amount_currency}（最小货币单位）",

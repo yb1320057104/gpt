@@ -1761,6 +1761,8 @@ class MongoResourceStore:
             parentEmail=(
                 str(document.get("parentEmail") or "") or None
             ),
+            mailboxKind=str(document.get("mailboxKind") or "url"),
+            mailboxPassword=(str(document.get("mailboxPassword") or "") or None),
         )
 
     async def _exclude_registered_accounts(

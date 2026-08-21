@@ -65,6 +65,7 @@ COUNTRY_NAMES = {
     "VN": "越南",
 }
 PAYMENT_METHOD_LABELS = {
+    "card": "银行卡 Checkout",
     "paypal": "PayPal",
     "gopay": "GoPay",
     "gcash": "GCash",
@@ -112,7 +113,7 @@ class PaymentExtractorTaskCreate(ExtractorModel):
     )
     country: str | None = Field(default=None, min_length=2, max_length=2)
     paymentMethod: Literal[
-        "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
+        "card", "paypal", "gopay", "gcash", "ideal", "upi", "pix", "blik",
         "twint", "kakao_pay", "momo"
     ] | None = Field(
         default=None,
@@ -145,6 +146,12 @@ class PaymentExtractorTaskCreate(ExtractorModel):
         validation_alias=AliasChoices("autoRetryCount", "auto_retry_count"),
     )
     idealBank: str = Field(default="n26", max_length=64)
+    promoCampaignId: str = Field(default="", max_length=128, validation_alias=AliasChoices("promoCampaignId", "promo_campaign_id"))
+    checkoutUiMode: Literal["auto", "hosted", "custom"] = Field(default="auto", validation_alias=AliasChoices("checkoutUiMode", "checkout_ui_mode"))
+    requireZero: bool = Field(default=True, validation_alias=AliasChoices("requireZero", "require_zero"))
+    gopayBrowserFallback: bool = Field(default=False, validation_alias=AliasChoices("gopayBrowserFallback", "gopay_browser_fallback"))
+    checkoutProxyCountry: str = Field(default="", max_length=2, validation_alias=AliasChoices("checkoutProxyCountry", "checkout_proxy_country"))
+    updateProxyCountry: str = Field(default="", max_length=2, validation_alias=AliasChoices("updateProxyCountry", "update_proxy_country"))
 
     @field_validator("accessToken")
     @classmethod
@@ -154,10 +161,18 @@ class PaymentExtractorTaskCreate(ExtractorModel):
             return ""
         return normalize_bearer_token(normalize_session_json(text))
 
-    @field_validator("accountId", "checkoutProxy", "updateProxy", "stripeHcaptchaToken", "idealBank")
+    @field_validator("accountId", "checkoutProxy", "updateProxy", "stripeHcaptchaToken", "idealBank", "promoCampaignId")
     @classmethod
     def trim_text(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("checkoutProxyCountry", "updateProxyCountry")
+    @classmethod
+    def normalize_proxy_country(cls, value: str) -> str:
+        value = value.strip().upper()
+        if value:
+            country_config(value)
+        return value
 
     @field_validator("country")
     @classmethod
@@ -465,6 +480,12 @@ class PaymentExtractorService:
         self.default_stripe_hcaptcha_token = os.getenv(
             "OPLL_STRIPE_HCAPTCHA_TOKEN", ""
         ).strip()
+        self.default_promo_campaign_id = os.getenv("OPLL_PROMO_CAMPAIGN_ID", "plus-1-month-free").strip() or "plus-1-month-free"
+        self.default_checkout_ui_mode = os.getenv("OPLL_CHECKOUT_UI_MODE", "auto").strip().lower() or "auto"
+        if self.default_checkout_ui_mode not in {"auto", "hosted", "custom"}:
+            self.default_checkout_ui_mode = "auto"
+        self.default_require_zero = _env_bool("OPLL_REQUIRE_ZERO", True)
+        self.default_gopay_browser_fallback = _env_bool("OPLL_GOPAY_BROWSER_FALLBACK", False)
         self.proxy_source_url = os.getenv("OPLL_PROXY_SOURCE_URL", "").strip()
         self.proxy_pool_id = (
             hashlib.sha256(configured_pool.encode("utf-8")).hexdigest()[:16]
@@ -533,6 +554,11 @@ class PaymentExtractorService:
             "proxySourceUrl": self.proxy_source_url,
             "applyCheckoutUpdate": self.default_apply_checkout_update,
             "checkoutModes": ["auto", "oaics_only"],
+            "checkoutUiModes": ["auto", "hosted", "custom"],
+            "promoCampaignId": self.default_promo_campaign_id,
+            "checkoutUiMode": self.default_checkout_ui_mode,
+            "requireZero": self.default_require_zero,
+            "gopayBrowserFallback": self.default_gopay_browser_fallback,
             "taskLimit": self.task_limit,
             "concurrency": int(
                 getattr(self.manager, "concurrency", self.default_concurrency)
@@ -625,6 +651,8 @@ class PaymentExtractorService:
         stripe_hcaptcha_token = (
             payload.stripeHcaptchaToken or self.default_stripe_hcaptcha_token
         )
+        promo_campaign_id = payload.promoCampaignId or self.default_promo_campaign_id
+        checkout_ui_mode = payload.checkoutUiMode or self.default_checkout_ui_mode
         if not access_token:
             raise PaymentExtractorServiceError(
                 "access_token_required", "AT 不能为空", http_status=422
@@ -660,6 +688,12 @@ class PaymentExtractorService:
                 retry_checkout_proxies=tuple(retry_checkout_proxies),
                 retry_update_proxies=tuple(retry_update_proxies),
                 ideal_bank=payload.idealBank or "n26",
+                promo_campaign_id=promo_campaign_id,
+                checkout_ui_mode=checkout_ui_mode,
+                require_zero=payload.requireZero,
+                gopay_browser_fallback=payload.gopayBrowserFallback,
+                checkout_proxy_country=payload.checkoutProxyCountry,
+                update_proxy_country=payload.updateProxyCountry,
             )
         except (ConfigurationError, ValueError) as exc:
             raise PaymentExtractorServiceError(

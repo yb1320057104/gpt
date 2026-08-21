@@ -135,7 +135,7 @@ def create_checkout(
         "entry_point": "all_plans_pricing_modal",
         "plan_name": "chatgptplusplan",
         "billing_details": {"country": config.country.upper(), "currency": config_currency(config)},
-        "checkout_ui_mode": "custom",
+        "checkout_ui_mode": "custom" if config.checkout_ui_mode == "auto" else config.checkout_ui_mode,
     }
     response = stage_http_request(
         chatgpt,
@@ -179,7 +179,8 @@ def check_coupon_eligibility(
     if not str(config.update_proxy or "").strip():
         raise ConfigurationError("update proxy is required for eligibility check")
     path = "/backend-api/promo_campaign/check_coupon"
-    url = f"https://chatgpt.com{path}?coupon=plus-1-month-free&is_coupon_from_query_param=true"
+    campaign = config.promo_campaign_id or "plus-1-month-free"
+    url = f"https://chatgpt.com{path}?coupon={campaign}&is_coupon_from_query_param=true"
     set_proxy_url(chatgpt, config.update_proxy)
     try:
         response = stage_http_request(
@@ -189,7 +190,7 @@ def check_coupon_eligibility(
             url,
             log,
             headers={
-                "Referer": "https://chatgpt.com/?promo_campaign=plus-1-month-free",
+                "Referer": f"https://chatgpt.com/?promo_campaign={campaign}",
                 "x-openai-target-path": path,
                 "x-openai-target-route": path,
             },
@@ -227,7 +228,7 @@ def update_checkout(
         "price_interval": "month",
         "seat_quantity": 1,
         "promo_campaign": {
-            "promo_campaign_id": "plus-1-month-free",
+            "promo_campaign_id": config.promo_campaign_id or "plus-1-month-free",
             "is_coupon_from_query_param": False,
         },
     }

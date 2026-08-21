@@ -30,6 +30,8 @@ class FakeProxies:
         self.lease = lease
         self.released = []
         self.successes = []
+        self.selected_proxy_id = None
+        self.selected_options = {}
 
     async def count_eligible_proxies(self):
         return int(self.lease is not None)
@@ -38,6 +40,8 @@ class FakeProxies:
         return self.lease
 
     async def acquire_proxy_by_id(self, _proxy_id, _owner, **_kwargs):
+        self.selected_proxy_id = _proxy_id
+        self.selected_options = _kwargs
         return self.lease
 
     async def release_proxy(self, proxy_id, owner):
@@ -76,6 +80,31 @@ def test_alive_check_marks_success_as_alive(monkeypatch):
     assert resources.results == [("account", {"alive": True, "http_status": 200})]
     assert proxies.successes == [("proxy", 125)]
     assert len(proxies.released) == 1
+
+
+def test_alive_check_passes_local_proxy_selection_and_country(monkeypatch):
+    resources = FakeResources({"accessToken": "TEST_AT", "registrationCountry": "JP"})
+    proxies = FakeProxies(
+        ProxyLease("local-7890:test", "127.0.0.1", 7890, "", "", country="JP")
+    )
+    captured = {}
+
+    def check(*_args, **kwargs):
+        captured.update(kwargs)
+        return alive_result()
+
+    monkeypatch.setattr("backend.account_alive_service.check_account_plan_curl", check)
+
+    result = asyncio.run(
+        AccountAliveCheckService(resources, proxies).check_accounts(
+            ["account"], proxy_id="local7890"
+        )
+    )
+
+    assert result.alive == 1
+    assert proxies.selected_proxy_id == "local7890"
+    assert proxies.selected_options["country"] == "JP"
+    assert captured["proxy_url"] == "http://127.0.0.1:7890"
 
 
 def test_alive_check_only_marks_explicit_unauthorized_as_dead(monkeypatch):

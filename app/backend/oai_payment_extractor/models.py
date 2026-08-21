@@ -19,6 +19,12 @@ class ExtractionConfig:
     retry_checkout_proxies: tuple[str, ...] = ()
     retry_update_proxies: tuple[str, ...] = ()
     ideal_bank: str = "n26"
+    promo_campaign_id: str = "plus-1-month-free"
+    checkout_ui_mode: str = "auto"
+    require_zero: bool = True
+    gopay_browser_fallback: bool = False
+    checkout_proxy_country: str = ""
+    update_proxy_country: str = ""
 
 
 @dataclass(frozen=True)

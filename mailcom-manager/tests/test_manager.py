@@ -242,27 +242,22 @@ def test_registration_adapter_accepts_email_and_exports_compatible_lines(
 
     exported = client.get("/api/export/registration-lines")
     assert exported.status_code == 200
-    assert exported.text.strip() == (
-        "person@gardener.com----http://testserver/api/mail/latest?"
-        "email=person%40gardener.com"
+    assert exported.text.strip().startswith(
+        "person@gardener.com----http://testserver/code/"
     )
     assert "mail-password" not in exported.text
 
     structured = client.get("/api/export/registration-items")
     assert structured.status_code == 200
-    assert structured.json() == {
-        "items": [
-            {
-                "email": "person@gardener.com",
-                "accountEmail": "person@gardener.com",
-                "isAlias": False,
-                "accessUrl": (
-                    "http://testserver/api/mail/latest?"
-                    "email=person%40gardener.com"
-                ),
-            }
-        ]
-    }
+    item = structured.json()["items"][0]
+    assert item["email"] == "person@gardener.com"
+    assert item["accountEmail"] == "person@gardener.com"
+    assert item["isAlias"] is False
+    assert item["accessUrl"].startswith("http://testserver/code/")
+    capability = client.get(item["accessUrl"])
+    assert capability.status_code == 200
+    assert capability.json()["code"] == "123456"
+    assert capability.json()["mail"]["verificationCode"] == "123456"
 
 
 def test_payment_confirmation_requires_recipient_time_success_and_order(tmp_path: Path) -> None:
@@ -399,10 +394,10 @@ def test_aliases_have_independent_urls_and_do_not_mix_codes(tmp_path: Path) -> N
     assert exported.status_code == 200
     lines = set(exported.text.strip().splitlines())
     assert len(lines) == 3
-    assert (
-        "alias.one@example.com----http://testserver/api/mail/latest?"
-        "email=alias.one%40example.com"
-    ) in lines
+    assert any(
+        line.startswith("alias.one@example.com----http://testserver/code/")
+        for line in lines
+    )
     assert "mail-password" not in exported.text
 
     structured = client.get("/api/export/registration-items").json()["items"]

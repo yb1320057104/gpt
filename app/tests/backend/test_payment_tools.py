@@ -324,6 +324,7 @@ def test_service_exposes_all_source_options_and_rotates_proxy_pool(monkeypatch) 
 
     assert len(service.options()["countries"]) == 20
     assert [item["value"] for item in service.options()["paymentMethods"]] == [
+        "card",
         "paypal",
         "gopay",
         "gcash",
@@ -609,6 +610,49 @@ def test_account_identity_overrides_shared_billing_identity(monkeypatch) -> None
     assert captured["email"] == "account@example.test"
     assert captured["name"] == "Account Fixture"
     assert result.billing.email == "account@example.test"
+
+
+def test_direct_card_returns_zero_checkout_link_without_provider_confirm(monkeypatch) -> None:
+    checkout = {
+        "cs_id": "cs_card_fixture",
+        "session_kind": "stripe_checkout",
+        "processor_entity": "openai_ie",
+        "billing_country": "PH",
+        "currency": "PHP",
+        "checkout_state": {
+            "currency": "PHP",
+            "total": {"total": {"minorUnitsAmount": 0}},
+        },
+    }
+    monkeypatch.setattr(application, "check_coupon_eligibility", lambda *_args: {"state": "eligible"})
+    monkeypatch.setattr(application, "create_checkout", lambda *_args: dict(checkout))
+    monkeypatch.setattr(application, "update_checkout", lambda *_args: {"success": True})
+    monkeypatch.setattr(application, "require_country_currency", lambda *_args: None)
+
+    class Session:
+        def close(self) -> None:
+            return None
+
+    factory = SimpleNamespace(
+        chatgpt=lambda *_args: Session(),
+        stripe=lambda *_args: pytest.fail("direct card must not create a Stripe provider session"),
+    )
+    config = ExtractionConfig(
+        access_token="header.payload.signature",
+        checkout_proxy="http://proxy.example:8080",
+        update_proxy="http://update.example:8080",
+        country="PH",
+        payment_method="card",
+        checkout_ui_mode="auto",
+        require_zero=True,
+    )
+
+    result = application.extract_payment_link(config, transport_factory=factory)
+
+    assert result.provider_url == "https://chatgpt.com/checkout/openai_ie/cs_card_fixture"
+    assert result.to_dict()["card_url"] == result.provider_url
+    assert result.extra["link_type"] == "direct_card_checkout_link"
+    assert result.amount_due_minor == 0
 
 
 def test_service_requires_update_proxy_only_when_update_is_enabled(monkeypatch) -> None:

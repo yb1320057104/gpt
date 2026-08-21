@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   CircleCheck,
   CircleClose,
@@ -14,7 +14,7 @@ import { ElMessage } from 'element-plus'
 import { copyText, downloadTextFile } from '@/services/exporter'
 import { useAppStore } from '@/stores/app'
 import { COMMON_REGISTRATION_COUNTRIES, countryLabel } from '@/services/countries'
-import type { EmailSource } from '@/types'
+import type { EmailSource, RunLogEntry } from '@/types'
 
 const store = useAppStore()
 const requestedCount = ref<number | undefined>(1)
@@ -42,6 +42,9 @@ const selectedEmailSource = ref<EmailSource>((() => {
 })())
 const syncingAliases = ref(false)
 const logViewport = ref<HTMLElement>()
+const protocolJob = ref<any>(null)
+const protocolStarting = ref(false)
+let protocolTimer: ReturnType<typeof setInterval> | undefined
 
 const availableForSource = computed(() => {
   if (selectedEmailSource.value === 'mailcom_alias') return store.stats.emails.aliases
@@ -178,6 +181,7 @@ onMounted(() => {
     store.refreshProxyGroups(),
   ]).catch(() => undefined)
 })
+onBeforeUnmount(() => { if (protocolTimer) clearInterval(protocolTimer) })
 
 watch(
   () => store.displayedLogs.length,
@@ -248,6 +252,32 @@ function formatElapsed(milliseconds: number) {
   return `${(milliseconds / 1000).toFixed(1)}s`
 }
 
+async function refreshProtocolJob() {
+  if (!protocolJob.value?.jobId) return
+  const response = await fetch(`/api/protocol-registration/${protocolJob.value.jobId}`)
+  if (response.ok) {
+    protocolJob.value = await response.json()
+    const protocolEntries: RunLogEntry[] = (protocolJob.value.lines || []).map((message: string, index: number) => ({ schemaVersion: 1, runId: protocolJob.value.jobId, timestamp: new Date().toISOString(), level: /error|fail/i.test(message) ? 'error' : /success|complete/i.test(message) ? 'success' : 'info', event: 'protocol_registration', message, sequence: index }))
+    store.displayedLogs = [...store.displayedLogs.filter((entry) => entry.event !== 'protocol_registration'), ...protocolEntries]
+    if (['completed', 'failed'].includes(protocolJob.value.status) && protocolTimer) {
+      clearInterval(protocolTimer); protocolTimer = undefined
+    }
+  }
+}
+async function startProtocolRegistration() {
+  protocolStarting.value = true
+  try {
+    const response = await fetch('/api/protocol-registration/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ count: requestedCount.value || 1, workers: store.settings.concurrency, country: selectedCountry.value, proxyGroup: selectedGroup.value }) })
+    if (!response.ok) throw new Error((await response.json()).detail || '协议注册启动失败')
+    protocolJob.value = await response.json()
+    const protocolEntries: RunLogEntry[] = (protocolJob.value.lines || []).map((message: string, index: number) => ({ schemaVersion: 1, runId: protocolJob.value.jobId, timestamp: new Date().toISOString(), level: /error|fail/i.test(message) ? 'error' : /success|complete/i.test(message) ? 'success' : 'info', event: 'protocol_registration', message, sequence: index }))
+    store.displayedLogs = [...store.displayedLogs.filter((entry) => entry.event !== 'protocol_registration'), ...protocolEntries]
+    if (protocolTimer) clearInterval(protocolTimer)
+    void refreshProtocolJob()
+    protocolTimer = setInterval(() => void refreshProtocolJob(), 2000)
+    ElMessage.success('协议注册已启动，成功账号会自动进入账号池')
+  } catch (error) { ElMessage.error(error instanceof Error ? error.message : '协议注册启动失败') } finally { protocolStarting.value = false }
+}
 async function startRun() {
   const count = requestedCount.value
   if (store.mongoHealth.status !== 'online') {
@@ -474,6 +504,9 @@ function downloadLogs() {
             >
               {{ store.runState.status === 'waiting_for_database' ? '等待数据库恢复' : running ? '真实探测运行中' : '启动真实探测' }}
             </el-button>
+            <el-button type="success" size="large" :loading="protocolStarting" :disabled="running || !selectedCountry || Boolean(protocolJob && protocolJob.status === 'running')" @click="startProtocolRegistration">
+              {{ protocolJob?.status === 'running' ? '协议注册中' : '协议注册' }}
+            </el-button>
             <el-button
               v-if="running"
               class="cancel-button"
@@ -486,6 +519,10 @@ function downloadLogs() {
             >
               {{ store.runState.cancelRequested ? '正在取消' : '取消任务' }}
             </el-button>
+          </div>
+          <div v-if="protocolJob" class="protocol-inline-status">
+            协议注册：{{ protocolJob.status }} · 已入账号池 {{ protocolJob.importedAccounts ?? 0 }}
+            <pre>{{ (protocolJob.lines || []).slice(-5).join('\n') }}</pre>
           </div>
           <el-alert
             v-if="availableForSource === 0"
@@ -516,6 +553,7 @@ function downloadLogs() {
           :status="store.runState.status === 'failed' ? 'exception' : store.runState.status === 'completed' ? 'success' : undefined"
           :stroke-width="10"
         />
+        <el-alert v-if="protocolJob" class="protocol-status-alert" type="info" :closable="false" show-icon :title="`协议注册：${protocolJob.status} · 已入账号池 ${protocolJob.importedAccounts ?? 0}`" />
         <el-alert
           v-if="store.runState.terminalReasonCode === 'roxy_circuit_open'"
           class="circuit-alert"
@@ -701,6 +739,9 @@ function downloadLogs() {
   gap: 16px;
   margin-bottom: 18px;
 }
+
+.protocol-inline-status { margin: 4px 0 12px; color: var(--text-secondary); font-size: 11px; }
+.protocol-inline-status pre { max-height: 90px; overflow: auto; margin: 5px 0 0; white-space: pre-wrap; color: var(--text-muted); font-size: 10px; }
 
 .start-panel,
 .progress-panel {

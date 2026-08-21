@@ -1,0 +1,22 @@
+# Core dependencies
+curl_cffi==0.16.0
+cryptography>=41.0.0
+PyNaCl>=1.5.0
+httpx[http2,socks]>=0.28.0
+requests>=2.31.0
+pyotp>=2.9.0
+
+# Anti-detect browser (preferred)
+camoufox[geoip]>=0.4.0
+browserforge>=0.1.0
+
+# Browser automation fallback
+cloakbrowser>=0.5.3,<0.6
+
+# CAPTCHA solving (Playwright-based)
+playwright>=1.40.0
+qrcode[pil]>=7.4.2
+
+# Test runner used by CI and the documented validation command
+pytest>=8.0
+

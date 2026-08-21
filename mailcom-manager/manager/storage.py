@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import secrets
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,43 @@ class AccountStore:
                     ON aliases(account_id, created_at DESC);
                 """
             )
+            # Additive migration for capability URLs.  Existing databases and
+            # the legacy email-query endpoint remain valid.
+            for table in ("accounts", "aliases"):
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if "access_key" not in columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN access_key TEXT")
+                rows = connection.execute(
+                    f"SELECT id FROM {table} WHERE access_key IS NULL OR access_key = ''"
+                ).fetchall()
+                for row in rows:
+                    connection.execute(
+                        f"UPDATE {table} SET access_key = ? WHERE id = ?",
+                        (self._new_access_key(connection), str(row["id"])),
+                    )
+                connection.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_access_key ON {table}(access_key)"
+                )
+
+    @staticmethod
+    def _new_access_key(connection: sqlite3.Connection) -> str:
+        while True:
+            value = secrets.token_urlsafe(32)
+            found = False
+            for table in ("accounts", "aliases"):
+                try:
+                    if connection.execute(
+                        f"SELECT 1 FROM {table} WHERE access_key = ?", (value,)
+                    ).fetchone() is not None:
+                        found = True
+                        break
+                except sqlite3.OperationalError:
+                    continue
+            if not found:
+                return value
 
     @staticmethod
     def _public(row: sqlite3.Row) -> dict[str, Any]:
@@ -105,11 +143,14 @@ class AccountStore:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO accounts (
-                    id, email, email_normalized, password_encrypted,
+                    id, email, email_normalized, password_encrypted, access_key,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(uuid4()), email.strip(), normalized, encrypted, now, now),
+                (
+                    str(uuid4()), email.strip(), normalized, encrypted,
+                    self._new_access_key(connection), now, now,
+                ),
             )
             return cursor.rowcount == 1
 
@@ -228,6 +269,22 @@ class AccountStore:
             bool(row["is_alias"]),
         )
 
+    def email_for_access_key(self, access_key: str) -> str | None:
+        value = str(access_key or "").strip()
+        if not value:
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT email FROM accounts WHERE access_key = ?
+                UNION ALL
+                SELECT email FROM aliases WHERE access_key = ?
+                LIMIT 1
+                """,
+                (value, value),
+            ).fetchone()
+        return str(row["email"]) if row is not None else None
+
     def all_emails(self) -> list[str]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
@@ -251,10 +308,10 @@ class AccountStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT email, email AS account_email, 0 AS is_alias, created_at
+                SELECT email, email AS account_email, 0 AS is_alias, access_key, created_at
                 FROM accounts
                 UNION ALL
-                SELECT x.email, a.email AS account_email, 1 AS is_alias, x.created_at
+                SELECT x.email, a.email AS account_email, 1 AS is_alias, x.access_key, x.created_at
                 FROM aliases x
                 JOIN accounts a ON a.id = x.account_id
                 ORDER BY created_at DESC
@@ -265,6 +322,7 @@ class AccountStore:
                 "email": str(row["email"]),
                 "accountEmail": str(row["account_email"]),
                 "isAlias": bool(row["is_alias"]),
+                "accessKey": str(row["access_key"]),
             }
             for row in rows
         ]
@@ -321,9 +379,9 @@ class AccountStore:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO aliases (
-                    id, account_id, email, email_normalized, label,
+                    id, account_id, email, email_normalized, label, access_key,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid4()),
@@ -331,6 +389,7 @@ class AccountStore:
                     email.strip(),
                     normalized,
                     label.strip()[:200],
+                    self._new_access_key(connection),
                     now,
                     now,
                 ),

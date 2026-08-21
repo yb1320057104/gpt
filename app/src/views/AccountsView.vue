@@ -549,7 +549,7 @@ onBeforeUnmount(() => {
             placeholder="资格检测代理（自动匹配）"
             style="width: 260px"
           >
-            <el-option label="???? 127.0.0.1:7890" value="local7890" />
+            <el-option label="本机代理 · 127.0.0.1:7890" value="local7890" />
             <el-option
               v-for="proxy in promotionProxies"
               :key="proxy.id"

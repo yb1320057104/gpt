@@ -968,7 +968,7 @@ def test_runner_retries_transient_roxy_browser_create_failure(tmp_path: Path) ->
         ("password_next_step_unknown", PasswordStepError),
     ],
 )
-def test_runner_rotates_proxy_after_transient_registration_failure(
+def test_runner_retries_same_proxy_after_transient_registration_failure(
     error_code: str,
     error_type: type[EmailStepError] | type[PasswordStepError],
     tmp_path: Path,
@@ -1014,8 +1014,8 @@ def test_runner_rotates_proxy_after_transient_registration_failure(
     assert result["code"] == "account_access_token_extracted"
     assert result["attempts"] == 2
     assert result["attemptErrors"][0]["code"] == error_code
-    assert fake_store.acquired == ["p1", "p2"]
-    assert fake_store.released == ["p1", "p2"]
+    assert fake_store.acquired == ["p1"]
+    assert fake_store.released == ["p1"]
     assert submitted_emails == ["person@example.com", "person@example.com"]
     assert fake_resources.completed == [("email-id", runner.owner)]
 
@@ -1153,10 +1153,44 @@ def test_runner_records_terminal_transient_email_failure(tmp_path: Path) -> None
     with pytest.raises(EmailStepError):
         asyncio.run(runner.run())
 
-    assert len(runner.attempt_errors) == 1
+    assert len(runner.attempt_errors) == 2
     assert runner.attempt_errors[0]["attempt"] == 1
     assert runner.attempt_errors[0]["proxyId"] == "p1"
     assert runner.attempt_errors[0]["code"] == "email_post_submit_reset"
+    assert runner.attempt_errors[1]["attempt"] == 2
+    assert runner.attempt_errors[1]["proxyId"] == "p1"
+
+
+def test_transient_page_failure_retries_same_proxy_without_rotation(
+    tmp_path: Path,
+) -> None:
+    fake_store = FakeStore([proxy("p1"), proxy("p2")])
+    fake_resources = FakeResourceStore()
+    fake_roxy = FakeRoxy()
+    runner = BrowserProbeRunner(
+        settings(),
+        workspace_id=None,
+        hold_seconds=0,
+        artifact_writer=ArtifactWriter(tmp_path),
+        mongo_manager=FakeMongo(),  # type: ignore[arg-type]
+        mailbox_client=FakeMailboxClient(),  # type: ignore[arg-type]
+        roxy_factory=lambda *_args, **_kwargs: fake_roxy,  # type: ignore[arg-type]
+        automation_factory=lambda *_args, **_kwargs: FakeAutomation(
+            EmailStepError(
+                "email_post_submit_reset",
+                "邮箱提交后页面被重置",
+            ),
+            [],
+        ),  # type: ignore[arg-type]
+    )
+    runner.store = fake_store  # type: ignore[assignment]
+    runner.resources = fake_resources  # type: ignore[assignment]
+
+    with pytest.raises(EmailStepError):
+        asyncio.run(runner.run())
+
+    assert fake_store.acquired == ["p1"]
+    assert [item["proxyId"] for item in runner.attempt_errors] == ["p1", "p1"]
 
 
 def test_verification_result_is_redacted_by_default(tmp_path: Path) -> None:

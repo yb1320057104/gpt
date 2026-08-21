@@ -85,7 +85,7 @@ class AccountAliveCheckService:
         country = str(source.get("registrationCountry") or "").upper()
         if proxy_id:
             lease = await self.proxies.acquire_proxy_by_id(
-                proxy_id, owner, lease_seconds=120
+                proxy_id, owner, lease_seconds=120, country=country or None
             )
         else:
             lease = await self.proxies.acquire_proxy(

@@ -142,6 +142,10 @@ class EmailRecord(ApiModel):
     importedAt: datetime
     sourceType: EmailSourceType = "manual"
     parentEmail: str | None = None
+    # Optional mailbox metadata.  These fields are additive so existing
+    # clients and persisted records remain compatible.
+    mailboxKind: str = "url"
+    mailboxPassword: str | None = None
 
 
 class ProxyRecord(ApiModel):

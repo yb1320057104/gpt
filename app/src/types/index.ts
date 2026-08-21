@@ -451,6 +451,10 @@ export interface PaymentExtractorTaskInput {
   rotateCheckoutProxy?: boolean
   rotateUpdateProxy?: boolean
   idealBank?: string
+  promoCampaignId?: string
+  checkoutUiMode?: 'auto' | 'hosted' | 'custom'
+  requireZero?: boolean
+  gopayBrowserFallback?: boolean
 }
 
 export interface PaymentExtractorAccountSource {
