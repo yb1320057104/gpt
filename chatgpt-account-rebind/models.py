@@ -34,4 +34,3 @@ class ParsedMailbox:
     email: str
     access_url: str
     password: str = ""
-

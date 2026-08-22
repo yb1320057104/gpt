@@ -7,13 +7,13 @@ import { useAppStore } from '@/stores/app'
 const route = useRoute()
 const store = useAppStore()
 const collapsed = ref(false)
-let timer: ReturnType<typeof setInterval> | undefined
-const pageTitle = computed(() => String(route.meta.title || '启动界面'))
-const mongoLabel = computed(() => store.mongoHealth.status === 'online' ? 'MongoDB 在线' : store.mongoHealth.status === 'reconnecting' ? 'MongoDB 重连中' : 'MongoDB 不可用')
-const mongoClass = computed(() => store.mongoHealth.status === 'online' ? 'status-pill--online' : store.mongoHealth.status === 'reconnecting' ? 'status-pill--reconnecting' : 'status-pill--offline')
+let healthTimer: ReturnType<typeof setInterval> | undefined
+const pageTitle = computed(() => String(route.meta.title ?? '启动界面'))
+const mongoStatusLabel = computed(() => store.mongoHealth.status === 'online' ? 'MongoDB 在线' : store.mongoHealth.status === 'reconnecting' ? 'MongoDB 重连中' : 'MongoDB 不可用')
+const mongoStatusClass = computed(() => store.mongoHealth.status === 'online' ? 'status-pill--online' : store.mongoHealth.status === 'reconnecting' ? 'status-pill--reconnecting' : 'status-pill--offline')
 function syncSidebar() { collapsed.value = window.innerWidth < 920 }
-onMounted(() => { syncSidebar(); window.addEventListener('resize', syncSidebar); void store.bootstrap(); timer = setInterval(() => void store.refreshHealth(), 5000) })
-onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (timer) clearInterval(timer) })
+onMounted(() => { syncSidebar(); window.addEventListener('resize', syncSidebar); void store.bootstrap(); healthTimer = setInterval(() => void store.refreshHealth(), 5000) })
+onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (healthTimer) clearInterval(healthTimer) })
 </script>
 
 <template>
@@ -34,6 +34,9 @@ onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (t
       </el-menu>
       <div class="sidebar-footer"><button class="collapse-button" type="button" @click="collapsed = !collapsed"><el-icon><component :is="collapsed ? Expand : Fold" /></el-icon><span v-if="!collapsed">收起导航</span></button></div>
     </aside>
-    <div class="workspace"><header class="topbar"><div><p class="eyebrow">AUTOREGISTER / LOCAL</p><h1>{{ pageTitle }}</h1></div><div class="service-status"><span class="status-pill" :class="mongoClass"><i />{{ mongoLabel }}</span><span class="status-pill" :class="store.configServiceOnline ? 'status-pill--online' : 'status-pill--offline'"><i />配置服务{{ store.configServiceOnline ? '在线' : '离线' }}</span><span class="mode-badge"><el-icon><Monitor /></el-icon>本地模式</span></div></header><main class="content-area"><router-view /></main></div>
+    <div class="workspace">
+      <header class="topbar"><div><p class="eyebrow">AUTOREGISTER / LOCAL</p><h1>{{ pageTitle }}</h1></div><div class="service-status"><el-tooltip :content="store.mongoHealth.error || `数据库：${store.mongoHealth.database}`" placement="bottom"><span class="status-pill" :class="mongoStatusClass"><i />{{ mongoStatusLabel }}</span></el-tooltip><span class="status-pill" :class="store.configServiceOnline ? 'status-pill--online' : 'status-pill--offline'"><i />配置服务{{ store.configServiceOnline ? '在线' : '离线' }}</span><span class="mode-badge"><el-icon><Monitor /></el-icon>本地模式</span></div></header>
+      <main class="content-area"><router-view /></main>
+    </div>
   </div>
 </template>

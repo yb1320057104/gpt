@@ -55,4 +55,3 @@ class MailboxCodeClient:
                 return code
             time.sleep(interval)
         raise TimeoutError("verification_code_timeout")
-
