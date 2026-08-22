@@ -102,6 +102,7 @@ function queryString(query: ResourceQuery) {
   if (query.promotion) params.set('promotion', query.promotion)
   if (query.alive) params.set('alive', query.alive)
   if (query.globalPromotion) params.set('globalPromotion', query.globalPromotion)
+  if (query.rebind) params.set('rebind', query.rebind)
   if (query.source && query.source !== 'all') params.set('source', query.source)
   return params.toString()
 }

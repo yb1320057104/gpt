@@ -97,6 +97,9 @@ class AccountRecord(ApiModel):
     checkoutTypeHttpStatus: int | None = None
     checkoutTypeCheckStatus: PlanCheckStatus | None = None
     registrationCountry: str | None = None
+    rebindStatus: str | None = None
+    reboundEmail: str | None = None
+    rebindProxy: str | None = None
     aliveStatus: Literal["running", "alive", "dead", "unknown"] | None = None
     aliveCheckedAt: datetime | None = None
     aliveErrorCode: str | None = None
@@ -146,6 +149,8 @@ class EmailRecord(ApiModel):
     # clients and persisted records remain compatible.
     mailboxKind: str = "url"
     mailboxPassword: str | None = None
+    usagePurpose: str = "registration"
+    rebindReservedBy: str | None = None
 
 
 class ProxyRecord(ApiModel):

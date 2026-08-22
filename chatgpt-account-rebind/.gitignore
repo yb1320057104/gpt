@@ -1,0 +1,6 @@
+data/*.db
+data/*.db-*
+data/imports/
+logs/
+__pycache__/
+*.pyc

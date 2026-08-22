@@ -343,6 +343,7 @@ class MongoResourceStore:
         country: str = "",
         alive: str = "",
         global_promotion: str = "",
+        rebind: str = "",
     ) -> Page[AccountRecord]:
         mongo_query: dict[str, Any] = {}
         if query.strip():
@@ -382,6 +383,10 @@ class MongoResourceStore:
             )
         if global_promotion in {"eligible", "ineligible", "pending", "failed"}:
             mongo_query["globalPromotionStatus"] = global_promotion
+        if rebind == "rebound":
+            mongo_query["rebindStatus"] = "success"
+        elif rebind == "ready":
+            mongo_query.setdefault("$and", []).append({"$or": [{"rebindStatus": {"$ne": "success"}}, {"rebindStatus": {"$exists": False}}]})
         total = await self._guard(self.accounts.count_documents(mongo_query))
         cursor = (
             self.accounts.find(mongo_query, {"accessToken": 0})
@@ -1114,6 +1119,36 @@ class MongoResourceStore:
             )
         )
 
+    async def reserve_rebind_email(self, run_id: str) -> dict[str, Any] | None:
+        """Reserve an email exclusively for rebind, never registration."""
+        result = await self._guard(self.emails.find_one_and_update(
+            {"status": "available", "usagePurpose": {"$ne": "rebind"}},
+            {"$set": {"status": "reserved", "usagePurpose": "rebind", "rebindReservedBy": run_id, "reservedAt": utc_now()}},
+            sort=[("importedAt", DESCENDING)],
+            return_document=ReturnDocument.AFTER,
+        ))
+        return result
+
+    async def release_rebind_email(self, email_id: str, run_id: str) -> bool:
+        result = await self._guard(self.emails.update_one(
+            {"_id": email_id, "rebindReservedBy": run_id},
+            {"$set": {"status": "available", "usagePurpose": "registration"}, "$unset": {"rebindReservedBy": "", "reservedAt": ""}},
+        ))
+        return bool(result.modified_count)
+
+    async def mark_rebind_success(self, account_id: str, new_email: str, access_token: str, proxy: str = "") -> None:
+        await self._guard(self.accounts.update_one(
+            {"_id": account_id},
+            {"$set": {"email": new_email.strip().lower(), "emailNormalized": new_email.strip().lower(), "accessToken": access_token, "accessTokenConfigured": bool(access_token), "rebindStatus": "success", "reboundEmail": new_email.strip().lower(), "rebindProxy": proxy, "updatedAt": utc_now()}},
+        ))
+
+    async def consume_rebind_email(self, email_id: str, run_id: str) -> bool:
+        result = await self._guard(self.emails.update_one(
+            {"_id": email_id, "rebindReservedBy": run_id},
+            {"$set": {"status": "used", "usagePurpose": "rebind"}, "$unset": {"rebindReservedBy": "", "reservedAt": ""}},
+        ))
+        return bool(result.modified_count)
+
     async def discard_reserved_email(self, email_id: str, run_id: str) -> bool:
         result = await self._guard(
             self.emails.delete_one({"_id": email_id, "reservedBy": run_id})
@@ -1723,6 +1758,9 @@ class MongoResourceStore:
             checkoutTypeHttpStatus=document.get("checkoutTypeHttpStatus"),
             checkoutTypeCheckStatus=document.get("checkoutTypeCheckStatus"),
             registrationCountry=document.get("registrationCountry"),
+            rebindStatus=document.get("rebindStatus"),
+            reboundEmail=document.get("reboundEmail"),
+            rebindProxy=document.get("rebindProxy"),
             aliveStatus=document.get("aliveStatus"),
             aliveCheckedAt=document.get("aliveCheckedAt"),
             aliveErrorCode=document.get("aliveErrorCode"),
@@ -1763,6 +1801,8 @@ class MongoResourceStore:
             ),
             mailboxKind=str(document.get("mailboxKind") or "url"),
             mailboxPassword=(str(document.get("mailboxPassword") or "") or None),
+            usagePurpose=str(document.get("usagePurpose") or "registration"),
+            rebindReservedBy=(str(document.get("rebindReservedBy") or "") or None),
         )
 
     async def _exclude_registered_accounts(
