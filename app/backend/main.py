@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from enum import IntEnum
 from pathlib import Path
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
@@ -353,6 +353,10 @@ def create_app(
     app.state.run_store = run_store
     app.state.worker_store = worker_store
     app.state.run_manager = run_manager
+    app.state.account_rebind_proxy = ""
+    app.state.account_rebind_tasks = {}
+    app.state.account_rebind_logs = []
+    app.state.account_rebind_concurrency = 2
 
     @app.exception_handler(MongoUnavailableError)
     async def mongodb_unavailable_handler(
@@ -1143,11 +1147,149 @@ def create_app(
         global_promotion: Annotated[
             str, Query(alias="globalPromotion", pattern="^(|eligible|ineligible|pending|failed)$")
         ] = "",
+        rebind: Annotated[str, Query(pattern="^(|ready|rebound)$")] = "",
     ) -> Page[AccountRecord]:
         mongo.require_online()
         return await resource_store.list_accounts(
-            page, int(page_size), q, promotion, country, alive, global_promotion
+            page, int(page_size), q, promotion, country, alive, global_promotion, rebind
         )  # type: ignore[arg-type]
+
+    @app.get("/api/account-rebind/pools")
+    async def account_rebind_pools(request: Request) -> dict:
+        mongo.require_online()
+        available = await resource_store.emails.count_documents({"status": "available", "usagePurpose": {"$ne": "rebind"}})
+        reserved = await resource_store.emails.count_documents({"status": "reserved", "usagePurpose": "rebind"})
+        success = await resource_store.accounts.find({"rebindStatus": "success"}, {"email": 1, "reboundEmail": 1, "accessTokenConfigured": 1, "rebindProxy": 1}).sort("updatedAt", -1).to_list(length=100)
+        return {"availableRegistrationEmails": await resource_store.emails.count_documents({"status": "available", "$or": [{"usagePurpose": {"$exists": False}}, {"usagePurpose": "registration"}]}), "availableRebindEmails": available, "reservedRebindEmails": reserved, "proxy": request.app.state.account_rebind_proxy, "success": [{"id": str(item.get("_id")), **{k: item.get(k) for k in ("email", "reboundEmail", "accessTokenConfigured", "rebindProxy")}} for item in success]}
+
+    @app.put("/api/account-rebind/proxy")
+    async def set_account_rebind_proxy(request: Request) -> dict:
+        payload = await request.json()
+        proxy = str(payload.get("proxy") or "").strip()
+        if proxy and not urlparse(proxy).scheme:
+            raise HTTPException(status_code=422, detail="代理地址必须包含协议，例如 http://")
+        request.app.state.account_rebind_proxy = proxy
+        return {"ok": True, "proxy": proxy}
+
+    @app.get("/api/account-rebind/tasks")
+    async def account_rebind_tasks(request: Request) -> dict:
+        return {"items": list(request.app.state.account_rebind_tasks.values())}
+
+    @app.get("/api/account-rebind/logs")
+    async def account_rebind_logs(request: Request) -> dict:
+        return {"items": request.app.state.account_rebind_logs[-300:]}
+
+    @app.put("/api/account-rebind/concurrency")
+    async def set_account_rebind_concurrency(request: Request) -> dict:
+        payload = await request.json()
+        value = max(1, min(20, int(payload.get("concurrency") or 1)))
+        request.app.state.account_rebind_concurrency = value
+        return {"concurrency": value}
+
+    @app.get("/api/account-rebind/proxies")
+    async def account_rebind_proxies() -> dict:
+        mongo.require_online()
+        docs = await resource_store.proxies.find({"enabled": {"$ne": False}, "status": {"$in": ["available", "unknown"]}}, {"_id": 1, "country": 1, "group": 1, "scheme": 1, "host": 1, "port": 1}).sort("country", 1).to_list(length=500)
+        items = [{"id": "local7890", "label": "本地代理 · 127.0.0.1:7890", "value": "http://127.0.0.1:7890", "source": "local"}]
+        items.extend({"id": str(doc["_id"]), "label": f"{doc.get('country', 'ZZ')} · {doc.get('group', 'default')} · {doc.get('host')}:{doc.get('port')}", "value": "", "source": "pool"} for doc in docs)
+        return {"items": items}
+
+    @app.post("/api/account-rebind/tasks")
+    async def create_account_rebind_task(request: Request) -> dict:
+        mongo.require_online()
+        payload = await request.json()
+        account_ids = [str(item) for item in (payload.get("accountIds") or []) if str(item).strip()]
+        if not account_ids:
+            raise HTTPException(status_code=422, detail="请先选择账号")
+        proxy = str(payload.get("proxy") or "").strip()
+        task_id = uuid4().hex
+        accounts = await resource_store.accounts.find({"_id": {"$in": account_ids}}, {"_id": 1, "email": 1}).to_list(length=len(account_ids))
+        items = []
+        for account in accounts:
+            items.append({"accountId": str(account["_id"]), "email": account.get("email", ""), "status": "pending", "progress": 0, "mailbox": "", "mailboxId": "", "error": "", "runId": f"rebind-{task_id}-{account['_id']}"})
+        task = {"taskId": task_id, "status": "pending", "progress": 0, "proxy": proxy, "proxyId": "", "createdAt": datetime.now(timezone.utc).isoformat(), "items": items, "message": "等待选择代理并开始换绑"}
+        request.app.state.account_rebind_tasks[task_id] = task
+        request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO", "message": f"任务 {task_id[:8]} 已创建，共 {len(items)} 个账号"})
+        return task
+
+    @app.post("/api/account-rebind/tasks/{task_id}/start")
+    async def start_account_rebind_task(task_id: str, request: Request) -> dict:
+        task = request.app.state.account_rebind_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="换绑任务不存在")
+        payload = await request.json()
+        proxy_id = str(payload.get("proxyId") or "").strip()
+        custom_proxy = str(payload.get("proxy") or "").strip()
+        if proxy_id == "local7890":
+            proxy = "http://127.0.0.1:7890"
+        elif proxy_id:
+            doc = await resource_store.proxies.find_one({"_id": proxy_id, "enabled": {"$ne": False}})
+            if not doc:
+                raise HTTPException(status_code=422, detail="所选代理不存在或已禁用")
+            auth = f"{doc.get('username')}:{doc.get('password')}@" if doc.get("username") else ""
+            proxy = f"{doc.get('scheme', 'http')}://{auth}{doc.get('host')}:{doc.get('port')}"
+        else:
+            proxy = custom_proxy
+        if not proxy:
+            raise HTTPException(status_code=422, detail="请选择代理池代理、本地代理或填写自定义代理")
+        task["proxy"], task["proxyId"], task["status"], task["message"] = proxy, proxy_id, "queued", "邮箱已分配，等待换绑执行器"
+        request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO", "taskId": task_id, "step": "proxy.selected", "message": f"任务 {task_id[:8]} 已选择代理 {proxy}"})
+        for item in task.get("items", []):
+            request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO", "taskId": task_id, "accountId": item["accountId"], "step": "mailbox.reserve", "message": f"账号 {item['email']} 正在申请换绑邮箱"})
+            mailbox = await resource_store.reserve_rebind_email(item["runId"])
+            item.update({"status": "queued" if mailbox else "failed", "progress": 5 if mailbox else 0, "mailbox": mailbox.get("email") if mailbox else "", "mailboxId": str(mailbox.get("_id")) if mailbox else "", "error": "" if mailbox else "rebind_mailbox_empty"})
+            request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO" if mailbox else "ERROR", "message": f"账号 {item['email']} {'占用邮箱 ' + item['mailbox'] if mailbox else '分配邮箱失败'}"})
+        task["progress"] = min((item.get("progress", 0) for item in task["items"]), default=0)
+        endpoint = os.getenv("CHATGPT_EMAIL_CHANGE_ENDPOINT", "").strip()
+        if endpoint:
+            request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO", "taskId": task_id, "step": "email_change.ready", "message": f"准备调用 POST {endpoint}"})
+        else:
+            task["status"], task["message"] = "waiting_contract", "换绑接口未配置，未发送请求"
+            request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "WARN", "taskId": task_id, "step": "email_change.blocked", "message": "CHATGPT_EMAIL_CHANGE_ENDPOINT 未配置，未调用任何远程接口"})
+        return task
+
+    @app.post("/api/account-rebind/tasks/start")
+    async def start_pending_account_rebind_tasks(request: Request) -> dict:
+        pending = [(task_id, task) for task_id, task in request.app.state.account_rebind_tasks.items() if task.get("status") == "pending"]
+        concurrency = request.app.state.account_rebind_concurrency
+        semaphore = asyncio.Semaphore(concurrency)
+        async def run_one(task_id: str) -> dict:
+            async with semaphore:
+                return await start_account_rebind_task(task_id, request)
+        results = await asyncio.gather(*(run_one(task_id) for task_id, _ in pending), return_exceptions=True)
+        started = sum(not isinstance(result, Exception) for result in results)
+        request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "INFO", "step": "batch.start", "message": f"批量开始 {started}/{len(pending)} 个任务，并发 {concurrency}"})
+        return {"requested": len(pending), "started": started, "concurrency": concurrency}
+
+    @app.post("/api/account-rebind/tasks/{task_id}/release")
+    async def release_account_rebind_task(task_id: str, request: Request) -> dict:
+        task = request.app.state.account_rebind_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="换绑任务不存在")
+        for item in task.get("items", []):
+            if item.get("mailboxId"):
+                await resource_store.release_rebind_email(item["mailboxId"], item.get("runId", ""))
+                item["status"] = "released"
+        task["status"] = "released"
+        task["message"] = "任务已取消，占用邮箱已释放"
+        request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "WARN", "message": f"任务 {task_id[:8]} 已释放"})
+        return task
+
+    @app.post("/api/account-rebind/tasks/cancel-all")
+    async def cancel_all_account_rebind_tasks(request: Request) -> dict:
+        cancelled = 0
+        for task_id, task in list(request.app.state.account_rebind_tasks.items()):
+            if task.get("status") in {"success", "released", "failed"}:
+                continue
+            for item in task.get("items", []):
+                if item.get("mailboxId"):
+                    await resource_store.release_rebind_email(item["mailboxId"], item.get("runId", ""))
+                item["status"] = "cancelled"
+            task["status"] = "cancelled"
+            task["message"] = "任务已取消，占用邮箱已释放"
+            cancelled += 1
+        request.app.state.account_rebind_logs.append({"time": datetime.now(timezone.utc).isoformat(), "level": "WARN", "step": "batch.cancel", "message": f"一键取消任务 {cancelled} 个"})
+        return {"cancelled": cancelled}
 
     @app.post("/api/accounts", response_model=AccountRecord, status_code=201)
     async def create_account(payload: AccountCreate) -> AccountRecord:

@@ -2985,7 +2985,7 @@ class CdpBrowserAutomation:
         password_input = page.locator('input[type="password"]')
         submit_button = page.locator(
             'xpath=//form[.//input[@type="password"]]'
-            '//*[self::button or self::input][@type="submit" or self::button]'
+            '//*[self::button or self::input][@type="submit"]'
         )
         if not await self._is_visible(password_input):
             raise PasswordStepError(

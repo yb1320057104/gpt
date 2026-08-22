@@ -18,6 +18,7 @@ const search = ref('')
 const promotionFilter = ref<ResourceQuery['promotion']>('')
 const aliveFilter = ref<ResourceQuery['alive']>('')
 const globalPromotionFilter = ref<ResourceQuery['globalPromotion']>('')
+const rebindFilter = ref<ResourceQuery['rebind']>('')
 const countryFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref<ResourceQuery['pageSize']>(10)
@@ -339,6 +340,7 @@ async function loadPage() {
       country: countryFilter.value,
       alive: aliveFilter.value,
       globalPromotion: globalPromotionFilter.value,
+      rebind: rebindFilter.value,
     })
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
@@ -477,8 +479,29 @@ async function deleteSelected() {
   ElMessage.success(`已删除 ${deleted} 个账号`)
 }
 
+async function enqueueRebind() {
+  if (!selectedIds.value.length) return
+  try {
+    const response = await fetch('/api/account-rebind/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountIds: [...selectedIds.value] }),
+    })
+    const raw = await response.text()
+    let body: any = {}
+    try { body = raw ? JSON.parse(raw) : {} } catch { body = { detail: raw || `HTTP ${response.status}` } }
+    if (!response.ok) throw new Error(body.detail || '提交换绑队列失败')
+    ElMessage.success(`已将 ${body.items?.length || selectedIds.value.length} 个账号提交到换绑队列`)
+    selectedIds.value = []
+    tableRef.value?.clearSelection()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '提交换绑队列失败')
+  }
+}
+
 watch(pageAccounts, () => void syncPageSelection(), { flush: 'post', immediate: true })
 watch([currentPage, pageSize], () => void loadPage())
+watch(rebindFilter, () => { currentPage.value = 1; void loadPage() })
 onMounted(() => {
   void loadPage()
   globalPromotionTimer = setInterval(() => {
@@ -540,6 +563,7 @@ onBeforeUnmount(() => {
             @input="handleSearch"
           />
           <span class="muted">已选择 {{ selectedIds.length }} 条</span>
+          <el-select v-model="rebindFilter" clearable placeholder="换绑状态" style="width:140px"><el-option label="未换绑" value="ready" /><el-option label="已换绑" value="rebound" /></el-select>
         </div>
         <div class="toolbar-group">
           <el-select
@@ -614,6 +638,14 @@ onBeforeUnmount(() => {
             @click="deleteSelected"
           >
             删除选中
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :disabled="selectedIds.length === 0"
+            @click="enqueueRebind"
+          >
+            提交换绑队列
           </el-button>
           <el-button :disabled="selectedIds.length === 0" @click="openExport('selected')">
             导出选中
@@ -747,6 +779,9 @@ onBeforeUnmount(() => {
               {{ row.accountType === 'plus' ? 'Plus' : 'Free' }}
             </el-tag>
           </template>
+        </el-table-column>
+        <el-table-column label="换绑状态" width="105">
+          <template #default="{ row }"><el-tag :type="row.rebindStatus === 'success' ? 'success' : 'info'" effect="plain">{{ row.rebindStatus === 'success' ? '已换绑' : '未换绑' }}</el-tag></template>
         </el-table-column>
         <el-table-column label="验活状态" width="190">
           <template #default="{ row }">

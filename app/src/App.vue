@@ -1,19 +1,19 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { CircleCheck, Collection, Connection, CreditCard, Message, Operation, Setting, Fold, Expand, Monitor, VideoPlay } from '@element-plus/icons-vue'
+import { CircleCheck, Collection, Connection, CreditCard, Message, Operation, Setting, Fold, Expand, Monitor, VideoPlay, Refresh } from '@element-plus/icons-vue'
 import { useAppStore } from '@/stores/app'
 
 const route = useRoute()
 const store = useAppStore()
 const collapsed = ref(false)
-let healthTimer: ReturnType<typeof setInterval> | undefined
-const pageTitle = computed(() => String(route.meta.title ?? '启动界面'))
-const mongoStatusLabel = computed(() => store.mongoHealth.status === 'online' ? 'MongoDB 在线' : store.mongoHealth.status === 'reconnecting' ? 'MongoDB 重连中' : 'MongoDB 不可用')
-const mongoStatusClass = computed(() => store.mongoHealth.status === 'online' ? 'status-pill--online' : store.mongoHealth.status === 'reconnecting' ? 'status-pill--reconnecting' : 'status-pill--offline')
+let timer: ReturnType<typeof setInterval> | undefined
+const pageTitle = computed(() => String(route.meta.title || '启动界面'))
+const mongoLabel = computed(() => store.mongoHealth.status === 'online' ? 'MongoDB 在线' : store.mongoHealth.status === 'reconnecting' ? 'MongoDB 重连中' : 'MongoDB 不可用')
+const mongoClass = computed(() => store.mongoHealth.status === 'online' ? 'status-pill--online' : store.mongoHealth.status === 'reconnecting' ? 'status-pill--reconnecting' : 'status-pill--offline')
 function syncSidebar() { collapsed.value = window.innerWidth < 920 }
-onMounted(() => { syncSidebar(); window.addEventListener('resize', syncSidebar); void store.bootstrap(); healthTimer = setInterval(() => void store.refreshHealth(), 5000) })
-onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (healthTimer) clearInterval(healthTimer) })
+onMounted(() => { syncSidebar(); window.addEventListener('resize', syncSidebar); void store.bootstrap(); timer = setInterval(() => void store.refreshHealth(), 5000) })
+onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (timer) clearInterval(timer) })
 </script>
 
 <template>
@@ -24,6 +24,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (h
         <el-menu-item index="/launch"><el-icon><VideoPlay /></el-icon><template #title>启动界面</template></el-menu-item>
         <el-menu-item index="/settings"><el-icon><Setting /></el-icon><template #title>配置栏</template></el-menu-item>
         <el-menu-item index="/accounts"><el-icon><Collection /></el-icon><template #title>账号池</template></el-menu-item>
+        <el-menu-item index="/account-rebind"><el-icon><Refresh /></el-icon><template #title>账号换绑</template></el-menu-item>
         <el-menu-item index="/emails"><el-icon><Message /></el-icon><template #title>邮箱池</template></el-menu-item>
         <el-menu-item index="/payment-tools"><el-icon><CreditCard /></el-icon><template #title>提链</template></el-menu-item>
         <el-menu-item index="/pipeline"><el-icon><Operation /></el-icon><template #title>自动流水线</template></el-menu-item>
@@ -33,9 +34,6 @@ onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (h
       </el-menu>
       <div class="sidebar-footer"><button class="collapse-button" type="button" @click="collapsed = !collapsed"><el-icon><component :is="collapsed ? Expand : Fold" /></el-icon><span v-if="!collapsed">收起导航</span></button></div>
     </aside>
-    <div class="workspace">
-      <header class="topbar"><div><p class="eyebrow">AUTOREGISTER / LOCAL</p><h1>{{ pageTitle }}</h1></div><div class="service-status"><el-tooltip :content="store.mongoHealth.error || `数据库：${store.mongoHealth.database}`" placement="bottom"><span class="status-pill" :class="mongoStatusClass"><i />{{ mongoStatusLabel }}</span></el-tooltip><span class="status-pill" :class="store.configServiceOnline ? 'status-pill--online' : 'status-pill--offline'"><i />配置服务{{ store.configServiceOnline ? '在线' : '离线' }}</span><span class="mode-badge"><el-icon><Monitor /></el-icon>本地模式</span></div></header>
-      <main class="content-area"><router-view /></main>
-    </div>
+    <div class="workspace"><header class="topbar"><div><p class="eyebrow">AUTOREGISTER / LOCAL</p><h1>{{ pageTitle }}</h1></div><div class="service-status"><span class="status-pill" :class="mongoClass"><i />{{ mongoLabel }}</span><span class="status-pill" :class="store.configServiceOnline ? 'status-pill--online' : 'status-pill--offline'"><i />配置服务{{ store.configServiceOnline ? '在线' : '离线' }}</span><span class="mode-badge"><el-icon><Monitor /></el-icon>本地模式</span></div></header><main class="content-area"><router-view /></main></div>
   </div>
 </template>

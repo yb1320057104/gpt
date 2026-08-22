@@ -29,6 +29,9 @@ export interface AccountRecord {
   checkoutTypeHttpStatus?: number | null
   checkoutTypeCheckStatus?: 'running' | 'success' | 'failed' | null
   registrationCountry?: string | null
+  rebindStatus?: string | null
+  reboundEmail?: string | null
+  rebindProxy?: string | null
   aliveStatus?: 'running' | 'alive' | 'dead' | 'unknown' | null
   aliveCheckedAt?: string | null
   aliveErrorCode?: string | null
@@ -279,6 +282,7 @@ export interface ResourceQuery {
   promotion?: '' | 'untried_plus' | 'ineligible' | 'unchecked'
   alive?: '' | 'alive' | 'dead' | 'unknown' | 'unchecked'
   globalPromotion?: '' | 'eligible' | 'ineligible' | 'pending' | 'failed'
+  rebind?: '' | 'ready' | 'rebound'
   source?: EmailSource
 }
 
