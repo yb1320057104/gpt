@@ -30,8 +30,10 @@ export interface AccountRecord {
   checkoutTypeCheckStatus?: 'running' | 'success' | 'failed' | null
   registrationCountry?: string | null
   rebindStatus?: string | null
+  previousEmail?: string | null
   reboundEmail?: string | null
   rebindProxy?: string | null
+  rebindProxyCountry?: string | null
   aliveStatus?: 'running' | 'alive' | 'dead' | 'unknown' | null
   aliveCheckedAt?: string | null
   aliveErrorCode?: string | null
@@ -155,6 +157,13 @@ export interface ProxyTestResult {
 export interface ParsedEmail {
   email: string
   accessUrl: string
+}
+
+export interface ParsedAccount {
+  email: string
+  chatgptPassword: string
+  totpSecret: string
+  emailAccessUrl: string
 }
 
 export interface ParsedProxy {
@@ -283,6 +292,7 @@ export interface ResourceQuery {
   alive?: '' | 'alive' | 'dead' | 'unknown' | 'unchecked'
   globalPromotion?: '' | 'eligible' | 'ineligible' | 'pending' | 'failed'
   rebind?: '' | 'ready' | 'rebound'
+  rebindCountry?: string
   source?: EmailSource
 }
 

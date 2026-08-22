@@ -103,6 +103,7 @@ function queryString(query: ResourceQuery) {
   if (query.alive) params.set('alive', query.alive)
   if (query.globalPromotion) params.set('globalPromotion', query.globalPromotion)
   if (query.rebind) params.set('rebind', query.rebind)
+  if (query.rebindCountry?.trim()) params.set('rebindCountry', query.rebindCountry.trim().toUpperCase())
   if (query.source && query.source !== 'all') params.set('source', query.source)
   return params.toString()
 }
@@ -572,6 +573,16 @@ export const dataGateway = {
 
   async listProxies(query: ResourceQuery): Promise<PageResponse<ProxyRecord>> {
     return parseResponse(await fetch(`/api/proxies?${queryString(query)}`))
+  },
+
+  async importAccounts(rawText: string): Promise<ImportResult> {
+    return parseResponse(
+      await fetch('/api/accounts/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawText }),
+      }),
+    )
   },
 
   async importEmails(rawText: string): Promise<ImportResult> {

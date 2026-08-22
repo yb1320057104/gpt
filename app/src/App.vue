@@ -26,6 +26,7 @@ onBeforeUnmount(() => { window.removeEventListener('resize', syncSidebar); if (h
         <el-menu-item index="/accounts"><el-icon><Collection /></el-icon><template #title>账号池</template></el-menu-item>
         <el-menu-item index="/account-rebind"><el-icon><Refresh /></el-icon><template #title>账号换绑</template></el-menu-item>
         <el-menu-item index="/emails"><el-icon><Message /></el-icon><template #title>邮箱池</template></el-menu-item>
+        <el-menu-item index="/mailcom"><el-icon><Message /></el-icon><template #title>MailCom 管理</template></el-menu-item>
         <el-menu-item index="/payment-tools"><el-icon><CreditCard /></el-icon><template #title>提链</template></el-menu-item>
         <el-menu-item index="/pipeline"><el-icon><Operation /></el-icon><template #title>自动流水线</template></el-menu-item>
         <el-menu-item index="/hero-sms"><el-icon><Message /></el-icon><template #title>HeroSMS 接码</template></el-menu-item>

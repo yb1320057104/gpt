@@ -8,6 +8,7 @@ const router = createRouter({
     { path: '/accounts', name: 'accounts', component: () => import('@/views/AccountsView.vue'), meta: { title: '账号池' } },
     { path: '/account-rebind', name: 'account-rebind', component: () => import('@/views/AccountRebindView.vue'), meta: { title: '账号换绑' } },
     { path: '/emails', name: 'emails', component: () => import('@/views/EmailsView.vue'), meta: { title: '邮箱池' } },
+    { path: '/mailcom', name: 'mailcom', component: () => import('@/views/MailComView.vue'), meta: { title: 'MailCom 管理' } },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '配置栏' } },
     { path: '/payment-tools', name: 'payment-tools', component: () => import('@/views/PaymentToolsView.vue'), meta: { title: '提链' } },
     { path: '/pipeline', name: 'pipeline', component: () => import('@/views/PipelineView.vue'), meta: { title: '自动流水线' } },

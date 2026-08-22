@@ -196,7 +196,7 @@ Start-Component 'Resin' {
         Confirm-Started 'Resin' $process 2260 (Join-Path $RuntimeLogs 'resin.err.log') 15
         Save-ProcessId 'resin' $process
     } else {
-        Write-Host "  executable not found: $binary (build with: go build -o resin.exe .\cmd\resin)" -ForegroundColor Yellow
+        Write-Host "  executable not found: $binary (run: app\scripts\build-resin.ps1)" -ForegroundColor Yellow
     }
 }
 

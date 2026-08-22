@@ -3,12 +3,12 @@ import { computed, ref, watch } from 'vue'
 import { DocumentAdd, UploadFilled } from '@element-plus/icons-vue'
 import type { UploadFile } from 'element-plus'
 import { ElMessage } from 'element-plus'
-import { parseEmailImport, parseProxyImport } from '@/services/parsers'
+import { parseAccountImport, parseEmailImport, parseProxyImport } from '@/services/parsers'
 import type { ImportResult } from '@/types'
 
 const props = defineProps<{
   modelValue: boolean
-  kind: 'email' | 'proxy'
+  kind: 'account' | 'email' | 'proxy'
   existingKeys: string[]
   submitHandler: (rawText: string) => Promise<ImportResult>
 }>()
@@ -22,24 +22,32 @@ const rawText = ref('')
 const submitting = ref(false)
 
 const isEmail = computed(() => props.kind === 'email')
-const title = computed(() => (isEmail.value ? '导入邮箱' : '导入代理'))
+const isAccount = computed(() => props.kind === 'account')
+const isProxy = computed(() => props.kind === 'proxy')
+const title = computed(() => (isAccount.value ? '导入账号' : isEmail.value ? '导入邮箱' : '导入代理'))
 const formatHint = computed(() =>
-  isEmail.value ? '邮箱----接码地址 或 邮箱----mail.com 密码' : '支持 HTTP(S)/SOCKS5；省略协议时自动按 HTTP 解析',
+  isAccount.value
+    ? '账号----密码----TOTP / 接码地址，或账号----接码地址[----TOTP]'
+    : isEmail.value ? '邮箱----接码地址 或 邮箱----mail.com 密码' : '支持 HTTP(S)/SOCKS5；省略协议时自动按 HTTP 解析',
 )
 const placeholder = computed(() =>
-  isEmail.value
+  isAccount.value
+    ? 'one@example.com----Password123----JBSWY3DPEHPK3PXP\ntwo@example.com----Password456----https://mail.example.com/inbox/two\nthree@example.com----https://mail.example.com/inbox/three\nfour@example.com----https://mail.example.com/inbox/four----JBSWY3DPEHPK3PXP'
+    : isEmail.value
     ? 'demo@example.com----https://example.invalid/inbox/demo\nuser@gardener.com----mail.com-password'
     : 'host:port\nhost:port:username:password\nusername:password@host:port\nusername:password:host:port\n\n也支持带协议 URL 或 proxies: 开头的 YAML',
 )
 const yamlProxyCount = computed(() => {
-  if (isEmail.value || !/^\s*proxies\s*:/m.test(rawText.value)) return 0
+  if (!isProxy.value || !/^\s*proxies\s*:/m.test(rawText.value)) return 0
   const named = rawText.value.match(/^\s*-\s*name\s*:/gm)?.length || 0
   return named || (/^\s*-\s*(?:type|server|host)\s*:/m.test(rawText.value) ? 1 : 0)
 })
 const preview = computed(() =>
-  isEmail.value
-    ? parseEmailImport(rawText.value, props.existingKeys)
-    : parseProxyImport(rawText.value, props.existingKeys),
+  isAccount.value
+    ? parseAccountImport(rawText.value, props.existingKeys)
+    : isEmail.value
+      ? parseEmailImport(rawText.value, props.existingKeys)
+      : parseProxyImport(rawText.value, props.existingKeys),
 )
 
 watch(
@@ -86,7 +94,7 @@ async function submit() {
       <el-icon><DocumentAdd /></el-icon>
       <div>
         <strong>一行一条，格式：<code>{{ formatHint }}</code></strong>
-        <p>代理同时支持 proxies: 列表 YAML；可粘贴或选择 UTF-8 TXT/YAML 文件。</p>
+        <p>{{ isAccount ? '支持四种格式混合导入，系统自动识别密码、TOTP 和接码地址。' : '代理同时支持 proxies: 列表 YAML；可粘贴或选择 UTF-8 文件。' }}</p>
       </div>
     </div>
 
@@ -101,12 +109,12 @@ async function submit() {
 
     <div class="import-controls">
       <el-upload
-        :accept="isEmail ? '.txt,text/plain' : '.txt,.yaml,.yml,text/plain,application/x-yaml'"
+        :accept="isProxy ? '.txt,.yaml,.yml,text/plain,application/x-yaml' : '.txt,text/plain'"
         :auto-upload="false"
         :show-file-list="false"
         :on-change="readUpload"
       >
-        <el-button :icon="UploadFilled">选择 {{ isEmail ? 'TXT' : 'TXT / YAML' }} 文件</el-button>
+        <el-button :icon="UploadFilled">选择 {{ isProxy ? 'TXT / YAML' : 'TXT' }} 文件</el-button>
       </el-upload>
       <span>空行、BOM 与两端空格会被自动清理</span>
     </div>

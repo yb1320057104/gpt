@@ -98,8 +98,10 @@ class AccountRecord(ApiModel):
     checkoutTypeCheckStatus: PlanCheckStatus | None = None
     registrationCountry: str | None = None
     rebindStatus: str | None = None
+    previousEmail: str | None = None
     reboundEmail: str | None = None
     rebindProxy: str | None = None
+    rebindProxyCountry: str | None = None
     aliveStatus: Literal["running", "alive", "dead", "unknown"] | None = None
     aliveCheckedAt: datetime | None = None
     aliveErrorCode: str | None = None
@@ -123,9 +125,9 @@ class AccountRecord(ApiModel):
 
 class AccountCreate(ApiModel):
     email: str = Field(min_length=3, max_length=320)
-    chatgptPassword: str = Field(min_length=1, max_length=1024)
-    totpSecret: str = Field(min_length=1, max_length=256)
-    emailAccessUrl: str = Field(min_length=1, max_length=4096)
+    chatgptPassword: str = Field(default="", max_length=1024)
+    totpSecret: str = Field(default="", max_length=256)
+    emailAccessUrl: str = Field(default="", max_length=4096)
     accountType: AccountType = "free"
     phoneBound: bool | None = None
     promotionEligible: bool | None = None

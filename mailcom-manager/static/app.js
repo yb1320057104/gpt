@@ -1,3 +1,7 @@
+if (new URLSearchParams(window.location.search).get('embedded') === '1') {
+  document.documentElement.classList.add('embedded')
+}
+
 const state = { accounts: [], query: '', activeAccount: null, aliasAccount: null, aliases: [], folder: 'INBOX', bulkAliasJob: null, bulkAliasTimer: null }
 const $ = (id) => document.getElementById(id)
 let toastTimer
@@ -106,19 +110,24 @@ function renderAccounts() {
 }
 
 async function loadStats() {
-  const stats = await api('/api/stats')
+  const [stats, health] = await Promise.all([api('/api/stats'), api('/api/health')])
   $('statTotal').textContent = stats.total
   $('statOnline').textContent = stats.online
   $('statFailed').textContent = stats.failed
   $('statUnknown').textContent = stats.unknown
   $('statAliases').textContent = stats.aliases
+  $('storageBackend').textContent = health.storage === 'mongodb-dpapi'
+    ? '服务器 MongoDB · DPAPI 密文'
+    : '本机 SQLite · DPAPI 密文'
 }
 
 function renderImapSettings(settings) {
   $('imapEndpoint').textContent = `${settings.imapHost} : ${settings.imapPort}`
   const route = settings.proxyEnabled
     ? `${settings.proxyScheme.toUpperCase()} · ${settings.proxyHost}:${settings.proxyPort}`
-    : 'DIRECT'
+    : settings.proxyPoolEnabled
+      ? `项目代理池自动轮换 · ${settings.proxyPoolCount} 条`
+      : 'DIRECT'
   $('imapRoute').textContent = `SSL · ${route} · READ ONLY`
 }
 
@@ -155,10 +164,9 @@ async function openImapSettings() {
   } catch (error) { toast(error.message, 'error') }
 }
 
-async function saveImapSettings(event) {
-  event.preventDefault()
+function getImapSettingsPayload() {
   const proxyEnabled = $('imapProxyEnabled').checked
-  const payload = {
+  return {
     imapHost: $('imapSettingsHost').value.trim(),
     imapPort: Number.parseInt($('imapSettingsPort').value, 10),
     proxyEnabled,
@@ -168,12 +176,56 @@ async function saveImapSettings(event) {
     proxyUsername: $('imapProxyUsername').value,
     proxyPassword: $('imapProxyPassword').value || null,
   }
+}
+
+function validateImapSettingsPayload(payload) {
   if (!payload.imapHost || !Number.isInteger(payload.imapPort)) {
-    return toast('请填写有效的 IMAP 主机和端口', 'error')
+    toast('请填写有效的 IMAP 主机和端口', 'error')
+    return false
   }
-  if (proxyEnabled && (!payload.proxyHost || !Number.isInteger(payload.proxyPort))) {
-    return toast('请填写有效的代理 IP 和端口', 'error')
+  if (payload.proxyEnabled && (!payload.proxyHost || !Number.isInteger(payload.proxyPort))) {
+    toast('请填写有效的代理 IP 和端口', 'error')
+    return false
   }
+  return true
+}
+
+async function testImapProxy() {
+  const payload = getImapSettingsPayload()
+  if (!validateImapSettingsPayload(payload)) return
+  const button = $('testImapProxy')
+  const output = $('imapSettingsResult')
+  button.disabled = true
+  button.textContent = '测试中…'
+  output.hidden = false
+  output.classList.remove('error')
+    output.textContent = payload.proxyEnabled
+      ? '正在通过固定代理连接 Mail.com IMAP…'
+      : '正在从项目代理池自动轮换并连接 Mail.com IMAP…'
+  try {
+    const result = await api('/api/settings/imap/test', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+    const route = result.route === 'project-pool'
+      ? `项目代理池 · 第 ${result.attempts} 次成功 · ${result.proxyCountry} / ${result.proxyGroup}`
+      : payload.proxyScheme.toUpperCase()
+    output.textContent = `连接成功 · ${route} · ${result.latencyMs} ms · IMAP TLS 响应正常`
+    toast('代理连接测试成功')
+  } catch (error) {
+    output.classList.add('error')
+    output.textContent = `连接失败 · ${error.message}`
+    toast(error.message, 'error')
+  } finally {
+    button.disabled = false
+    button.textContent = '测试连接'
+  }
+}
+
+async function saveImapSettings(event) {
+  event.preventDefault()
+  const payload = getImapSettingsPayload()
+  if (!validateImapSettingsPayload(payload)) return
   const button = $('submitImapSettings')
   button.disabled = true
   button.textContent = '正在保存…'
@@ -185,7 +237,8 @@ async function saveImapSettings(event) {
     renderImapSettings(settings)
     $('imapProxyPassword').value = ''
     $('imapSettingsResult').hidden = false
-    $('imapSettingsResult').textContent = `已应用：${settings.proxyEnabled ? `${settings.proxyScheme}://${settings.proxyHost}:${settings.proxyPort}` : 'IMAP 直连'}`
+    $('imapSettingsResult').classList.remove('error')
+    $('imapSettingsResult').textContent = `已应用：${settings.proxyEnabled ? `${settings.proxyScheme}://${settings.proxyHost}:${settings.proxyPort}` : `项目代理池自动轮换（${settings.proxyPoolCount} 条）`}`
     toast('IMAP / 代理设置已保存并立即生效')
   } catch (error) { toast(error.message, 'error') }
   finally {
@@ -548,6 +601,7 @@ $('copyRegistrationButton').addEventListener('click', copyRegistrationLines)
 $('testAllButton').addEventListener('click', testAll)
 $('imapSettingsButton').addEventListener('click', openImapSettings)
 $('imapProxyEnabled').addEventListener('change', toggleProxyFields)
+$('testImapProxy').addEventListener('click', testImapProxy)
 $('imapSettingsForm').addEventListener('submit', saveImapSettings)
 $('closeImapSettingsDialog').addEventListener('click', () => $('imapSettingsDialog').close())
 $('cancelImapSettings').addEventListener('click', () => $('imapSettingsDialog').close())

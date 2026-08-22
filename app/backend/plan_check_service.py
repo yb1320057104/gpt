@@ -142,7 +142,11 @@ class AccountPlanCheckService:
             )
 
     async def check_accounts(
-        self, ids: list[str], *, proxy_id: str | None = None
+        self,
+        ids: list[str],
+        *,
+        proxy_id: str | None = None,
+        country: str | None = None,
     ) -> AccountPlanCheckResult:
         unique_ids = list(dict.fromkeys(str(value) for value in ids))
         available = await self.proxies.count_eligible_proxies()
@@ -152,13 +156,19 @@ class AccountPlanCheckService:
 
         async def check_one(account_id: str) -> AccountPlanCheckItem:
             async with semaphore:
-                return await self._check_one(account_id, proxy_id=proxy_id)
+                return await self._check_one(
+                    account_id, proxy_id=proxy_id, country=country
+                )
 
         items = await asyncio.gather(*(check_one(account_id) for account_id in unique_ids))
         return self._result(list(items))
 
     async def _check_one(
-        self, account_id: str, *, proxy_id: str | None = None
+        self,
+        account_id: str,
+        *,
+        proxy_id: str | None = None,
+        country: str | None = None,
     ) -> AccountPlanCheckItem:
         source = await self.resources.claim_account_plan_check(account_id)
         if source is None:
@@ -169,7 +179,12 @@ class AccountPlanCheckService:
             )
 
         owner = f"plan:{uuid4()}"
-        registration_country = str(source.get("registrationCountry") or "").upper()
+        registration_country = str(
+            country
+            or source.get("rebindProxyCountry")
+            or source.get("registrationCountry")
+            or ""
+        ).upper()
         if proxy_id:
             lease = await self.proxies.acquire_proxy_by_id(
                 proxy_id,

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MailCom Hub</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=20260822-mongodb">
 </head>
 <body>
   <div class="noise"></div>
@@ -37,7 +37,7 @@
     </section>
 
     <section class="stats-grid">
-      <article><span>邮箱总数</span><strong id="statTotal">0</strong><small>本机 SQLite</small></article>
+      <article><span>邮箱总数</span><strong id="statTotal">0</strong><small id="storageBackend">正在确认存储</small></article>
       <article><span>连接正常</span><strong id="statOnline" class="green">0</strong><small>最近测试成功</small></article>
       <article><span>连接失败</span><strong id="statFailed" class="red">0</strong><small>需要检查密码或 IMAP</small></article>
       <article><span>尚未测试</span><strong id="statUnknown" class="amber">0</strong><small>等待连通检查</small></article>
@@ -194,17 +194,17 @@
   <dialog id="imapSettingsDialog" class="modal imap-settings-modal">
     <form method="dialog" class="modal-shell" id="imapSettingsForm">
       <header>
-        <div><span class="eyebrow">CONNECTION SETTINGS</span><h2>IMAP / 动态代理设置</h2></div>
+        <div><span class="eyebrow">CONNECTION SETTINGS</span><h2>IMAP / 项目代理池</h2></div>
         <button id="closeImapSettingsDialog" type="button" class="icon-button" aria-label="关闭">×</button>
       </header>
       <div class="format-note">
-        <strong>保存后立即生效，重启后自动恢复</strong>
-        <span>代理密码使用 Windows DPAPI 加密保存在本机，页面和 API 不会返回密码。</span>
+        <strong>默认自动使用项目 MongoDB 中的全部可用代理，失败后立即轮换下一条</strong>
+        <span>无需手动选择国家或代理组；只有需要强制使用某一条代理时，才启用下方固定代理覆盖。</span>
       </div>
       <div class="imap-settings-grid">
         <label class="wide"><span>IMAP 主机 / IP</span><input id="imapSettingsHost" required maxlength="253" autocomplete="off" value="imap.mail.com"></label>
         <label><span>IMAP 端口</span><input id="imapSettingsPort" required type="number" min="1" max="65535" value="993"></label>
-        <label class="proxy-toggle wide"><input id="imapProxyEnabled" type="checkbox"><span>启用动态代理</span></label>
+        <label class="proxy-toggle wide"><input id="imapProxyEnabled" type="checkbox"><span>使用固定代理覆盖自动代理池（可选）</span></label>
         <label><span>代理协议</span>
           <select id="imapProxyScheme">
             <option value="http">HTTP</option>
@@ -223,12 +223,13 @@
       <div id="imapSettingsResult" class="inline-result" hidden></div>
       <footer>
         <button id="cancelImapSettings" type="button" class="button ghost">取消</button>
+        <button id="testImapProxy" type="button" class="button secondary">测试连接</button>
         <button id="submitImapSettings" type="submit" class="button primary">保存并立即应用</button>
       </footer>
     </form>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=20260822-auto-proxy-pool" defer></script>
 </body>
 </html>

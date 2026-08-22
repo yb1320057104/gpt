@@ -6,6 +6,7 @@ import re
 import socket
 import ssl
 import threading
+import time
 from base64 import b64encode
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -453,6 +454,38 @@ class ImapMailboxService:
             client.logout()
         except Exception:
             pass
+
+    def probe(self) -> dict[str, Any]:
+        """Verify the transport through TLS and the IMAP greeting, without logging in."""
+        client: Any | None = None
+        started = time.perf_counter()
+        try:
+            client = self.factory(self.host, self.port, timeout=self.timeout_seconds)
+            return {
+                "ok": True,
+                "latencyMs": max(1, round((time.perf_counter() - started) * 1000)),
+                "route": self.route,
+                "message": "代理连接成功，IMAP TLS 握手和服务响应正常",
+            }
+        except (imaplib.IMAP4.error, OSError, socket.timeout, TimeoutError, ssl.SSLError) as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            if self.proxy_password:
+                detail = detail.replace(self.proxy_password, "***")
+            raise MailboxError(
+                "proxy_test_failed",
+                f"代理无法连接到 {self.host}:{self.port}：{detail[:180]}",
+                retryable=True,
+            ) from None
+        finally:
+            if client is not None:
+                try:
+                    shutdown = getattr(client, "shutdown", None)
+                    if callable(shutdown):
+                        shutdown()
+                    else:
+                        self._logout(client)
+                except Exception:
+                    pass
 
     def test(self, email: str, password: str) -> dict[str, Any]:
         client = self._connect(email, password)

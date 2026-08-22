@@ -148,6 +148,36 @@ def test_country_timezone_offsets_are_consistent() -> None:
     assert timezone_offset_for_country("US") == "300"
 
 
+def test_rebind_country_override_controls_promotion_proxy_and_timezone(monkeypatch) -> None:
+    resources = FakeResources({
+        "account": {
+            "accessToken": "TEST_AT",
+            "registrationCountry": "TR",
+            "rebindProxyCountry": "PH",
+        }
+    })
+    proxies = FakeProxies(
+        ProxyLease("proxy-ph", "proxy.test", 10000, "", "", country="PH")
+    )
+    observed: dict[str, str] = {}
+
+    def check(*_args, **kwargs):
+        observed["timezone"] = kwargs["timezone_offset_min"]
+        return plan_result()
+
+    monkeypatch.setattr("backend.plan_check_service.check_account_plan_curl", check)
+
+    result = asyncio.run(
+        AccountPlanCheckService(resources, proxies).check_accounts(
+            ["account"], country="PH"
+        )
+    )
+
+    assert result.succeeded == 1
+    assert proxies.acquire_options[0]["country"] == "PH"
+    assert observed["timezone"] == "-480"
+
+
 def test_manual_plan_check_401_persists_failure_and_releases_proxy(monkeypatch) -> None:
     resources = FakeResources({"account": {"accessToken": "TEST_AT"}})
     proxies = FakeProxies(ProxyLease("proxy", "proxy.test", 10000, "", ""))

@@ -1,24 +1,27 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { CircleCheck, CopyDocument, CreditCard, Delete, Download, Key, Link, Lock, MagicStick, Search, UserFilled } from '@element-plus/icons-vue'
+import { CircleCheck, CopyDocument, CreditCard, Delete, Download, Key, Link, Lock, MagicStick, Search, UploadFilled, UserFilled } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
-import type { AccountRecord, ExportFormat, ExportScope, ProxyRecord, ResourceQuery } from '@/types'
+import type { AccountRecord, ExportFormat, ExportScope, ImportResult, ProxyRecord, ResourceQuery } from '@/types'
 import { useAppStore } from '@/stores/app'
 import { dataGateway } from '@/services/dataGateway'
 import { COMMON_REGISTRATION_COUNTRIES, countryLabel } from '@/services/countries'
 import { copyText } from '@/services/exporter'
 import ExportDialog from '@/components/ExportDialog.vue'
 import AccessTokenGroupsDialog from '@/components/AccessTokenGroupsDialog.vue'
+import ImportDialog from '@/components/ImportDialog.vue'
 import SecretCell from '@/components/SecretCell.vue'
 import StatCard from '@/components/StatCard.vue'
 
 const store = useAppStore()
 const tableRef = ref<TableInstance>()
 const search = ref('')
+const importOpen = ref(false)
 const promotionFilter = ref<ResourceQuery['promotion']>('')
 const aliveFilter = ref<ResourceQuery['alive']>('')
 const globalPromotionFilter = ref<ResourceQuery['globalPromotion']>('')
 const rebindFilter = ref<ResourceQuery['rebind']>('')
+const rebindCountryFilter = ref('')
 const countryFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref<ResourceQuery['pageSize']>(10)
@@ -46,8 +49,10 @@ const copyAtLimit = ref((() => {
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 let globalPromotionTimer: ReturnType<typeof setInterval> | undefined
 let aliveMarkerTimer: ReturnType<typeof setInterval> | undefined
+let rebindRefreshTimer: ReturnType<typeof setInterval> | undefined
 
 const pageAccounts = computed(() => store.accounts)
+const existingAccountKeys = computed(() => store.accounts.map((item) => item.email.toLowerCase()))
 const promotionChecking = computed(() => store.accountPromotionChecking)
 const aliveChecking = computed(() => store.accountAliveChecking)
 const checkoutTypeChecking = computed(() => store.accountCheckoutTypeChecking)
@@ -55,6 +60,7 @@ const checkingAccountIds = computed(() => store.accountPromotionCheckingIds)
 const aliveCheckingAccountIds = computed(() => store.accountAliveCheckingIds)
 const checkoutTypeCheckingAccountIds = computed(() => store.accountCheckoutTypeCheckingIds)
 const oaicsStartingIds = ref<string[]>([])
+const refreshingSelectedAt = ref(false)
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat('zh-CN', {
@@ -72,8 +78,25 @@ function hasValidAccessToken(account: AccountRecord) {
 }
 
 function accessTokenStatus(account: AccountRecord) {
+  if (account.rebindStatus === 'email_changed_token_pending') return 'pending'
   if (!account.accessTokenConfigured) return 'missing'
   return hasValidAccessToken(account) ? 'valid' : 'expired'
+}
+
+function rebindStatusLabel(account: AccountRecord) {
+  if (account.rebindStatus === 'success') return '已换绑'
+  if (account.rebindStatus === 'email_changed_token_pending') return '邮箱已换 · AT待更新'
+  if (account.rebindStatus === 'in_progress') return '换绑中'
+  if (account.rebindStatus === 'failed') return '换绑失败'
+  return '未换绑'
+}
+
+function rebindStatusTag(account: AccountRecord) {
+  if (account.rebindStatus === 'success') return 'success'
+  if (account.rebindStatus === 'email_changed_token_pending') return 'warning'
+  if (account.rebindStatus === 'failed') return 'danger'
+  if (account.rebindStatus === 'in_progress') return 'primary'
+  return 'info'
 }
 
 function promotionLabel(account: AccountRecord) {
@@ -341,12 +364,23 @@ async function loadPage() {
       alive: aliveFilter.value,
       globalPromotion: globalPromotionFilter.value,
       rebind: rebindFilter.value,
+      rebindCountry: rebindCountryFilter.value,
     })
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
   } finally {
     loading.value = false
   }
+}
+
+async function submitAccountImport(rawText: string) {
+  return store.importAccounts(rawText)
+}
+
+async function afterAccountImport(_result: ImportResult) {
+  currentPage.value = 1
+  await loadPage()
+  await syncPageSelection()
 }
 
 function handleSearch() {
@@ -391,6 +425,12 @@ function changePromotionFilter(value: string | number | boolean | undefined) {
 
 function changeCountryFilter(value: string | number | boolean | undefined) {
   countryFilter.value = String(value || '').trim().toUpperCase()
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeRebindCountryFilter(value: string | number | boolean | undefined) {
+  rebindCountryFilter.value = String(value || '').trim().toUpperCase()
   currentPage.value = 1
   void loadPage()
 }
@@ -499,11 +539,44 @@ async function enqueueRebind() {
   }
 }
 
+async function refreshSelectedAccessTokens() {
+  if (!selectedIds.value.length) return
+  refreshingSelectedAt.value = true
+  try {
+    const response = await fetch('/api/account-rebind/access-tokens/refresh-expired', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountIds: [...selectedIds.value],
+        proxyMode: 'auto',
+        emailSource: 'standard',
+      }),
+    })
+    const raw = await response.text()
+    let body: any = {}
+    try { body = raw ? JSON.parse(raw) : {} } catch { body = { detail: raw || `HTTP ${response.status}` } }
+    if (!response.ok) {
+      const message = typeof body.detail === 'string' ? body.detail : body.detail?.message
+      throw new Error(message || '重新获取 AT 失败')
+    }
+    if (!body.started) {
+      ElMessage.warning('选中账号没有可用的密码或邮箱接码资料')
+      return
+    }
+    ElMessage.success(`已为选中的 ${body.started} 个账号启动 AT 获取任务，可在换绑页面查看进度`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '重新获取 AT 失败')
+  } finally {
+    refreshingSelectedAt.value = false
+  }
+}
+
 watch(pageAccounts, () => void syncPageSelection(), { flush: 'post', immediate: true })
 watch([currentPage, pageSize], () => void loadPage())
 watch(rebindFilter, () => { currentPage.value = 1; void loadPage() })
 onMounted(() => {
   void loadPage()
+  rebindRefreshTimer = setInterval(() => void loadPage(), 3000)
   globalPromotionTimer = setInterval(() => {
     if (pageAccounts.value.some((account) =>
       ['pending', 'running'].includes(account.globalPromotionStatus || '') || account.oaicsScanStatus === 'running',
@@ -532,6 +605,7 @@ onBeforeUnmount(() => {
   if (searchTimer) clearTimeout(searchTimer)
   if (globalPromotionTimer) clearInterval(globalPromotionTimer)
   if (aliveMarkerTimer) clearInterval(aliveMarkerTimer)
+  if (rebindRefreshTimer) clearInterval(rebindRefreshTimer)
 })
 </script>
 
@@ -554,6 +628,7 @@ onBeforeUnmount(() => {
     <div class="panel table-panel">
       <div class="table-toolbar">
         <div class="toolbar-group">
+          <el-button type="primary" :icon="UploadFilled" @click="importOpen = true">导入账号</el-button>
           <el-input
             v-model="search"
             class="toolbar-search"
@@ -564,6 +639,24 @@ onBeforeUnmount(() => {
           />
           <span class="muted">已选择 {{ selectedIds.length }} 条</span>
           <el-select v-model="rebindFilter" clearable placeholder="换绑状态" style="width:140px"><el-option label="未换绑" value="ready" /><el-option label="已换绑" value="rebound" /></el-select>
+          <el-select
+            :model-value="rebindCountryFilter"
+            clearable
+            filterable
+            allow-create
+            default-first-option
+            placeholder="筛选换绑 IP 国家"
+            style="width: 190px"
+            @change="changeRebindCountryFilter"
+          >
+            <el-option
+              v-for="country in COMMON_REGISTRATION_COUNTRIES"
+              :key="`rebind-${country.value}`"
+              :label="`${country.label} · ${country.value}`"
+              :value="country.value"
+            />
+            <el-option label="未记录" value="ZZ" />
+          </el-select>
         </div>
         <div class="toolbar-group">
           <el-select
@@ -649,6 +742,16 @@ onBeforeUnmount(() => {
           </el-button>
           <el-button :disabled="selectedIds.length === 0" @click="openExport('selected')">
             导出选中
+          </el-button>
+          <el-button
+            type="success"
+            plain
+            :icon="Key"
+            :loading="refreshingSelectedAt"
+            :disabled="selectedIds.length === 0 || refreshingSelectedAt"
+            @click="refreshSelectedAccessTokens"
+          >
+            重新获取选中账号 AT
           </el-button>
           <el-button
             type="success"
@@ -780,8 +883,15 @@ onBeforeUnmount(() => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="换绑状态" width="105">
-          <template #default="{ row }"><el-tag :type="row.rebindStatus === 'success' ? 'success' : 'info'" effect="plain">{{ row.rebindStatus === 'success' ? '已换绑' : '未换绑' }}</el-tag></template>
+        <el-table-column label="换绑状态" width="165">
+          <template #default="{ row }"><el-tag :type="rebindStatusTag(row)" effect="plain">{{ rebindStatusLabel(row) }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="换绑 IP 国家" width="165">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.rebindProxyCountry ? 'success' : 'info'">
+              {{ row.rebindProxyCountry ? countryLabel(row.rebindProxyCountry) : '未记录' }}
+            </el-tag>
+          </template>
         </el-table-column>
         <el-table-column label="验活状态" width="190">
           <template #default="{ row }">
@@ -865,11 +975,11 @@ onBeforeUnmount(() => {
           <template #default="{ row }">
             <div class="at-status">
               <el-tag
-                :type="accessTokenStatus(row) === 'valid' ? 'success' : accessTokenStatus(row) === 'expired' ? 'warning' : 'info'"
+                :type="accessTokenStatus(row) === 'valid' ? 'success' : accessTokenStatus(row) === 'expired' || accessTokenStatus(row) === 'pending' ? 'warning' : 'info'"
                 effect="plain"
                 round
               >
-                {{ accessTokenStatus(row) === 'valid' ? '已提取' : accessTokenStatus(row) === 'expired' ? '已过期' : '未提取' }}
+                {{ accessTokenStatus(row) === 'valid' ? '已提取' : accessTokenStatus(row) === 'expired' ? '已过期' : accessTokenStatus(row) === 'pending' ? '等待新 AT' : '未提取' }}
               </el-tag>
               <small v-if="row.accessTokenExpiresAt">{{ formatDate(row.accessTokenExpiresAt) }}</small>
             </div>
@@ -982,6 +1092,13 @@ onBeforeUnmount(() => {
       :format-locked="exportFormatLocked"
     />
     <AccessTokenGroupsDialog v-model="accessTokenGroupsOpen" />
+    <ImportDialog
+      v-model="importOpen"
+      kind="account"
+      :existing-keys="existingAccountKeys"
+      :submit-handler="submitAccountImport"
+      @imported="afterAccountImport"
+    />
   </section>
 </template>
 

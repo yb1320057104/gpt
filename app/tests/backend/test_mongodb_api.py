@@ -93,6 +93,11 @@ class ImportStore:
         self.proxies: set[tuple[str, int, str, str]] = set()
         self.proxy_schemes: list[str] = []
         self.proxy_groups: list[str | None] = []
+        self.accounts: list[dict] = []
+
+    async def create_account(self, incoming):
+        self.accounts.append(incoming.model_dump())
+        return None
 
     async def upsert_email(
         self,
@@ -265,6 +270,39 @@ def test_server_side_import_validation_and_proxy_password_colons() -> None:
             "TEST_PASSWORD:tail",
         )
     }
+
+
+def test_account_import_auto_detects_all_supported_mixed_formats() -> None:
+    store = ImportStore()
+    service = ResourceService(store)  # type: ignore[arg-type]
+    secret = "JBSWY3DPEHPK3PXP"
+
+    result = asyncio.run(service.import_accounts(
+        "first@example.com----Password-1----JBSWY3DPEHPK3PXP\n"
+        "second@example.com----Password-2----https://mail.test/second\n"
+        "third@example.com----https://mail.test/third\n"
+        "fourth@example.com----https://mail.test/fourth----JBSWY3DPEHPK3PXP\n"
+        "first@example.com----Password-duplicate----JBSWY3DPEHPK3PXP\n"
+        "broken@example.com----not-a-mailbox-url\n"
+    ))
+
+    assert result.model_dump() == {
+        "total": 6, "imported": 4, "duplicateCount": 1, "errorCount": 1
+    }
+    assert store.accounts == [
+        {"email": "first@example.com", "chatgptPassword": "Password-1", "totpSecret": secret,
+         "emailAccessUrl": "", "accountType": "free", "phoneBound": None,
+         "promotionEligible": None, "sourceEmailId": None, "registrationCountry": None},
+        {"email": "second@example.com", "chatgptPassword": "Password-2", "totpSecret": "",
+         "emailAccessUrl": "https://mail.test/second", "accountType": "free", "phoneBound": None,
+         "promotionEligible": None, "sourceEmailId": None, "registrationCountry": None},
+        {"email": "third@example.com", "chatgptPassword": "", "totpSecret": "",
+         "emailAccessUrl": "https://mail.test/third", "accountType": "free", "phoneBound": None,
+         "promotionEligible": None, "sourceEmailId": None, "registrationCountry": None},
+        {"email": "fourth@example.com", "chatgptPassword": "", "totpSecret": secret,
+         "emailAccessUrl": "https://mail.test/fourth", "accountType": "free", "phoneBound": None,
+         "promotionEligible": None, "sourceEmailId": None, "registrationCountry": None},
+    ]
 
 
 def test_proxy_import_accepts_yaml_proxy_lists() -> None:

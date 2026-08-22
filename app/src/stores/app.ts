@@ -214,6 +214,12 @@ export const useAppStore = defineStore('app', {
       return result
     },
 
+    async importAccounts(rawText: string) {
+      const result = await dataGateway.importAccounts(rawText)
+      await Promise.all([this.refreshAccounts(), this.refreshStats()])
+      return result
+    },
+
     async syncMailcomAliases() {
       const result = await dataGateway.syncMailcomAliases()
       await Promise.all([this.refreshEmails(), this.refreshStats()])

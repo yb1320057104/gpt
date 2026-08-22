@@ -54,6 +54,7 @@ PROXY_COUNTRY_PATTERN = re.compile(
 )
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 DEFAULT_PROXY_GROUP = "默认组"
+MAX_PROXY_COOLDOWN_SECONDS = 10 * 60
 REGISTRATION_EXCLUDED_EMAIL_DOMAINS = tuple(
     domain.strip().casefold().lstrip("@")
     for domain in os.getenv(
@@ -65,6 +66,26 @@ REGISTRATION_EXCLUDED_EMAIL_DOMAINS = tuple(
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def proxy_quarantine_seconds() -> int:
+    try:
+        configured = int(os.getenv("AUTOREGISTER_PROXY_COOLDOWN_SECONDS", "600"))
+    except (TypeError, ValueError):
+        configured = MAX_PROXY_COOLDOWN_SECONDS
+    return max(60, min(MAX_PROXY_COOLDOWN_SECONDS, configured))
+
+
+def usable_proxy_status_filter(now: datetime) -> dict[str, Any]:
+    """Allow normal proxies and automatically released 10-minute quarantines."""
+    return {
+        "$or": [
+            {"status": {"$ne": "quarantined"}},
+            {"quarantineUntil": {"$exists": False}},
+            {"quarantineUntil": None},
+            {"quarantineUntil": {"$lte": now}},
+        ]
+    }
 
 
 def normalize_email(value: str) -> str:
@@ -218,6 +239,14 @@ class MongoResourceStore:
     def proxies(self) -> Any:
         return self.manager.database["proxies"]
 
+    @property
+    def rebind_logs(self) -> Any:
+        return self.manager.database["account_rebind_logs"]
+
+    @property
+    def rebind_tasks(self) -> Any:
+        return self.manager.database["account_rebind_tasks"]
+
     async def _guard(self, awaitable: Any) -> Any:
         self.manager.require_online()
         try:
@@ -279,12 +308,34 @@ class MongoResourceStore:
                 [("country", ASCENDING), ("enabled", ASCENDING)],
                 name="proxies_country_enabled",
             )
+            await self.rebind_logs.create_index(
+                [("createdAt", DESCENDING)],
+                name="account_rebind_logs_created_desc",
+            )
+            await self.rebind_logs.create_index(
+                [("createdAt", ASCENDING)],
+                expireAfterSeconds=30 * 24 * 60 * 60,
+                name="account_rebind_logs_ttl_30d",
+            )
+            await self.rebind_tasks.create_index(
+                [("taskId", ASCENDING)],
+                unique=True,
+                name="account_rebind_tasks_id_unique",
+            )
+            await self.rebind_tasks.create_index(
+                [("updatedAt", DESCENDING)],
+                name="account_rebind_tasks_updated_desc",
+            )
         except (PyMongoError, OSError) as exc:
             self.manager.mark_offline(exc)
             raise MongoUnavailableError("MongoDB 索引初始化失败") from exc
 
     async def release_orphaned_reservations(self, active_run_ids: list[str]) -> int:
-        query: dict[str, Any] = {"status": "reserved"}
+        # Registration-run cleanup must never release durable rebind leases.
+        query: dict[str, Any] = {
+            "status": "reserved",
+            "usagePurpose": {"$ne": "rebind"},
+        }
         if active_run_ids:
             query["reservedBy"] = {"$nin": active_run_ids}
         result = await self._guard(
@@ -344,6 +395,7 @@ class MongoResourceStore:
         alive: str = "",
         global_promotion: str = "",
         rebind: str = "",
+        rebind_country: str = "",
     ) -> Page[AccountRecord]:
         mongo_query: dict[str, Any] = {}
         if query.strip():
@@ -384,9 +436,32 @@ class MongoResourceStore:
         if global_promotion in {"eligible", "ineligible", "pending", "failed"}:
             mongo_query["globalPromotionStatus"] = global_promotion
         if rebind == "rebound":
-            mongo_query["rebindStatus"] = "success"
+            mongo_query["rebindStatus"] = {
+                "$in": ["success", "email_changed_token_pending"]
+            }
         elif rebind == "ready":
-            mongo_query.setdefault("$and", []).append({"$or": [{"rebindStatus": {"$ne": "success"}}, {"rebindStatus": {"$exists": False}}]})
+            mongo_query.setdefault("$and", []).append({
+                "$or": [
+                    {
+                        "rebindStatus": {
+                            "$nin": ["success", "email_changed_token_pending"]
+                        }
+                    },
+                    {"rebindStatus": {"$exists": False}},
+                ]
+            })
+        if rebind_country.strip():
+            normalized_rebind_country = normalize_country_code(rebind_country)
+            if normalized_rebind_country == "ZZ":
+                mongo_query.setdefault("$and", []).append({
+                    "$or": [
+                        {"rebindProxyCountry": None},
+                        {"rebindProxyCountry": ""},
+                        {"rebindProxyCountry": {"$exists": False}},
+                    ]
+                })
+            else:
+                mongo_query["rebindProxyCountry"] = normalized_rebind_country
         total = await self._guard(self.accounts.count_documents(mongo_query))
         cursor = (
             self.accounts.find(mongo_query, {"accessToken": 0})
@@ -702,6 +777,7 @@ class MongoResourceStore:
                     "accessToken": 1,
                     "accessTokenExpiresAt": 1,
                     "registrationCountry": 1,
+                    "rebindProxyCountry": 1,
                 },
                 return_document=ReturnDocument.AFTER,
             )
@@ -1119,10 +1195,31 @@ class MongoResourceStore:
             )
         )
 
-    async def reserve_rebind_email(self, run_id: str) -> dict[str, Any] | None:
-        """Reserve an email exclusively for rebind, never registration."""
+    async def reserve_rebind_email(
+        self,
+        run_id: str,
+        exclude_email: str = "",
+        source: str = "standard",
+    ) -> dict[str, Any] | None:
+        """Reserve one shared-pool email exclusively for this rebind task."""
+        query: dict[str, Any] = {
+            "status": "available",
+            "usagePurpose": {"$ne": "rebind"},
+        }
+        query.update(email_source_filter(source))
+        normalized_exclusion = exclude_email.strip().lower()
+        if normalized_exclusion:
+            exclusions = [
+                {"emailNormalized": {"$ne": normalized_exclusion}},
+                {"email": {"$ne": normalized_exclusion}},
+            ]
+            if "$or" in query:
+                source_filter = {"$or": query.pop("$or")}
+                query["$and"] = [source_filter, *exclusions]
+            else:
+                query["$and"] = exclusions
         result = await self._guard(self.emails.find_one_and_update(
-            {"status": "available", "usagePurpose": {"$ne": "rebind"}},
+            query,
             {"$set": {"status": "reserved", "usagePurpose": "rebind", "rebindReservedBy": run_id, "reservedAt": utc_now()}},
             sort=[("importedAt", DESCENDING)],
             return_document=ReturnDocument.AFTER,
@@ -1136,11 +1233,212 @@ class MongoResourceStore:
         ))
         return bool(result.modified_count)
 
-    async def mark_rebind_success(self, account_id: str, new_email: str, access_token: str, proxy: str = "") -> None:
+    async def reserve_specific_rebind_email(
+        self,
+        email_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        """Reacquire a task's previously selected mailbox when it is still free."""
+        return await self._guard(self.emails.find_one_and_update(
+            {
+                "_id": email_id,
+                "$or": [
+                    {"status": "available"},
+                    {"status": "reserved", "rebindReservedBy": run_id},
+                ],
+            },
+            {
+                "$set": {
+                    "status": "reserved",
+                    "usagePurpose": "rebind",
+                    "rebindReservedBy": run_id,
+                    "reservedAt": utc_now(),
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        ))
+
+    async def remember_rebind_mailbox(
+        self,
+        account_id: str,
+        mailbox: dict[str, Any],
+        run_id: str,
+    ) -> None:
         await self._guard(self.accounts.update_one(
             {"_id": account_id},
-            {"$set": {"email": new_email.strip().lower(), "emailNormalized": new_email.strip().lower(), "accessToken": access_token, "accessTokenConfigured": bool(access_token), "rebindStatus": "success", "reboundEmail": new_email.strip().lower(), "rebindProxy": proxy, "updatedAt": utc_now()}},
+            {
+                "$set": {
+                    "rebindMailboxId": str(mailbox.get("_id") or ""),
+                    "rebindTargetEmail": str(mailbox.get("email") or "").strip().lower(),
+                    "rebindRunId": run_id,
+                    "rebindMailboxSource": str(mailbox.get("sourceType") or "standard"),
+                    "rebindStatus": "in_progress",
+                    "updatedAt": utc_now(),
+                }
+            },
         ))
+
+    async def mark_rebind_email_changed(
+        self,
+        account_id: str,
+        old_email: str,
+        new_email: str,
+        new_email_access_url: str,
+        proxy: str = "",
+        proxy_country: str = "",
+    ) -> None:
+        """Persist the irreversible remote email change before AT confirmation."""
+        now = utc_now()
+        normalized_email = new_email.strip().lower()
+        result = await self._guard(self.accounts.update_one(
+            {"_id": account_id},
+            {
+                "$set": {
+                    "email": normalized_email,
+                    "emailNormalized": normalized_email,
+                    "emailAccessUrl": new_email_access_url.strip(),
+                    "rebindStatus": "email_changed_token_pending",
+                    "previousEmail": old_email.strip().lower(),
+                    "reboundEmail": normalized_email,
+                    "rebindProxy": proxy,
+                    "rebindProxyCountry": normalize_country_code(proxy_country) if proxy_country else None,
+                    "reboundAt": now,
+                    "updatedAt": now,
+                },
+                "$unset": {"rebindError": ""},
+            },
+        ))
+        if int(result.matched_count) != 1:
+            raise ResourceNotFoundError("换绑账号不存在")
+
+    async def update_account_access_token(
+        self,
+        account_id: str,
+        access_token: str,
+        access_token_expires_at: datetime | None,
+        *,
+        rebind_success: bool = False,
+    ) -> None:
+        now = utc_now()
+        updates: dict[str, Any] = {
+            "accessToken": access_token,
+            "accessTokenConfigured": bool(access_token),
+            "accessTokenExpiresAt": access_token_expires_at,
+            "accessTokenUpdatedAt": now,
+            "aliveStatus": "unknown",
+            "updatedAt": now,
+        }
+        if rebind_success:
+            updates["rebindStatus"] = "success"
+        result = await self._guard(self.accounts.update_one(
+            {"_id": account_id},
+            {"$set": updates, "$unset": {"rebindError": "", "aliveError": ""}},
+        ))
+        if int(result.matched_count) != 1:
+            raise ResourceNotFoundError("账号不存在")
+
+    async def clear_rebind_retry_state(self, account_id: str) -> None:
+        await self._guard(self.accounts.update_one(
+            {"_id": account_id, "rebindStatus": {"$in": ["failed", "in_progress"]}},
+            {
+                "$unset": {
+                    "rebindStatus": "",
+                    "rebindError": "",
+                    "rebindMailboxId": "",
+                    "rebindTargetEmail": "",
+                    "rebindRunId": "",
+                    "rebindMailboxSource": "",
+                },
+                "$set": {"updatedAt": utc_now()},
+            },
+        ))
+
+    async def append_rebind_log(self, entry: dict[str, Any]) -> None:
+        document = dict(entry)
+        document["createdAt"] = utc_now()
+        await self._guard(self.rebind_logs.insert_one(document))
+
+    async def list_rebind_logs(self, limit: int = 300) -> list[dict[str, Any]]:
+        documents = await self._guard(
+            self.rebind_logs.find({}, {"_id": 0, "createdAt": 0})
+            .sort("createdAt", DESCENDING)
+            .limit(max(1, min(1000, limit)))
+            .to_list(length=max(1, min(1000, limit)))
+        )
+        documents.reverse()
+        return documents
+
+    async def save_rebind_task(self, task: dict[str, Any]) -> None:
+        task_id = str(task.get("taskId") or "")
+        if not task_id:
+            return
+        document = dict(task)
+        document["updatedAt"] = utc_now()
+        try:
+            await self._guard(self.rebind_tasks.update_one(
+                {"taskId": task_id, "deletedAt": {"$exists": False}},
+                {"$set": document},
+                upsert=True,
+            ))
+        except DuplicateKeyError:
+            # A cancellation tombstone wins over a late progress write.
+            return
+
+    async def list_rebind_tasks(self, limit: int = 500) -> list[dict[str, Any]]:
+        return await self._guard(
+            self.rebind_tasks.find({"deletedAt": {"$exists": False}}, {"_id": 0})
+            .sort("updatedAt", DESCENDING)
+            .limit(max(1, min(1000, limit)))
+            .to_list(length=max(1, min(1000, limit)))
+        )
+
+    async def delete_rebind_task(self, task_id: str) -> None:
+        await self._guard(self.rebind_tasks.update_one(
+            {"taskId": task_id},
+            {
+                "$set": {"deletedAt": utc_now(), "updatedAt": utc_now()},
+                "$unset": {"items": ""},
+            },
+            upsert=True,
+        ))
+
+    async def mark_rebind_success(
+        self,
+        account_id: str,
+        old_email: str,
+        new_email: str,
+        new_email_access_url: str,
+        access_token: str,
+        access_token_expires_at: datetime | None,
+        proxy: str = "",
+        proxy_country: str = "",
+    ) -> None:
+        now = utc_now()
+        normalized_email = new_email.strip().lower()
+        result = await self._guard(self.accounts.update_one(
+            {"_id": account_id},
+            {
+                "$set": {
+                    "email": normalized_email,
+                    "emailNormalized": normalized_email,
+                    "emailAccessUrl": new_email_access_url.strip(),
+                    "accessToken": access_token,
+                    "accessTokenConfigured": bool(access_token),
+                    "accessTokenExpiresAt": access_token_expires_at,
+                    "accessTokenUpdatedAt": now,
+                    "rebindStatus": "success",
+                    "previousEmail": old_email.strip().lower(),
+                    "reboundEmail": normalized_email,
+                    "rebindProxy": proxy,
+                    "rebindProxyCountry": normalize_country_code(proxy_country) if proxy_country else None,
+                    "reboundAt": now,
+                    "updatedAt": now,
+                },
+                "$unset": {"rebindError": ""},
+            },
+        ))
+        if int(result.matched_count) != 1:
+            raise ResourceNotFoundError("换绑账号不存在")
 
     async def consume_rebind_email(self, email_id: str, run_id: str) -> bool:
         result = await self._guard(self.emails.update_one(
@@ -1267,9 +1565,31 @@ class MongoResourceStore:
             raise ResourceNotFoundError("账号资料完成后无法读取账号记录")
         return self._account_record(stored)
 
+    async def release_expired_proxy_quarantines(self) -> int:
+        """Make expired/legacy quarantines visible and selectable again."""
+        now = utc_now()
+        result = await self._guard(
+            self.proxies.update_many(
+                {
+                    "status": "quarantined",
+                    "$or": [
+                        {"quarantineUntil": {"$exists": False}},
+                        {"quarantineUntil": None},
+                        {"quarantineUntil": {"$lte": now}},
+                    ],
+                },
+                {
+                    "$set": {"status": "unknown", "consecutiveFailures": 0},
+                    "$unset": {"quarantineUntil": ""},
+                },
+            )
+        )
+        return int(result.modified_count)
+
     async def list_proxies(
         self, page: int, page_size: PageSize, query: str, country: str = ""
     ) -> Page[ProxyRecord]:
+        await self.release_expired_proxy_quarantines()
         mongo_query: dict[str, Any] = {}
         if query.strip():
             escaped = re.escape(query.strip())
@@ -1307,6 +1627,7 @@ class MongoResourceStore:
         now = utc_now()
         query: dict[str, Any] = {
             "$and": [
+                usable_proxy_status_filter(now),
                 {
                     "$or": [
                         {"activeLeaseOwners": {"$exists": False}},
@@ -1334,9 +1655,9 @@ class MongoResourceStore:
         return await self._guard(cursor.to_list(length=limit))
 
     async def payment_extractor_proxy_pool(self, country: str, group: str) -> list[str]:
+        await self.release_expired_proxy_quarantines()
         query: dict[str, Any] = {
-            "enabled": True,
-            "status": {"$ne": "quarantined"},
+            "$and": [{"enabled": True}, usable_proxy_status_filter(utc_now())]
         }
         if country:
             query = {"$and": [query, proxy_country_filter(country)]}
@@ -1379,7 +1700,10 @@ class MongoResourceStore:
         if available:
             changes["status"] = "available"
             changes["consecutiveFailures"] = 0
-            update: dict[str, Any] | list[dict[str, Any]] = {"$set": changes}
+            update: dict[str, Any] | list[dict[str, Any]] = {
+                "$set": changes,
+                "$unset": {"quarantineUntil": ""},
+            }
         else:
             # A single timeout is not enough evidence to disable a proxy.
             # Keep a previously healthy proxy selectable until repeated
@@ -1388,6 +1712,9 @@ class MongoResourceStore:
                 2, int(os.getenv("AUTOREGISTER_PROXY_DELETE_AFTER_FAILURES", "3"))
             )
             next_failures = {"$add": [{"$ifNull": ["$consecutiveFailures", 0]}, 1]}
+            quarantine_until = utc_now() + timedelta(
+                seconds=proxy_quarantine_seconds()
+            )
             update = [
                 {
                     "$set": {
@@ -1406,35 +1733,22 @@ class MongoResourceStore:
                                 },
                             ]
                         },
+                        "quarantineUntil": {
+                            "$cond": [
+                                {"$gte": [next_failures, threshold]},
+                                quarantine_until,
+                                "$quarantineUntil",
+                            ]
+                        },
                     }
                 }
             ]
         await self._guard(self.proxies.update_one({"_id": proxy_id}, update))
 
     async def delete_repeatedly_failed_proxies(self, threshold: int) -> int:
-        now = utc_now()
-        query = {
-            "status": "quarantined",
-            "consecutiveFailures": {"$gte": max(1, threshold)},
-            "$and": [
-                {
-                    "$or": [
-                        {"activeLeaseOwners": {"$exists": False}},
-                        {"activeLeaseOwners": {"$size": 0}},
-                        {"activeLeaseCount": {"$lte": 0}},
-                    ]
-                },
-                {
-                    "$or": [
-                        {"leaseUntil": {"$exists": False}},
-                        {"leaseUntil": None},
-                        {"leaseUntil": {"$lte": now}},
-                    ]
-                },
-            ],
-        }
-        result = await self._guard(self.proxies.delete_many(query))
-        return int(result.deleted_count)
+        """Deprecated safety shim: automatic health cleanup never deletes proxies."""
+        _ = threshold
+        return 0
 
     async def upsert_proxy(
         self,
@@ -1504,6 +1818,7 @@ class MongoResourceStore:
         return self._proxy_record(document)
 
     async def proxy_country_summaries(self) -> list[ProxyCountrySummary]:
+        await self.release_expired_proxy_quarantines()
         cursor = self.proxies.find({}, {"country": 1, "username": 1, "host": 1, "enabled": 1})
         documents = await self._guard(cursor.to_list(length=None))
         counts: dict[str, list[int]] = {}
@@ -1524,6 +1839,7 @@ class MongoResourceStore:
         ]
 
     async def proxy_group_summaries(self) -> list[ProxyGroupSummary]:
+        await self.release_expired_proxy_quarantines()
         cursor = self.proxies.find(
             {},
             {
@@ -1610,9 +1926,11 @@ class MongoResourceStore:
         normalized = normalize_country_code(country)
         if normalized == "ZZ":
             return []
+        await self.release_expired_proxy_quarantines()
         filters: list[dict[str, Any]] = [
             proxy_country_filter(normalized),
-            {"enabled": True, "status": {"$ne": "quarantined"}},
+            {"enabled": True},
+            usable_proxy_status_filter(utc_now()),
         ]
         if group:
             filters.append(proxy_group_filter(group))
@@ -1647,6 +1965,7 @@ class MongoResourceStore:
         return DeleteResult(deleted=int(result.deleted_count))
 
     async def overview_stats(self) -> OverviewStats:
+        await self.release_expired_proxy_quarantines()
         today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         available_email_query = await self._exclude_registered_accounts(
             registration_email_filter()
@@ -1728,10 +2047,10 @@ class MongoResourceStore:
         return AccountRecord(
             id=str(document["_id"]),
             email=document["email"],
-            chatgptPassword=document["chatgptPassword"],
-            totpSecret=document["totpSecret"],
+            chatgptPassword=str(document.get("chatgptPassword") or ""),
+            totpSecret=str(document.get("totpSecret") or ""),
             emailAccessUrl=direct_mailbox_access_url(
-                document["emailAccessUrl"], document["email"]
+                str(document.get("emailAccessUrl") or ""), document["email"]
             ),
             createdAt=document["createdAt"],
             accountType=document["accountType"],
@@ -1759,8 +2078,10 @@ class MongoResourceStore:
             checkoutTypeCheckStatus=document.get("checkoutTypeCheckStatus"),
             registrationCountry=document.get("registrationCountry"),
             rebindStatus=document.get("rebindStatus"),
+            previousEmail=document.get("previousEmail"),
             reboundEmail=document.get("reboundEmail"),
             rebindProxy=document.get("rebindProxy"),
+            rebindProxyCountry=document.get("rebindProxyCountry"),
             aliveStatus=document.get("aliveStatus"),
             aliveCheckedAt=document.get("aliveCheckedAt"),
             aliveErrorCode=document.get("aliveErrorCode"),
@@ -1858,6 +2179,74 @@ class MongoResourceStore:
 class ResourceService:
     def __init__(self, store: MongoResourceStore) -> None:
         self.store = store
+
+    async def import_accounts(self, raw_text: str) -> ImportResult:
+        total = imported = duplicates = errors = 0
+        seen: set[str] = set()
+        for raw_line in raw_text.lstrip("\ufeff").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            total += 1
+            parts = [part.strip() for part in line.split("----")]
+            if len(parts) not in {2, 3}:
+                errors += 1
+                continue
+            email = parts[0]
+            key = normalize_email(email)
+            if not EMAIL_PATTERN.fullmatch(email):
+                errors += 1
+                continue
+            if key in seen:
+                duplicates += 1
+                continue
+
+            password = ""
+            totp_secret = ""
+            access_url = ""
+            second = parts[1]
+            third = parts[2] if len(parts) == 3 else ""
+            try:
+                if len(parts) == 2:
+                    if not valid_url(second):
+                        raise ValueError("两段格式的第二段必须是接码地址")
+                    access_url = second
+                elif valid_url(second):
+                    access_url = second
+                    totp_secret = normalize_totp_secret(third)
+                elif valid_url(third):
+                    if not second or len(second) > 1024:
+                        raise ValueError("密码为空或过长")
+                    password = second
+                    access_url = third
+                else:
+                    if not second or len(second) > 1024:
+                        raise ValueError("密码为空或过长")
+                    password = second
+                    totp_secret = normalize_totp_secret(third)
+            except ValueError:
+                errors += 1
+                continue
+
+            seen.add(key)
+            try:
+                await self.create_account(AccountCreate(
+                    email=key,
+                    chatgptPassword=password,
+                    totpSecret=totp_secret,
+                    emailAccessUrl=access_url,
+                ))
+                imported += 1
+            except DuplicateResourceError:
+                duplicates += 1
+            except (ValueError, TypeError):
+                errors += 1
+        return ImportResult(
+            total=total,
+            imported=imported,
+            duplicateCount=duplicates,
+            errorCount=errors,
+        )
 
     async def import_emails(self, raw_text: str) -> ImportResult:
         total = imported = duplicates = errors = 0
@@ -2086,7 +2475,9 @@ class ResourceService:
         )
 
     async def create_account(self, incoming: AccountCreate) -> AccountRecord:
-        if not EMAIL_PATTERN.fullmatch(incoming.email) or not valid_url(incoming.emailAccessUrl):
+        if not EMAIL_PATTERN.fullmatch(incoming.email) or (
+            incoming.emailAccessUrl and not valid_url(incoming.emailAccessUrl)
+        ):
             raise ValueError("邮箱或接码地址格式无效")
         return await self.store.create_account(incoming)
 

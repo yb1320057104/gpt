@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,16 @@ WORKSPACE_LOCK_PREFIX = "browser_probe_workspace:"
 DEFAULT_PROXY_GROUP = "默认组"
 LOCAL_PROXY_GROUP = "__local_127_0_0_1_7890__"
 LOCAL_PROXY_ID_PREFIX = "local-7890:"
+MAX_PROXY_COOLDOWN_SECONDS = 10 * 60
+
+
+def proxy_cooldown_seconds() -> int:
+    """Return the shared proxy cooldown, capped at the user-facing 10 minutes."""
+    try:
+        configured = int(os.getenv("AUTOREGISTER_PROXY_COOLDOWN_SECONDS", "600"))
+    except (TypeError, ValueError):
+        configured = MAX_PROXY_COOLDOWN_SECONDS
+    return max(60, min(MAX_PROXY_COOLDOWN_SECONDS, configured))
 
 
 def utc_now() -> datetime:
@@ -91,6 +102,89 @@ class MongoProbeStore:
             await self._guard(
                 self.proxies.create_index(index_keys, name=index_name)
             )
+        await self.normalize_proxy_cooldowns()
+
+    async def normalize_proxy_cooldowns(self) -> int:
+        """Release expired isolation and cap legacy 30-minute/6-hour blocks."""
+        now = utc_now()
+        cooldown_ms = proxy_cooldown_seconds() * 1000
+        capped_registration = await self._guard(
+            self.proxies.update_many(
+                {"registrationBlockedUntil": {"$gt": now}},
+                [
+                    {
+                        "$set": {
+                            "registrationBlockedUntil": {
+                                "$min": [
+                                    "$registrationBlockedUntil",
+                                    {
+                                        "$add": [
+                                            {
+                                                "$ifNull": [
+                                                    "$lastRegistrationFailureAt",
+                                                    now,
+                                                ]
+                                            },
+                                            cooldown_ms,
+                                        ]
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                ],
+            )
+        )
+        capped_health = await self._guard(
+            self.proxies.update_many(
+                {"quarantineUntil": {"$gt": now}},
+                [
+                    {
+                        "$set": {
+                            "quarantineUntil": {
+                                "$min": [
+                                    "$quarantineUntil",
+                                    {
+                                        "$add": [
+                                            {"$ifNull": ["$lastCheckedAt", now]},
+                                            cooldown_ms,
+                                        ]
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                ],
+            )
+        )
+        released = await self._guard(
+            self.proxies.update_many(
+                {
+                    "status": "quarantined",
+                    "$or": [
+                        {"quarantineUntil": {"$exists": False}},
+                        {"quarantineUntil": None},
+                        {"quarantineUntil": {"$lte": now}},
+                    ],
+                },
+                {
+                    "$set": {"status": "unknown", "consecutiveFailures": 0},
+                    "$unset": {"quarantineUntil": ""},
+                },
+            )
+        )
+        cleared_registration = await self._guard(
+            self.proxies.update_many(
+                {"registrationBlockedUntil": {"$lte": now}},
+                {"$unset": {"registrationBlockedUntil": ""}},
+            )
+        )
+        return int(
+            released.modified_count
+            + capped_registration.modified_count
+            + capped_health.modified_count
+            + cleared_registration.modified_count
+        )
 
     async def clear_expired_probe_leases(self) -> int:
         now = utc_now()
@@ -274,11 +368,22 @@ class MongoProbeStore:
     ) -> dict[str, Any]:
         query: dict[str, Any] = {
             "enabled": True,
-            "status": {"$ne": "quarantined"},
-            "$or": [
-                {"registrationBlockedUntil": {"$exists": False}},
-                {"registrationBlockedUntil": None},
-                {"registrationBlockedUntil": {"$lte": now}},
+            "$and": [
+                {
+                    "$or": [
+                        {"status": {"$ne": "quarantined"}},
+                        {"quarantineUntil": {"$exists": False}},
+                        {"quarantineUntil": None},
+                        {"quarantineUntil": {"$lte": now}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"registrationBlockedUntil": {"$exists": False}},
+                        {"registrationBlockedUntil": None},
+                        {"registrationBlockedUntil": {"$lte": now}},
+                    ]
+                },
             ],
         }
         if excluded_ids:
@@ -557,7 +662,9 @@ class MongoProbeStore:
                         "status": "available",
                         "latencyMs": max(0, latency_ms),
                         "lastCheckedAt": utc_now(),
-                    }
+                        "consecutiveFailures": 0,
+                    },
+                    "$unset": {"quarantineUntil": ""},
                 },
             )
         )
@@ -568,14 +675,17 @@ class MongoProbeStore:
         *,
         code: str,
         observed_country: str | None = None,
-        cooldown_seconds: int = 21_600,
+        cooldown_seconds: int = MAX_PROXY_COOLDOWN_SECONDS,
     ) -> None:
         if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
             return
         now = utc_now()
+        effective_cooldown = min(
+            proxy_cooldown_seconds(), max(60, int(cooldown_seconds))
+        )
         changes: dict[str, Any] = {
             "registrationBlockedUntil": now
-            + timedelta(seconds=max(60, cooldown_seconds)),
+            + timedelta(seconds=effective_cooldown),
             "lastRegistrationFailureAt": now,
             "lastRegistrationFailureCode": code,
         }
@@ -588,6 +698,22 @@ class MongoProbeStore:
                 {
                     "$set": changes,
                     "$inc": {"registrationFailureCount": 1},
+                },
+            )
+        )
+
+    async def record_proxy_registration_success(self, proxy_id: str) -> None:
+        if proxy_id.startswith(LOCAL_PROXY_ID_PREFIX):
+            return
+        await self._guard(
+            self.proxies.update_one(
+                {"_id": proxy_id},
+                {
+                    "$set": {"lastRegistrationSuccessAt": utc_now()},
+                    "$unset": {
+                        "registrationBlockedUntil": "",
+                        "lastRegistrationFailureCode": "",
+                    },
                 },
             )
         )

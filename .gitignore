@@ -86,3 +86,6 @@ Thumbs.db
 /app/proxy-engines/easy-proxies.yaml
 /app/proxy-engines/managed_nodes.json
 /app/proxy-engines/nodes.txt
+
+# HAR-derived analysis may contain real account identifiers or session material
+/docs/*HAR*ANALYSIS*.md

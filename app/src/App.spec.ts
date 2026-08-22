@@ -23,8 +23,9 @@ describe('App navigation', () => {
     })
 
     const labels = wrapper.findAll('.nav-menu .el-menu-item').map((item) => item.text())
-    expect(labels).toEqual(['启动界面', '配置栏', '账号池', '账号换绑', '邮箱池', '提链', '自动流水线', 'HeroSMS 接码', '成品管理', '协议授权'])
+    expect(labels).toEqual(['启动界面', '配置栏', '账号池', '账号换绑', '邮箱池', 'MailCom 管理', '提链', '自动流水线', 'HeroSMS 接码', '成品管理', '协议授权'])
     expect(router.resolve('/account-rebind').name).toBe('account-rebind')
+    expect(router.resolve('/mailcom').name).toBe('mailcom')
     expect(router.resolve('/settings').name).toBe('settings')
     expect(router.resolve('/payment-tools').name).toBe('payment-tools')
     expect(router.resolve('/pipeline').name).toBe('pipeline')

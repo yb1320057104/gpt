@@ -27,6 +27,7 @@
 | 启动界面 | 选择邮箱来源、注册国家、代理分组、数量和并发 |
 | 账号池 | 查询、筛选、套餐检查、复制和导出账号 |
 | 邮箱池 | 导入接码地址、同步 MailCom 别名、管理来源 |
+| MailCom 管理 | 在主控制台内管理 MailCom 主邮箱、别名、收件箱和 IMAP 代理 |
 | 配置栏 | RoxyBrowser、任务并发和代理分组 |
 | 支付工具 | Access Token 解析与支付链接任务 |
 | Plus 流水线 | 资格筛选、提炼、接码和支付编排 |
@@ -123,7 +124,7 @@ proxy.example.test:1080:username:password
 
 ## MailCom Hub
 
-`mailcom-manager/` 是独立的本机邮箱管理服务，提供：
+`mailcom-manager/` 是随主项目自动启动的本机邮箱管理服务，提供：
 
 - `邮箱----密码` 批量导入
 - Windows DPAPI 加密存储
@@ -132,13 +133,13 @@ proxy.example.test:1080:username:password
 - 别名创建和批量补足
 - 可选的服务器快照同步
 
-启动：
+从仓库根目录启动主项目后，MailCom 会自动启动，无需单独运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-autoregister.ps1
 ```
 
-接口文档见 <http://127.0.0.1:3211/docs>，详细说明见
+主界面入口为 <http://127.0.0.1:5173/mailcom>，接口文档见 <http://127.0.0.1:3211/docs>，详细说明见
 [`mailcom-manager/README.md`](mailcom-manager/README.md)。
 
 ## 环境变量
@@ -168,6 +169,28 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mailcom-manager\start.
 `app\.env`。当前私有仓库模板已经配置远程 MongoDB，安装脚本会跳过本机
 MongoDB 安装。云服务器安全组需要允许运行电脑访问 TCP `37017`。模板包含
 受限数据库账号，仓库必须保持私有。
+
+## 账号邮箱换绑
+
+在“账号池”选择账号并加入换绑任务，再到“账号换绑”选择代理、并发数并启动。
+执行器直接使用现有账号池和邮箱池，每个账号独占登录 Cookie、OAuth state 和验证码
+上下文。支持以下自动选择的登录路径：
+
+- 密码；
+- 密码 + TOTP；
+- 密码 + 邮箱验证码；
+- 邮箱验证码；
+- 邮箱验证码 + TOTP。
+
+账号没有保存接码地址时，执行器会按原邮箱地址在邮箱池中查找；没有密码且也找不到
+可用接码地址的账号会以 `account_login_credentials_missing` 失败。换绑完成后会使用新邮箱
+重新登录，通过 `/backend-api/me` 与 `/api/auth/session` 双重确认，然后同步更新账号邮箱、
+接码地址、换绑标记和新 AccessToken。失败任务的目标邮箱默认保持占用，避免不确定状态下
+被其他任务重复使用；确认安全后可在换绑控制台手动释放。
+
+网页认证接口可能返回 `cloudflare_challenge_required`。该状态会标记为可重试，不会伪造
+或复用 Cloudflare challenge；应更换可用代理/认证环境后重试。`CHATGPT_SENTINEL_TOKEN`
+如需配置，只能使用当前合法会话动态取得的值，禁止把 HAR 中的值写入配置。
 
 ## 开发
 

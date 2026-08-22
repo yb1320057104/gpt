@@ -135,6 +135,43 @@ def test_imap_proxy_settings_apply_and_survive_restart(
     assert restarted_settings["proxyHasPassword"] is True
 
 
+def test_imap_proxy_test_does_not_save_or_apply_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "manager.db"
+    mail = ImapMailboxService(proxy_url="")
+    app = create_app(db_path=database, cipher=FakeCipher(), imap_service=mail)
+    client = TestClient(app)
+    captured = {}
+
+    def fake_probe(self):
+        captured["route"] = self.route
+        captured["host"] = self.proxy_host
+        captured["port"] = self.proxy_port
+        return {"ok": True, "latencyMs": 23, "route": self.route, "message": "ok"}
+
+    monkeypatch.setattr(ImapMailboxService, "probe", fake_probe)
+    response = client.post(
+        "/api/settings/imap/test",
+        json={
+            "imapHost": "imap.mail.com",
+            "imapPort": 993,
+            "proxyEnabled": True,
+            "proxyScheme": "http",
+            "proxyHost": "127.0.0.1",
+            "proxyPort": 7890,
+            "proxyUsername": "",
+            "proxyPassword": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["latencyMs"] == 23
+    assert captured == {"route": "http", "host": "127.0.0.1", "port": 7890}
+    assert mail.route == "direct"
+    assert not (tmp_path / "imap-settings.json").exists()
+
+
 def test_server_sync_pushes_complete_snapshot_without_returning_password(
     tmp_path: Path,
 ) -> None:

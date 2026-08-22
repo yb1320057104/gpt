@@ -4,6 +4,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, vi } from 'vitest'
 import ExportDialog from '@/components/ExportDialog.vue'
 import AccessTokenGroupsDialog from '@/components/AccessTokenGroupsDialog.vue'
+import ImportDialog from '@/components/ImportDialog.vue'
 import { dataGateway } from '@/services/dataGateway'
 import * as exporter from '@/services/exporter'
 import { useAppStore } from '@/stores/app'
@@ -29,6 +30,26 @@ function account(overrides: Partial<AccountRecord> = {}): AccountRecord {
 }
 
 describe('AccountsView AccessToken controls', () => {
+  it('opens the mixed-format account import dialog from the account pool', async () => {
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    const store = useAppStore()
+    vi.spyOn(store, 'refreshAccounts').mockResolvedValue({
+      items: [], total: 0, page: 1, pageSize: 10,
+    })
+
+    const wrapper = mount(AccountsView, {
+      global: { plugins: [pinia, ElementPlus] },
+    })
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text().includes('导入账号'))!.trigger('click')
+
+    const dialog = wrapper.getComponent(ImportDialog)
+    expect(dialog.props('kind')).toBe('account')
+    expect(dialog.props('modelValue')).toBe(true)
+    wrapper.unmount()
+  })
+
   it('shows the survived-15-minutes marker after automatic verification', async () => {
     const pinia = createPinia()
     setActivePinia(pinia)
@@ -55,7 +76,7 @@ describe('AccountsView AccessToken controls', () => {
     setActivePinia(pinia)
     const store = useAppStore()
     store.accounts = [
-      account({ registrationCountry: 'TR' }),
+      account({ registrationCountry: 'TR', rebindProxyCountry: 'US' }),
       account({ id: 'legacy-account', email: 'legacy@example.test', registrationCountry: null }),
     ]
     store.accountTotal = 2
@@ -72,6 +93,8 @@ describe('AccountsView AccessToken controls', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('土耳其 · TR')
+    expect(wrapper.text()).toContain('换绑 IP 国家')
+    expect(wrapper.text()).toContain('美国 · US')
     expect(wrapper.text()).toContain('历史账号')
   })
 

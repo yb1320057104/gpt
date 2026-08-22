@@ -20,6 +20,8 @@ def utc_now_text() -> str:
 
 
 class AccountStore:
+    storage_kind = "sqlite-dpapi"
+
     def __init__(self, path: Path, cipher: CredentialCipher) -> None:
         self.path = path
         self.cipher = cipher

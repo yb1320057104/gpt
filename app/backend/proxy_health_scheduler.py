@@ -20,9 +20,6 @@ class ProxyHealthScheduler:
         self.batch_size = max(
             1, min(1000, int(os.getenv("AUTOREGISTER_PROXY_CHECK_BATCH_SIZE", "120")))
         )
-        self.failure_threshold = max(
-            2, int(os.getenv("AUTOREGISTER_PROXY_DELETE_AFTER_FAILURES", "3"))
-        )
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
@@ -44,13 +41,15 @@ class ProxyHealthScheduler:
         if self._lock.locked():
             return {"tested": 0, "available": 0, "failed": 0, "deleted": 0}
         async with self._lock:
+            await self.service.resources.store.release_expired_proxy_quarantines()
             result = await self.service.test_stored_proxies(
                 timeout_seconds=12,
                 limit=self.batch_size,
             )
-            deleted = await self.service.resources.store.delete_repeatedly_failed_proxies(
-                self.failure_threshold
-            )
+            # Health checks may quarantine an unavailable exit, but must never
+            # destroy a user-owned MongoDB proxy record. Transient local-engine
+            # or upstream outages are recoverable; a deletion is not.
+            deleted = 0
             summary = {
                 "tested": result.tested,
                 "available": result.available,

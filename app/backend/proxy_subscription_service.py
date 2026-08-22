@@ -73,7 +73,16 @@ class ProxySubscriptionService:
                 f"{payload.provider} 订阅导入失败：{self._safe_error(exc)}",
             ) from exc
 
-        probes = await self._probe_all(proxy_lines, payload.probeTimeoutSeconds)
+        # Imports still need a country so they can be placed in the existing
+        # country-partitioned pool. A successful connectivity-only result is
+        # useful for health checks, but not sufficient for classification.
+        probes = [
+            item
+            for item in await self._probe_all(
+                proxy_lines, payload.probeTimeoutSeconds
+            )
+            if item.country
+        ]
         if not probes:
             raise ProxySubscriptionError(
                 "proxy_subscription_no_usable_proxies",
@@ -194,7 +203,8 @@ class ProxySubscriptionService:
         usable = [item for item in results if item is not None]
         grouped: dict[str, list[ProxyProbeResult]] = defaultdict(list)
         for item in usable:
-            grouped[item.country].append(item)
+            if item.country:
+                grouped[item.country].append(item)
         return ProxyTestResult(
             tested=len(documents),
             available=len(usable),
@@ -219,10 +229,36 @@ class ProxySubscriptionService:
             trust_env=False,
             follow_redirects=True,
         ) as client:
-            errors: list[Exception] = []
+            # Match Mihomo/Clash Verge's delay-test semantics: availability is
+            # determined by a small connectivity endpoint, not by a geo-IP
+            # provider. Geo services routinely rate-limit proxy pools and must
+            # not turn a successful proxy test into a false negative.
+            health_errors: list[Exception] = []
+            health_urls = [
+                value.strip()
+                for value in os.getenv(
+                    "AUTOREGISTER_PROXY_TEST_URLS",
+                    "https://www.gstatic.com/generate_204,"
+                    "https://cp.cloudflare.com/generate_204",
+                ).split(",")
+                if value.strip()
+            ]
+            for url in health_urls:
+                try:
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    break
+                except httpx.HTTPError as exc:
+                    health_errors.append(exc)
+            else:
+                if health_errors:
+                    raise health_errors[-1]
+                raise ValueError("no proxy test URL configured")
+
+            latency_ms = max(1, round((perf_counter() - started) * 1000))
             country = ""
-            # Prefer the actual automation destination. Public geo APIs are
-            # frequently rate-limited or blocked by otherwise valid proxies.
+            # Country detection is best-effort metadata enrichment after the
+            # connectivity test has already succeeded.
             for url, params, response_type in (
                 ("https://chatgpt.com/cdn-cgi/trace", None, "trace"),
                 ("https://api.country.is/", None, "country-is"),
@@ -233,7 +269,9 @@ class ProxySubscriptionService:
                 ),
             ):
                 try:
-                    response = await client.get(url, params=params)
+                    response = await client.get(
+                        url, params=params, timeout=min(timeout_seconds, 3)
+                    )
                     response.raise_for_status()
                     if response_type == "trace":
                         match = re.search(r"(?m)^loc=([A-Za-z]{2})\s*$", response.text)
@@ -246,16 +284,14 @@ class ProxySubscriptionService:
                             country = str(body.get("country_code") or "").strip().upper()
                     if re.fullmatch(r"[A-Z]{2}", country) and country != "ZZ":
                         break
-                except (httpx.HTTPError, ValueError, TypeError) as exc:
-                    errors.append(exc)
+                except (httpx.HTTPError, ValueError, TypeError):
+                    continue
             if not re.fullmatch(r"[A-Z]{2}", country) or country == "ZZ":
-                if errors:
-                    raise errors[-1]
-                raise ValueError("proxy country could not be identified")
+                country = ""
         return ProxyProbeResult(
             proxy_url=proxy_url,
             country=country,
-            latency_ms=max(1, round((perf_counter() - started) * 1000)),
+            latency_ms=latency_ms,
         )
 
     async def _easy_proxies(
@@ -437,10 +473,12 @@ class ProxySubscriptionService:
             )
             self._raise_manager_error(details, "Resin 订阅状态读取失败")
             detail_body = details.json()
+            healthy_node_count = int(detail_body.get("healthy_node_count") or 0)
+            total_node_count = int(detail_body.get("node_count") or 0)
+            if healthy_node_count <= 0 < total_node_count:
+                await self._raise_resin_build_error(client, headers)
             node_count = int(
-                detail_body.get("healthy_node_count")
-                or detail_body.get("node_count")
-                or 0
+                healthy_node_count or total_node_count
             )
             if node_count <= 0:
                 raise ProxySubscriptionError(
@@ -464,6 +502,39 @@ class ProxySubscriptionService:
                     host = f"[{host}]"
                 proxy_lines.append(f"http://{auth}{host}:{endpoint.port}")
             return proxy_lines, node_count
+
+    async def _raise_resin_build_error(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+    ) -> None:
+        """Turn Resin's per-node build-tag errors into an actionable message."""
+        try:
+            response = await client.get("/api/v1/nodes?limit=200", headers=headers)
+            self._raise_manager_error(response, "Resin 节点状态读取失败")
+            items = response.json().get("items", [])
+        except (ProxySubscriptionError, httpx.HTTPError, ValueError, TypeError):
+            return
+
+        errors = "\n".join(
+            str(item.get("last_error") or "")
+            for item in items
+            if isinstance(item, dict)
+        ).lower()
+        required_tags = [
+            tag
+            for tag in ("with_utls", "with_quic", "with_wireguard", "with_grpc")
+            if tag in errors
+        ]
+        if not required_tags:
+            return
+        tags = " ".join(required_tags)
+        raise ProxySubscriptionError(
+            "proxy_subscription_resin_build_features_missing",
+            "Resin 可执行文件缺少订阅节点所需协议能力："
+            f"{tags}。请运行 app\\scripts\\build-resin.ps1 重新构建后再导入。",
+            status_code=422,
+        )
 
     @staticmethod
     def _local_manager_url(value: str) -> str:

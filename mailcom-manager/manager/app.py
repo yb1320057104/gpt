@@ -14,6 +14,7 @@ from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -21,8 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from .alias_creator import AliasCreationError, MailComAliasCreator
 from .crypto import DpapiCredentialCipher
 from .imap_client import ImapMailboxService, MailboxError
+from .proxy_pool_mailbox import MongoProxyPoolMailboxService
 from .server_sync import ServerSyncError, ServerSyncService
 from .storage import AccountStore
+from .mongo_storage import MongoAccountStore
 
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -123,7 +126,40 @@ def _public_imap_settings(mail: Any) -> dict[str, Any]:
         "proxyUsername": mail.proxy_username or "",
         "proxyHasPassword": bool(mail.proxy_password),
         "route": mail.route,
+        "proxyPoolEnabled": bool(getattr(mail, "proxy_pool_enabled", False)),
+        "proxyPoolCount": int(getattr(mail, "proxy_count", 0)),
     }
+
+
+def _configured_imap_service(
+    payload: ImapSettingsPayload,
+    current_mail: Any,
+) -> ImapMailboxService:
+    host = payload.imapHost.strip()
+    if not host or any(character.isspace() for character in host):
+        raise HTTPException(status_code=422, detail="IMAP 主机/IP 无效")
+    proxy_url = ""
+    if payload.proxyEnabled:
+        proxy_host = payload.proxyHost.strip()
+        if not proxy_host or payload.proxyPort is None:
+            raise HTTPException(status_code=422, detail="请填写代理 IP/主机和端口")
+        password = payload.proxyPassword.get_secret_value() if payload.proxyPassword else ""
+        current_username = getattr(current_mail, "proxy_username", None) or ""
+        current_password = getattr(current_mail, "proxy_password", None) or ""
+        if not password and current_password and payload.proxyUsername == current_username:
+            password = current_password
+        authentication = ""
+        if payload.proxyUsername:
+            authentication = quote(payload.proxyUsername, safe="")
+            if password:
+                authentication += f":{quote(password, safe='')}"
+            authentication += "@"
+        proxy_address = f"[{proxy_host}]" if ":" in proxy_host else proxy_host
+        proxy_url = (
+            f"{payload.proxyScheme}://{authentication}"
+            f"{proxy_address}:{payload.proxyPort}"
+        )
+    return ImapMailboxService(host=host, port=payload.imapPort, proxy_url=proxy_url)
 
 
 def _recipient_matches(value: str, email: str) -> bool:
@@ -197,6 +233,8 @@ def create_app(
     imap_service: ImapMailboxService | None = None,
     alias_creator: Any | None = None,
     server_sync_service: Any | None = None,
+    mongo_uri: str | None = None,
+    mongo_database: str | None = None,
 ) -> FastAPI:
     application = FastAPI(
         title="MailCom Manager API",
@@ -204,20 +242,40 @@ def create_app(
         docs_url="/docs",
         redoc_url=None,
     )
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type"],
+    )
     resolved_db_path = db_path or Path(
         os.getenv("MAILCOM_MANAGER_DB", str(DEFAULT_DB_PATH))
     )
     credential_cipher = cipher or DpapiCredentialCipher()
-    store = AccountStore(resolved_db_path, credential_cipher)
+    configured_mongo_uri = mongo_uri if mongo_uri is not None else os.getenv("MAILCOM_MONGO_URI", "")
+    configured_mongo_database = mongo_database or os.getenv("MAILCOM_MONGO_DATABASE", "autoregister")
+    store = (
+        MongoAccountStore(configured_mongo_uri, configured_mongo_database, credential_cipher)
+        if configured_mongo_uri
+        else AccountStore(resolved_db_path, credential_cipher)
+    )
     settings_path = resolved_db_path.parent / "imap-settings.json"
     saved_settings = _load_imap_settings(settings_path, credential_cipher)
     environment_configured = any(
         os.getenv(name)
         for name in ("MAILCOM_IMAP_HOST", "MAILCOM_IMAP_PORT", "MAILCOM_IMAP_PROXY")
     )
-    mail = imap_service or ImapMailboxService(
-        **({} if environment_configured or not saved_settings else saved_settings)
-    )
+    mail_settings = {} if environment_configured or not saved_settings else saved_settings
+    if imap_service is not None:
+        mail = imap_service
+    elif configured_mongo_uri:
+        mail = MongoProxyPoolMailboxService(
+            configured_mongo_uri,
+            configured_mongo_database,
+            **mail_settings,
+        )
+    else:
+        mail = ImapMailboxService(**mail_settings)
     application.state.store = store
     application.state.mail = mail
     application.state.alias_creator = alias_creator or MailComAliasCreator()
@@ -241,48 +299,39 @@ def create_app(
         return {
             "status": "ok",
             "service": "mailcom-manager",
-            "storage": "sqlite-dpapi",
+            "storage": store.storage_kind,
             "imapHost": getattr(mail, "host", "imap.mail.com"),
             "imapPort": getattr(mail, "port", 993),
             "imapRoute": mail.route,
             "imapProxyHost": getattr(mail, "proxy_host", "") or None,
             "imapProxyPort": getattr(mail, "proxy_port", 0) or None,
+            "imapProxyPoolEnabled": bool(getattr(mail, "proxy_pool_enabled", False)),
+            "imapProxyCount": int(getattr(mail, "proxy_count", 0)),
+            "imapLastProxy": getattr(mail, "last_proxy", None),
         }
 
     @application.get("/api/settings/imap")
     async def get_imap_settings() -> dict[str, Any]:
         return _public_imap_settings(mail)
 
+    @application.post("/api/settings/imap/test")
+    async def test_imap_settings(payload: ImapSettingsPayload) -> dict[str, Any]:
+        try:
+            if payload.proxyEnabled:
+                configured = _configured_imap_service(payload, mail)
+                return await asyncio.to_thread(configured.probe)
+            if getattr(mail, "proxy_pool_enabled", False):
+                return await asyncio.to_thread(mail.probe)
+            raise HTTPException(status_code=422, detail="项目代理池未启用")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except MailboxError as exc:
+            raise _mailbox_http_error(exc) from exc
+
     @application.put("/api/settings/imap")
     async def update_imap_settings(payload: ImapSettingsPayload) -> dict[str, Any]:
-        host = payload.imapHost.strip()
-        if not host or any(character.isspace() for character in host):
-            raise HTTPException(status_code=422, detail="IMAP 主机/IP 无效")
-        proxy_url = ""
-        if payload.proxyEnabled:
-            proxy_host = payload.proxyHost.strip()
-            if not proxy_host or payload.proxyPort is None:
-                raise HTTPException(status_code=422, detail="请填写代理 IP/主机和端口")
-            password = payload.proxyPassword.get_secret_value() if payload.proxyPassword else ""
-            if not password and mail.proxy_password and payload.proxyUsername == (mail.proxy_username or ""):
-                password = mail.proxy_password
-            authentication = ""
-            if payload.proxyUsername:
-                authentication = quote(payload.proxyUsername, safe="")
-                if password:
-                    authentication += f":{quote(password, safe='')}"
-                authentication += "@"
-            proxy_address = f"[{proxy_host}]" if ":" in proxy_host else proxy_host
-            proxy_url = (
-                f"{payload.proxyScheme}://{authentication}"
-                f"{proxy_address}:{payload.proxyPort}"
-            )
         try:
-            configured = ImapMailboxService(
-                host=host,
-                port=payload.imapPort,
-                proxy_url=proxy_url,
-            )
+            configured = _configured_imap_service(payload, mail)
             await asyncio.to_thread(
                 _save_imap_settings,
                 settings_path,
@@ -583,8 +632,11 @@ def create_app(
                 finally:
                     queue.task_done()
                     # Keep a small gap per worker so the provider is not hit
-                    # with a burst immediately after a browser closes.
-                    await asyncio.sleep(1)
+                    # with a burst immediately after a browser closes. There
+                    # is no reason to delay final job completion once the
+                    # queue has been drained.
+                    if not queue.empty():
+                        await asyncio.sleep(1)
 
         workers = [
             asyncio.create_task(worker(), name=f"mailcom-alias-worker-{index}")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import socks
 
-from manager.imap_client import ImapMailboxService, _http_connect
+from manager.imap_client import ImapMailboxService, MailboxError, _http_connect
 
 
 RAW_MESSAGE = (
@@ -24,6 +24,7 @@ class FakeImap:
         self.fetch_query = ""
         self.readonly = False
         self.logged_out = False
+        self.shutdown_called = False
 
     def login(self, email: str, password: str):
         assert email == "alias@gardener.com"
@@ -48,6 +49,36 @@ class FakeImap:
     def logout(self):
         self.logged_out = True
         return "BYE", [b"logout"]
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+
+def test_proxy_probe_connects_without_login_and_closes_transport() -> None:
+    fake = FakeImap()
+    service = ImapMailboxService(
+        factory=lambda *_args, **_kwargs: fake,
+        proxy_url="http://127.0.0.1:7890",
+    )
+
+    result = service.probe()
+
+    assert result["ok"] is True
+    assert result["route"] == "http"
+    assert result["latencyMs"] >= 1
+    assert fake.shutdown_called is True
+
+
+def test_proxy_probe_reports_connection_failure() -> None:
+    service = ImapMailboxService(
+        factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("proxy refused")),
+        proxy_url="socks5://127.0.0.1:7890",
+    )
+
+    with pytest.raises(MailboxError, match="proxy refused") as caught:
+        service.probe()
+
+    assert caught.value.code == "proxy_test_failed"
 
 
 def test_imap_reader_uses_readonly_peek_and_extracts_recipient_code() -> None:

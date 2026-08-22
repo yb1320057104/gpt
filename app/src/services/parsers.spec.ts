@@ -1,5 +1,37 @@
 import { describe, expect, it } from 'vitest'
-import { parseEmailImport, parseProxyImport, proxyKey } from './parsers'
+import { parseAccountImport, parseEmailImport, parseProxyImport, proxyKey } from './parsers'
+
+describe('parseAccountImport', () => {
+  it('auto-detects all four formats in one mixed batch', () => {
+    const secret = 'JBSWY3DPEHPK3PXP'
+    const result = parseAccountImport([
+      `first@example.com----Password-1----${secret}`,
+      'second@example.com----Password-2----https://mail.test/second',
+      'third@example.com----https://mail.test/third',
+      `fourth@example.com----https://mail.test/fourth----${secret}`,
+    ].join('\n'))
+
+    expect(result.errors).toHaveLength(0)
+    expect(result.accepted).toEqual([
+      { email: 'first@example.com', chatgptPassword: 'Password-1', totpSecret: secret, emailAccessUrl: '' },
+      { email: 'second@example.com', chatgptPassword: 'Password-2', totpSecret: '', emailAccessUrl: 'https://mail.test/second' },
+      { email: 'third@example.com', chatgptPassword: '', totpSecret: '', emailAccessUrl: 'https://mail.test/third' },
+      { email: 'fourth@example.com', chatgptPassword: '', totpSecret: secret, emailAccessUrl: 'https://mail.test/fourth' },
+    ])
+  })
+
+  it('reports duplicate and malformed rows without exposing credentials', () => {
+    const result = parseAccountImport(
+      'known@example.com----Password----JBSWY3DPEHPK3PXP\n' +
+      'bad@example.com----not-a-url',
+      ['known@example.com'],
+    )
+
+    expect(result.duplicates).toHaveLength(1)
+    expect(result.errors).toHaveLength(1)
+    expect(JSON.stringify([...result.duplicates, ...result.errors])).not.toContain('Password')
+  })
+})
 
 describe('parseEmailImport', () => {
   it('cleans BOM and blank lines and accepts the documented format', () => {

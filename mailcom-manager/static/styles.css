@@ -72,6 +72,10 @@ button { cursor: pointer; }
 .local-pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 9px var(--green); }
 
 main { width: min(1440px, 92vw); margin: 0 auto; padding: 42px 0 60px; }
+.embedded .topbar { display: none; }
+.embedded main { width: min(1440px, calc(100vw - 28px)); padding: 22px 0 34px; }
+.embedded .hero { display: none; }
+.embedded .stats-grid { margin-top: 0; }
 .hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; }
 .hero h2 { max-width: 740px; margin: 10px 0 9px; font-size: clamp(28px, 4vw, 48px); line-height: 1.08; letter-spacing: -.045em; }
 .hero p { max-width: 720px; margin: 0; color: var(--muted); font-size: 13px; line-height: 1.8; }
@@ -146,6 +150,7 @@ textarea { display: block; width: calc(100% - 44px); margin: 0 22px; padding: 14
 textarea:focus { border-color: #4c8978; box-shadow: 0 0 0 3px rgb(98 230 169 / 7%); }
 .modal footer { display: flex; justify-content: flex-end; gap: 8px; padding: 16px 22px 20px; }
 .inline-result { margin: 12px 22px 0; padding: 10px 12px; border-radius: 8px; color: var(--green); background: rgb(98 230 169 / 8%); font-size: 11px; }
+.inline-result.error { color: #ff8f8f; background: rgb(255 96 96 / 9%); }
 
 .mail-modal { width: min(920px, calc(100vw - 28px)); }
 .mail-toolbar { display: flex; justify-content: space-between; padding: 13px 20px; border-bottom: 1px solid var(--line); }

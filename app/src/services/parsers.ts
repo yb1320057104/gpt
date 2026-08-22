@@ -1,4 +1,4 @@
-import type { ImportIssue, ImportPreview, ParsedEmail, ParsedProxy, ProxyScheme } from '@/types'
+import type { ImportIssue, ImportPreview, ParsedAccount, ParsedEmail, ParsedProxy, ProxyScheme } from '@/types'
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
@@ -38,6 +38,77 @@ function redactLine(value: string) {
 
 export function emailKey(email: string) {
   return email.trim().toLowerCase()
+}
+
+function isHttpUrl(value: string) {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol)
+  } catch {
+    return false
+  }
+}
+
+function normalizeTotpSecret(value: string) {
+  const normalized = value.replace(/\s+/g, '').toUpperCase().replace(/=+$/, '')
+  const remainder = normalized.length % 8
+  if (!normalized || !/^[A-Z2-7]+$/.test(normalized) || ![0, 2, 4, 5, 7].includes(remainder)) return ''
+  return normalized
+}
+
+export function parseAccountImport(
+  rawText: string,
+  existingEmails: Iterable<string> = [],
+): ImportPreview<ParsedAccount> {
+  const accepted: ParsedAccount[] = []
+  const duplicates: ImportIssue[] = []
+  const errors: ImportIssue[] = []
+  const seen = new Set(Array.from(existingEmails, emailKey))
+  let total = 0
+
+  linesOf(rawText).forEach((source, index) => {
+    const value = source.trim()
+    if (!value) return
+    total += 1
+    const line = index + 1
+    const parts = value.split('----').map((part) => part.trim())
+    const email = parts[0] || ''
+    const fail = (reason: string) => errors.push({ line, reason, preview: maskEmail(email) })
+
+    if (!EMAIL_PATTERN.test(email)) return fail('账号邮箱格式无效')
+    if (parts.length !== 2 && parts.length !== 3) return fail('必须是 2 段或 3 段格式')
+    const key = emailKey(email)
+    if (seen.has(key)) {
+      duplicates.push({ line, reason: '账号已存在或在本批次重复', preview: maskEmail(email) })
+      return
+    }
+
+    const second = parts[1] || ''
+    const third = parts[2] || ''
+    let chatgptPassword = ''
+    let totpSecret = ''
+    let emailAccessUrl = ''
+    if (parts.length === 2) {
+      if (!isHttpUrl(second)) return fail('两段格式的第二段必须是 HTTP(S) 接码地址')
+      emailAccessUrl = second
+    } else if (isHttpUrl(second)) {
+      emailAccessUrl = second
+      totpSecret = normalizeTotpSecret(third)
+      if (!totpSecret) return fail('第三段 TOTP 不是有效 Base32')
+    } else if (isHttpUrl(third)) {
+      if (!second || second.length > 1024) return fail('密码为空或过长')
+      chatgptPassword = second
+      emailAccessUrl = third
+    } else {
+      if (!second || second.length > 1024) return fail('密码为空或过长')
+      chatgptPassword = second
+      totpSecret = normalizeTotpSecret(third)
+      if (!totpSecret) return fail('第三段 TOTP 不是有效 Base32')
+    }
+
+    seen.add(key)
+    accepted.push({ email: key, chatgptPassword, totpSecret, emailAccessUrl })
+  })
+  return { total, accepted, duplicates, errors }
 }
 
 export function proxyKey(proxy: ParsedProxy) {

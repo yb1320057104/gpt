@@ -13,6 +13,21 @@ $workspaceRoot = Split-Path -Parent $root
 $python = Join-Path $workspaceRoot "register_env\Scripts\python.exe"
 $healthUrl = "http://127.0.0.1:$Port/api/health"
 $homeUrl = "http://127.0.0.1:$Port/"
+$appEnv = Join-Path $workspaceRoot "app\.env"
+
+function Get-AppEnvValue([string] $Name) {
+    if (-not (Test-Path -LiteralPath $appEnv)) { return "" }
+    $line = Get-Content -LiteralPath $appEnv | Where-Object { $_ -match "^$([regex]::Escape($Name))=" } | Select-Object -Last 1
+    if (-not $line) { return "" }
+    return ($line -split "=", 2)[1].Trim()
+}
+
+if (-not $env:MAILCOM_MONGO_URI) {
+    $env:MAILCOM_MONGO_URI = Get-AppEnvValue "AUTOREGISTER_MONGO_URI"
+}
+if (-not $env:MAILCOM_MONGO_DATABASE) {
+    $env:MAILCOM_MONGO_DATABASE = Get-AppEnvValue "AUTOREGISTER_MONGO_DATABASE"
+}
 
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Python environment not found. Run app\setup.ps1 first: $python"
@@ -48,7 +63,7 @@ if ($DirectImap) {
 if (-not $listener) {
     $localProxy = Get-NetTCPConnection -LocalPort 7897 -State Listen -ErrorAction SilentlyContinue
     $savedImapSettings = Test-Path -LiteralPath (Join-Path $root "data\imap-settings.json")
-    if ($localProxy -and -not $savedImapSettings -and -not $customImap -and -not $env:MAILCOM_IMAP_PROXY) {
+    if ($localProxy -and -not $env:MAILCOM_MONGO_URI -and -not $savedImapSettings -and -not $customImap -and -not $env:MAILCOM_IMAP_PROXY) {
         $env:MAILCOM_IMAP_PROXY = "socks5://127.0.0.1:7897"
     }
     $stdout = Join-Path $root "data\server.stdout.log"

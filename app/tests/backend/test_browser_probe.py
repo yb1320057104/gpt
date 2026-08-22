@@ -125,7 +125,7 @@ class FakeStore:
         *,
         code: str,
         observed_country: str | None = None,
-        cooldown_seconds: int = 21_600,
+        cooldown_seconds: int = 600,
     ) -> None:
         del cooldown_seconds
         self.registration_rejections.append((proxy_id, code, observed_country))
