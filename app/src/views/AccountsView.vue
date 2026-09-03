@@ -1,0 +1,1178 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { CircleCheck, CopyDocument, CreditCard, Delete, Download, Key, Link, Lock, MagicStick, Search, UploadFilled, UserFilled } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox, type TableInstance } from 'element-plus'
+import type { AccountRecord, ExportFormat, ExportScope, ImportResult, ProxyRecord, ResourceQuery } from '@/types'
+import { useAppStore } from '@/stores/app'
+import { dataGateway } from '@/services/dataGateway'
+import { COMMON_REGISTRATION_COUNTRIES, countryLabel } from '@/services/countries'
+import { copyText } from '@/services/exporter'
+import ExportDialog from '@/components/ExportDialog.vue'
+import AccessTokenGroupsDialog from '@/components/AccessTokenGroupsDialog.vue'
+import ImportDialog from '@/components/ImportDialog.vue'
+import SecretCell from '@/components/SecretCell.vue'
+import StatCard from '@/components/StatCard.vue'
+
+const store = useAppStore()
+const tableRef = ref<TableInstance>()
+const search = ref('')
+const importOpen = ref(false)
+const promotionFilter = ref<ResourceQuery['promotion']>('')
+const aliveFilter = ref<ResourceQuery['alive']>('')
+const globalPromotionFilter = ref<ResourceQuery['globalPromotion']>('')
+const rebindFilter = ref<ResourceQuery['rebind']>('')
+const rebindCountryFilter = ref('')
+const countryFilter = ref('')
+const currentPage = ref(1)
+const pageSize = ref<ResourceQuery['pageSize']>(10)
+const pageSizeOptions = [10, 20, 50, 100]
+const loading = ref(false)
+const promotionProxyId = ref('')
+const promotionProxies = ref<ProxyRecord[]>([])
+const selectedIds = ref<string[]>([])
+const exportOpen = ref(false)
+const exportScope = ref<ExportScope>('selected')
+const exportIds = ref<string[]>([])
+const exportCount = ref(0)
+const exportInitialFormat = ref<ExportFormat>('credentials')
+const exportFormatLocked = ref(false)
+const accessTokenGroupsOpen = ref(false)
+const copyingAt = ref(false)
+const copyAtLimit = ref((() => {
+  try {
+    const saved = Number(localStorage.getItem('autoregister.copyAtLimit') || 100)
+    return Number.isInteger(saved) ? Math.max(1, Math.min(10_000, saved)) : 100
+  } catch {
+    return 100
+  }
+})())
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+let globalPromotionTimer: ReturnType<typeof setInterval> | undefined
+let aliveMarkerTimer: ReturnType<typeof setInterval> | undefined
+let rebindRefreshTimer: ReturnType<typeof setInterval> | undefined
+
+const pageAccounts = computed(() => store.accounts)
+const existingAccountKeys = computed(() => store.accounts.map((item) => item.email.toLowerCase()))
+const promotionChecking = computed(() => store.accountPromotionChecking)
+const aliveChecking = computed(() => store.accountAliveChecking)
+const checkoutTypeChecking = computed(() => store.accountCheckoutTypeChecking)
+const checkingAccountIds = computed(() => store.accountPromotionCheckingIds)
+const aliveCheckingAccountIds = computed(() => store.accountAliveCheckingIds)
+const checkoutTypeCheckingAccountIds = computed(() => store.accountCheckoutTypeCheckingIds)
+const oaicsStartingIds = ref<string[]>([])
+const refreshingSelectedAt = ref(false)
+
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(value))
+}
+
+function hasValidAccessToken(account: AccountRecord) {
+  if (!account.accessTokenConfigured || !account.accessTokenExpiresAt) return false
+  return new Date(account.accessTokenExpiresAt).getTime() > Date.now()
+}
+
+function accessTokenStatus(account: AccountRecord) {
+  if (account.rebindStatus === 'email_changed_token_pending') return 'pending'
+  if (!account.accessTokenConfigured) return 'missing'
+  return hasValidAccessToken(account) ? 'valid' : 'expired'
+}
+
+function rebindStatusLabel(account: AccountRecord) {
+  if (account.rebindStatus === 'success') return '已换绑'
+  if (account.rebindStatus === 'email_changed_token_pending') return '邮箱已换 · AT待更新'
+  if (account.rebindStatus === 'in_progress') return '换绑中'
+  if (account.rebindStatus === 'failed') return '换绑失败'
+  return '未换绑'
+}
+
+function rebindStatusTag(account: AccountRecord) {
+  if (account.rebindStatus === 'success') return 'success'
+  if (account.rebindStatus === 'email_changed_token_pending') return 'warning'
+  if (account.rebindStatus === 'failed') return 'danger'
+  if (account.rebindStatus === 'in_progress') return 'primary'
+  return 'info'
+}
+
+function promotionLabel(account: AccountRecord) {
+  if (account.planCheckStatus === 'running') return '\u68c0\u6d4b\u4e2d'
+  if (account.planCheckStatus === 'failed') return '\u68c0\u6d4b\u5931\u8d25'
+  if (account.promotionKind === 'discount') return '\u0050lus \u4f18\u60e0'
+  if (account.promotionEligible === true) return '\u0050lus \u8bd5\u7528'
+  if (account.planCheckStatus === 'success') return '\u4e0d\u7b26\u5408\u8d44\u683c'
+  return '\u672a\u67e5\u8be2'
+}
+
+function promotionTagType(account: AccountRecord) {
+  if (account.planCheckStatus === 'failed') return 'danger'
+  if (account.planCheckStatus === 'running') return 'warning'
+  if (account.promotionKind === 'discount') return 'primary'
+  if (account.promotionEligible === true) return 'success'
+  return 'info'
+}
+
+function promotionTooltip(account: AccountRecord) {
+  if (account.planCheckStatus === 'failed') {
+    return `错误码：${account.planCheckErrorCode || 'plan_check_failed'}`
+  }
+  if (account.planCheckedAt) return `查询时间：${formatDate(account.planCheckedAt)}`
+  return '尚未查询 Plus 试用资格'
+}
+
+function globalPromotionLabel(account: AccountRecord) {
+  if (account.globalPromotionStatus === 'running') return '检测中'
+  if (account.globalPromotionStatus === 'eligible') return '全局可试用'
+  if (account.globalPromotionStatus === 'ineligible') return '非全局试用'
+  if (account.globalPromotionStatus === 'failed') return '检测异常'
+  return '待检测'
+}
+
+function globalPromotionTagType(account: AccountRecord) {
+  if (account.globalPromotionStatus === 'eligible') return 'success'
+  if (account.globalPromotionStatus === 'ineligible' || account.globalPromotionStatus === 'failed') return 'danger'
+  if (account.globalPromotionStatus === 'running') return 'warning'
+  return 'info'
+}
+
+function globalPromotionTooltip(account: AccountRecord) {
+  const countries = (account.globalPromotionCountries || []).map(countryLabel).join('、')
+  const summary = account.globalPromotionMessage || '等待 Access Token 和至少 2 个可用代理'
+  const count = account.globalPromotionProxyCount || 0
+  const checked = account.globalPromotionCheckedAt ? `；检测时间：${formatDate(account.globalPromotionCheckedAt)}` : ''
+  return `${summary}${count ? `；已检测 ${count} 个代理` : ''}${countries ? `；国家：${countries}` : ''}${checked}`
+}
+
+function checkoutTypeLabel(account: AccountRecord) {
+  if (account.checkoutTypeCheckStatus === 'running') return '检测中'
+  if (account.checkoutTypeDetail === 'stripe_cs_live') return 'CS Live'
+  if (account.checkoutTypeDetail === 'stripe_cs_test') return 'CS Test'
+  if (account.checkoutTypeDetail === 'stripe_checkout') return 'Stripe Checkout'
+  if (account.checkoutTypeDetail === 'stripe_cs') return 'Stripe CS'
+  if (account.checkoutTypeDetail === 'oaics') return 'OAICS'
+  if (account.checkoutTypeDetail) return account.checkoutTypeDetail
+  if (account.checkoutType === 'oaics') return 'OAICS'
+  if (account.checkoutType === 'cs') return 'CS'
+  if (account.checkoutTypeErrorCode) return '检测失败'
+  return '未检测'
+}
+
+function checkoutTypeTooltip(account: AccountRecord) {
+  if (account.checkoutTypeErrorCode) {
+    const status = account.checkoutTypeHttpStatus
+    const reason = status === 401
+      ? 'Access Token 已失效'
+      : status === 403
+        ? '代理 IP、地区或账号触发风控'
+        : status === 429
+          ? '请求过于频繁，请稍后重试'
+          : status === 400 || status === 422
+            ? 'Checkout 参数或注册国家不被接受'
+            : status && status >= 500
+              ? 'ChatGPT 服务端暂时异常'
+              : status
+                ? 'Checkout 接口返回非成功状态'
+                : '请求未取得有效 HTTP 状态'
+    return `错误码：${account.checkoutTypeErrorCode}${status ? `；HTTP ${status}` : ''}；${reason}`
+  }
+  if (account.checkoutTypeCheckedAt) {
+    const detail = account.checkoutTypeDetail ? `；详细类型：${checkoutTypeLabel(account)}` : ''
+    return `检测时间：${formatDate(account.checkoutTypeCheckedAt)}${detail}`
+  }
+  return '尚未单独检测账单类型'
+}
+
+function oaicsScanLabel(account: AccountRecord) {
+  if (account.oaicsScanStatus === 'running') return '检测中'
+  if (account.oaicsScanStatus === 'failed') return '检测失败'
+  if (account.oaicsScanStatus === 'completed') {
+    return `OAICS ${account.oaicsScanSuccess || 0}/${account.oaicsScanTotal || 0}`
+  }
+  return '未检测'
+}
+
+function oaicsScanTooltip(account: AccountRecord) {
+  const stats = account.oaicsScanCountryStats || []
+  const lines = stats.map((item) =>
+    `${countryLabel(item.country)}：${item.oaics}/${item.total}，成功率 ${item.successRate}%（CS ${item.cs}，失败 ${item.failed}）`,
+  )
+  const header = account.oaicsScanMessage || '尚未使用全部代理检测 OAICS'
+  const checked = account.oaicsScanCheckedAt ? `检测时间：${formatDate(account.oaicsScanCheckedAt)}` : ''
+  return [header, checked, ...lines].filter(Boolean).join('\n')
+}
+
+async function checkOaicsAllProxies(ids: string[]) {
+  if (!ids.length) return
+  oaicsStartingIds.value = [...ids]
+  try {
+    const result = await dataGateway.checkAccountOaicsAllProxies(ids)
+    ElMessage.success(`OAICS 全代理检测已进入后台：启动 ${result.started}，跳过 ${result.skipped}`)
+    await loadPage()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : 'OAICS 全代理检测启动失败')
+  } finally {
+    oaicsStartingIds.value = []
+  }
+}
+
+async function checkCheckoutTypes(ids: string[]) {
+  if (!ids.length || checkoutTypeChecking.value) return
+  if (ids.length > 100) {
+    ElMessage.warning('单次最多检测 100 个账号')
+    return
+  }
+  try {
+    const result = promotionProxyId.value
+      ? await store.checkAccountCheckoutTypes(ids, promotionProxyId.value)
+      : await store.checkAccountCheckoutTypes(ids)
+    const message = `账单类型检测完成：成功 ${result.succeeded}，失败 ${result.failed}，跳过 ${result.skipped}`
+    if (result.failed || result.skipped) ElMessage.warning(message)
+    else ElMessage.success(message)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '账单类型检测失败')
+  }
+}
+
+async function checkGlobalPromotions(ids: string[]) {
+  if (!ids.length) return
+  try {
+    const result = await dataGateway.checkAccountGlobalPromotions(ids)
+    ElMessage.success(`全局试用检测已入队：${result.queued}，跳过 ${result.skipped}`)
+    await loadPage()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '全局试用检测启动失败')
+  }
+}
+
+function aliveLabel(account: AccountRecord) {
+  if (account.aliveStatus === 'running') return '检测中'
+  if (account.aliveStatus === 'alive') return '正常'
+  if (account.aliveStatus === 'dead') return '已失效'
+  if (account.aliveStatus === 'unknown') return '检测异常'
+  return '未检测'
+}
+
+function aliveTagType(account: AccountRecord) {
+  if (account.aliveStatus === 'alive') return 'success'
+  if (account.aliveStatus === 'dead') return 'danger'
+  if (account.aliveStatus === 'running') return 'warning'
+  return 'info'
+}
+
+function aliveTooltip(account: AccountRecord) {
+  const parts: string[] = []
+  if (account.aliveCheckedAt) parts.push(`检测时间：${formatDate(account.aliveCheckedAt)}`)
+  if (account.alive15mVerifiedAt) parts.push(`已活15分钟：${formatDate(account.alive15mVerifiedAt)}`)
+  if (account.aliveHttpStatus) parts.push(`HTTP：${account.aliveHttpStatus}`)
+  if (account.aliveErrorCode) parts.push(`结果：${account.aliveErrorCode}`)
+  return parts.join('；') || '尚未检测账号是否有效'
+}
+
+async function checkAlive(ids: string[]) {
+  if (!ids.length || aliveChecking.value) return
+  if (ids.length > 100) {
+    ElMessage.warning('单次最多检测 100 个账号')
+    return
+  }
+  try {
+    const result = promotionProxyId.value
+      ? await store.checkAccountsAlive(ids, promotionProxyId.value)
+      : await store.checkAccountsAlive(ids)
+    const message = `验活完成：正常 ${result.alive}，失效 ${result.dead}，异常 ${result.failed}，跳过 ${result.skipped}`
+    if (result.dead || result.failed || result.skipped) ElMessage.warning(message)
+    else ElMessage.success(message)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '账号验活失败')
+  }
+}
+
+async function checkPromotions(ids: string[]) {
+  if (!ids.length || promotionChecking.value) return
+  if (ids.length > 100) {
+    ElMessage.warning('单次最多查询 100 个账号')
+    return
+  }
+  try {
+    const result = promotionProxyId.value
+      ? await store.checkAccountPromotions(ids, promotionProxyId.value)
+      : await store.checkAccountPromotions(ids)
+    if (result.failed || result.skipped) {
+      ElMessage.warning(
+        `资格查询完成：成功 ${result.succeeded}，失败 ${result.failed}，跳过 ${result.skipped}`,
+      )
+    } else {
+      ElMessage.success(`已查询 ${result.succeeded} 个账号的优惠资格`)
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '优惠资格查询失败')
+  }
+}
+
+function setSelected(id: string, selected: boolean) {
+  const next = new Set(selectedIds.value)
+  if (selected) next.add(id)
+  else next.delete(id)
+  selectedIds.value = [...next]
+}
+
+function handleSelect(selection: AccountRecord[], row: AccountRecord) {
+  setSelected(row.id, selection.some((item) => item.id === row.id))
+}
+
+function handleSelectAll(selection: AccountRecord[]) {
+  const selectedOnPage = new Set(selection.map((item) => item.id))
+  pageAccounts.value.forEach((row) => setSelected(row.id, selectedOnPage.has(row.id)))
+}
+
+async function syncPageSelection() {
+  await nextTick()
+  tableRef.value?.clearSelection()
+  const selected = new Set(selectedIds.value)
+  pageAccounts.value.forEach((row) => {
+    if (selected.has(row.id)) tableRef.value?.toggleRowSelection(row, true)
+  })
+}
+
+function clearSelection() {
+  selectedIds.value = []
+  tableRef.value?.clearSelection()
+}
+
+function clampCurrentPage() {
+  const lastPage = Math.max(1, Math.ceil(store.accountTotal / pageSize.value))
+  currentPage.value = Math.min(currentPage.value, lastPage)
+}
+
+function handlePageSizeChange(value: number) {
+  pageSize.value = value as ResourceQuery['pageSize']
+  currentPage.value = 1
+}
+
+async function loadPage() {
+  loading.value = true
+  try {
+    await store.refreshAccounts({
+      page: currentPage.value,
+      pageSize: pageSize.value,
+      q: search.value,
+      promotion: promotionFilter.value,
+      country: countryFilter.value,
+      alive: aliveFilter.value,
+      globalPromotion: globalPromotionFilter.value,
+      rebind: rebindFilter.value,
+      rebindCountry: rebindCountryFilter.value,
+    })
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '账号池读取失败')
+  } finally {
+    loading.value = false
+  }
+}
+
+async function submitAccountImport(rawText: string) {
+  return store.importAccounts(rawText)
+}
+
+async function afterAccountImport(_result: ImportResult) {
+  currentPage.value = 1
+  await loadPage()
+  await syncPageSelection()
+}
+
+function handleSearch() {
+  currentPage.value = 1
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => void loadPage(), 250)
+}
+
+function openExport(
+  scope: ExportScope,
+  account?: AccountRecord,
+  initialFormat: ExportFormat = 'credentials',
+  formatLocked = false,
+) {
+  exportScope.value = scope
+  exportInitialFormat.value = initialFormat
+  exportFormatLocked.value = formatLocked
+  if (scope === 'single' && account) {
+    exportIds.value = [account.id]
+    exportCount.value = 1
+  }
+  if (scope === 'selected') {
+    exportIds.value = [...selectedIds.value]
+    exportCount.value = selectedIds.value.length
+  }
+  if (scope === 'all') {
+    exportIds.value = []
+    exportCount.value = store.accountTotal
+  }
+  exportOpen.value = true
+}
+
+function openAccessTokenExport(scope: 'single' | 'selected', account?: AccountRecord) {
+  openExport(scope, account, 'access-tokens', true)
+}
+
+function changePromotionFilter(value: string | number | boolean | undefined) {
+  promotionFilter.value = String(value || '') as ResourceQuery['promotion']
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeCountryFilter(value: string | number | boolean | undefined) {
+  countryFilter.value = String(value || '').trim().toUpperCase()
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeRebindCountryFilter(value: string | number | boolean | undefined) {
+  rebindCountryFilter.value = String(value || '').trim().toUpperCase()
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeAliveFilter(value: string | number | boolean | undefined) {
+  aliveFilter.value = String(value || '') as ResourceQuery['alive']
+  currentPage.value = 1
+  void loadPage()
+}
+
+function changeGlobalPromotionFilter(value: string | number | boolean | undefined) {
+  globalPromotionFilter.value = String(value || '') as ResourceQuery['globalPromotion']
+  currentPage.value = 1
+  void loadPage()
+}
+
+function openAccessTokenGroups() {
+  accessTokenGroupsOpen.value = true
+}
+
+async function copyAccessTokens() {
+  if (copyingAt.value) return
+  copyingAt.value = true
+  try {
+    const payload = await dataGateway.exportAccounts('access-tokens', 'all', [])
+    const tokens = payload.content
+      .split(/\r?\n/)
+      .map((token) => token.trim())
+      .filter(Boolean)
+      .slice(0, copyAtLimit.value)
+    if (!tokens.length) {
+      ElMessage.warning('账号池中没有有效 AT')
+      return
+    }
+    await copyText(tokens.join('\n'))
+    ElMessage.success(`已复制前 ${tokens.length} 个有效 AT`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '批量复制 AT 失败')
+  } finally {
+    copyingAt.value = false
+  }
+}
+
+watch(copyAtLimit, (value) => {
+  copyAtLimit.value = Math.max(1, Math.min(10_000, Number(value) || 100))
+  try {
+    localStorage.setItem('autoregister.copyAtLimit', String(copyAtLimit.value))
+  } catch {
+    // Local storage is optional.
+  }
+})
+
+function openMailbox(account: AccountRecord) {
+  if (!account.emailAccessUrl) return
+  try {
+    const url = new URL(account.emailAccessUrl)
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported_protocol')
+    window.open(url.toString(), '_blank', 'noopener,noreferrer')
+  } catch {
+    ElMessage.error('接码 URL 格式无效')
+  }
+}
+
+async function deleteSelected() {
+  if (!selectedIds.value.length) return
+  const count = selectedIds.value.length
+  try {
+    await ElMessageBox.confirm(
+      `确认永久删除选中的 ${count} 个账号？此操作会写入 MongoDB。`,
+      '删除选中账号',
+      {
+        type: 'warning',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+
+  const deleted = await store.deleteAccounts([...selectedIds.value])
+  clearSelection()
+  clampCurrentPage()
+  if (store.accountQuery.page !== currentPage.value) await loadPage()
+  await syncPageSelection()
+  ElMessage.success(`已删除 ${deleted} 个账号`)
+}
+
+async function enqueueRebind() {
+  if (!selectedIds.value.length) return
+  try {
+    const response = await fetch('/api/account-rebind/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountIds: [...selectedIds.value] }),
+    })
+    const raw = await response.text()
+    let body: any = {}
+    try { body = raw ? JSON.parse(raw) : {} } catch { body = { detail: raw || `HTTP ${response.status}` } }
+    if (!response.ok) throw new Error(body.detail || '提交换绑队列失败')
+    ElMessage.success(`已将 ${body.items?.length || selectedIds.value.length} 个账号提交到换绑队列`)
+    selectedIds.value = []
+    tableRef.value?.clearSelection()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '提交换绑队列失败')
+  }
+}
+
+async function refreshSelectedAccessTokens() {
+  if (!selectedIds.value.length) return
+  refreshingSelectedAt.value = true
+  try {
+    const response = await fetch('/api/account-rebind/access-tokens/refresh-expired', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        accountIds: [...selectedIds.value],
+        proxyMode: 'auto',
+        emailSource: 'standard',
+      }),
+    })
+    const raw = await response.text()
+    let body: any = {}
+    try { body = raw ? JSON.parse(raw) : {} } catch { body = { detail: raw || `HTTP ${response.status}` } }
+    if (!response.ok) {
+      const message = typeof body.detail === 'string' ? body.detail : body.detail?.message
+      throw new Error(message || '重新获取 AT 失败')
+    }
+    if (!body.started) {
+      ElMessage.warning('选中账号没有可用的密码或邮箱接码资料')
+      return
+    }
+    ElMessage.success(`已为选中的 ${body.started} 个账号启动 AT 获取任务，可在换绑页面查看进度`)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '重新获取 AT 失败')
+  } finally {
+    refreshingSelectedAt.value = false
+  }
+}
+
+watch(pageAccounts, () => void syncPageSelection(), { flush: 'post', immediate: true })
+watch([currentPage, pageSize], () => void loadPage())
+watch(rebindFilter, () => { currentPage.value = 1; void loadPage() })
+onMounted(() => {
+  void loadPage()
+  rebindRefreshTimer = setInterval(() => void loadPage(), 3000)
+  globalPromotionTimer = setInterval(() => {
+    if (pageAccounts.value.some((account) =>
+      ['pending', 'running'].includes(account.globalPromotionStatus || '') || account.oaicsScanStatus === 'running',
+    )) {
+      void loadPage()
+    }
+  }, 5000)
+  aliveMarkerTimer = setInterval(() => {
+    const cutoff = Date.now() - 15 * 60 * 1000
+    if (pageAccounts.value.some((account) =>
+      account.accessTokenConfigured
+      && account.aliveStatus !== 'dead'
+      && !account.alive15mVerifiedAt
+      && new Date(account.createdAt).getTime() <= cutoff,
+    )) {
+      void loadPage()
+    }
+  }, 60000)
+  void dataGateway.listProxies({ page: 1, pageSize: 100, q: '' }).then((page) => {
+    promotionProxies.value = page.items.filter((proxy) => proxy.enabled)
+  }).catch(() => {
+    promotionProxies.value = []
+  })
+})
+onBeforeUnmount(() => {
+  if (searchTimer) clearTimeout(searchTimer)
+  if (globalPromotionTimer) clearInterval(globalPromotionTimer)
+  if (aliveMarkerTimer) clearInterval(aliveMarkerTimer)
+  if (rebindRefreshTimer) clearInterval(rebindRefreshTimer)
+})
+</script>
+
+<template>
+  <section>
+    <div class="page-heading">
+      <div>
+        <h2>已完成账号</h2>
+        <p>成功记录自动进入账号池；凭据只读并默认遮罩。</p>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <StatCard label="账号总数" :value="store.stats.accounts.total" note="MongoDB 全部成功记录" :icon="UserFilled" />
+      <StatCard label="今日新增" :value="store.stats.accounts.today" note="按 UTC 日期统计" :icon="Download" tone="green" />
+      <StatCard label="TOTP 完整" :value="store.stats.accounts.totpComplete" note="密钥字段完整" :icon="Key" tone="amber" />
+<StatCard label="可导出" :value="store.stats.accounts.total" note="多种格式均已就绪" :icon="Lock" tone="green" />
+    </div>
+
+    <div class="panel table-panel">
+      <div class="table-toolbar">
+        <div class="toolbar-group">
+          <el-button type="primary" :icon="UploadFilled" @click="importOpen = true">导入账号</el-button>
+          <el-input
+            v-model="search"
+            class="toolbar-search"
+            :prefix-icon="Search"
+            clearable
+            placeholder="搜索邮箱"
+            @input="handleSearch"
+          />
+          <span class="muted">已选择 {{ selectedIds.length }} 条</span>
+          <el-select v-model="rebindFilter" clearable placeholder="换绑状态" style="width:140px"><el-option label="未换绑" value="ready" /><el-option label="已换绑" value="rebound" /></el-select>
+          <el-select
+            :model-value="rebindCountryFilter"
+            clearable
+            filterable
+            allow-create
+            default-first-option
+            placeholder="筛选换绑 IP 国家"
+            style="width: 190px"
+            @change="changeRebindCountryFilter"
+          >
+            <el-option
+              v-for="country in COMMON_REGISTRATION_COUNTRIES"
+              :key="`rebind-${country.value}`"
+              :label="`${country.label} · ${country.value}`"
+              :value="country.value"
+            />
+            <el-option label="未记录" value="ZZ" />
+          </el-select>
+        </div>
+        <div class="toolbar-group">
+          <el-select
+            v-model="promotionProxyId"
+            clearable
+            filterable
+            placeholder="资格检测代理（自动匹配）"
+            style="width: 260px"
+          >
+            <el-option label="本机代理 · 127.0.0.1:7890" value="local7890" />
+            <el-option
+              v-for="proxy in promotionProxies"
+              :key="proxy.id"
+              :label="`${proxy.country} · ${proxy.host}:${proxy.port} · ${proxy.group}`"
+              :value="proxy.id"
+            />
+          </el-select>
+          <el-button
+            type="success"
+            plain
+            :icon="Search"
+            :disabled="selectedIds.length === 0"
+            @click="checkGlobalPromotions([...selectedIds])"
+          >
+            全局试用检测
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :icon="MagicStick"
+            :loading="promotionChecking"
+            :disabled="selectedIds.length === 0 || promotionChecking"
+            @click="checkPromotions([...selectedIds])"
+          >
+            查询选中优惠
+          </el-button>
+          <el-button
+            type="success"
+            plain
+            :icon="CircleCheck"
+            :loading="aliveChecking"
+            :disabled="selectedIds.length === 0 || aliveChecking"
+            @click="checkAlive([...selectedIds])"
+          >
+            验活选中账号
+          </el-button>
+          <el-button
+            type="primary"
+            plain
+            :icon="CreditCard"
+            :loading="checkoutTypeChecking"
+            :disabled="selectedIds.length === 0 || checkoutTypeChecking"
+            @click="checkCheckoutTypes([...selectedIds])"
+          >
+            检测选中账单类型
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :icon="Search"
+            :loading="oaicsStartingIds.length > 0"
+            :disabled="selectedIds.length === 0 || oaicsStartingIds.length > 0"
+            @click="checkOaicsAllProxies([...selectedIds])"
+          >
+            OAICS 全代理检测
+          </el-button>
+          <el-button
+            type="danger"
+            plain
+            :icon="Delete"
+            :disabled="selectedIds.length === 0"
+            @click="deleteSelected"
+          >
+            删除选中
+          </el-button>
+          <el-button
+            type="warning"
+            plain
+            :disabled="selectedIds.length === 0"
+            @click="enqueueRebind"
+          >
+            提交换绑队列
+          </el-button>
+          <el-button :disabled="selectedIds.length === 0" @click="openExport('selected')">
+            导出选中
+          </el-button>
+          <el-button
+            type="success"
+            plain
+            :icon="Key"
+            :loading="refreshingSelectedAt"
+            :disabled="selectedIds.length === 0 || refreshingSelectedAt"
+            @click="refreshSelectedAccessTokens"
+          >
+            重新获取选中账号 AT
+          </el-button>
+          <el-button
+            type="success"
+            plain
+            :icon="Key"
+            :disabled="selectedIds.length === 0"
+            @click="openAccessTokenExport('selected')"
+          >
+            提取选中 AT
+          </el-button>
+          <el-button
+            type="success"
+            plain
+            :icon="CopyDocument"
+            :disabled="store.accountTotal === 0"
+            @click="openAccessTokenGroups"
+          >
+            AT 分组复制（每组 10 个）
+          </el-button>
+          <el-button
+            type="success"
+            :icon="CopyDocument"
+            :loading="copyingAt"
+            :disabled="store.accountTotal === 0"
+            @click="copyAccessTokens"
+          >
+            一键复制前 {{ copyAtLimit }} 个 AT
+          </el-button>
+          <el-input-number
+            v-model="copyAtLimit"
+            :min="1"
+            :max="10000"
+            :step="10"
+            controls-position="right"
+            aria-label="一键复制 AT 数量"
+            style="width: 128px"
+          />
+          <el-select
+            :model-value="promotionFilter"
+            clearable
+            placeholder="筛选 Plus 标签"
+            style="width: 180px"
+            @change="changePromotionFilter"
+          >
+            <el-option label="未试用 Plus" value="untried_plus" />
+            <el-option label="不可试用" value="ineligible" />
+            <el-option label="未查询" value="unchecked" />
+          </el-select>
+          <el-select
+            :model-value="countryFilter"
+            clearable
+            filterable
+            allow-create
+            default-first-option
+            placeholder="筛选注册国家"
+            style="width: 180px"
+            @change="changeCountryFilter"
+          >
+            <el-option
+              v-for="country in COMMON_REGISTRATION_COUNTRIES"
+              :key="country.value"
+              :label="`${country.label} · ${country.value}`"
+              :value="country.value"
+            />
+            <el-option label="历史账号 / 未识别" value="ZZ" />
+          </el-select>
+          <el-select
+            :model-value="aliveFilter"
+            clearable
+            placeholder="筛选验活状态"
+            style="width: 160px"
+            @change="changeAliveFilter"
+          >
+            <el-option label="正常" value="alive" />
+            <el-option label="已失效" value="dead" />
+            <el-option label="检测异常" value="unknown" />
+            <el-option label="未检测" value="unchecked" />
+          </el-select>
+          <el-select
+            :model-value="globalPromotionFilter"
+            clearable
+            placeholder="筛选全局优惠"
+            style="width: 170px"
+            @change="changeGlobalPromotionFilter"
+          >
+            <el-option label="全局可试用" value="eligible" />
+            <el-option label="非全局试用" value="ineligible" />
+            <el-option label="待检测" value="pending" />
+            <el-option label="检测异常" value="failed" />
+          </el-select>
+          <el-button type="primary" plain :disabled="store.accountTotal === 0" @click="openExport('all')">导出全部</el-button>
+        </div>
+      </div>
+
+      <el-table
+        ref="tableRef"
+        v-loading="loading"
+        :data="pageAccounts"
+        row-key="id"
+        empty-text="账号池暂无数据"
+        @select="handleSelect"
+        @select-all="handleSelectAll"
+      >
+        <el-table-column type="selection" width="48" />
+        <el-table-column label="邮箱" min-width="220">
+          <template #default="{ row }">
+            <div class="account-email">
+              <span class="email-avatar">{{ row.email.slice(0, 1).toUpperCase() }}</span>
+              <div>
+                <div class="account-email-line">
+                  <strong>{{ row.email }}</strong>
+                </div>
+                <small>ID {{ row.id }}</small>
+              </div>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="注册国家" width="150">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.registrationCountry ? 'success' : 'info'">
+              {{ row.registrationCountry ? countryLabel(row.registrationCountry) : '历史账号 / 未识别' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="账号类型" width="96">
+          <template #default="{ row }">
+            <el-tag :type="row.accountType === 'plus' ? 'warning' : 'info'" effect="dark" round>
+              {{ row.accountType === 'plus' ? 'Plus' : 'Free' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="换绑状态" width="165">
+          <template #default="{ row }"><el-tag :type="rebindStatusTag(row)" effect="plain">{{ rebindStatusLabel(row) }}</el-tag></template>
+        </el-table-column>
+        <el-table-column label="换绑 IP 国家" width="165">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.rebindProxyCountry ? 'success' : 'info'">
+              {{ row.rebindProxyCountry ? countryLabel(row.rebindProxyCountry) : '未记录' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="验活状态" width="190">
+          <template #default="{ row }">
+            <div class="alive-status-tags">
+              <el-tooltip :content="aliveTooltip(row)">
+                <el-tag :type="aliveTagType(row)" effect="plain" round>
+                  {{ aliveLabel(row) }}
+                </el-tag>
+              </el-tooltip>
+              <el-tag v-if="row.alive15mVerifiedAt" type="success" effect="dark" round>
+                已活15分钟
+              </el-tag>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="结账类型" width="145">
+          <template #default="{ row }">
+            <el-tooltip :content="checkoutTypeTooltip(row)">
+              <el-tag
+                :type="row.checkoutType === 'oaics' ? 'success' : row.checkoutType === 'cs' ? 'warning' : row.checkoutTypeErrorCode ? 'danger' : 'info'"
+                effect="plain"
+                round
+              >
+                {{ checkoutTypeLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="OAICS 全代理" width="155">
+          <template #default="{ row }">
+            <el-tooltip :content="oaicsScanTooltip(row)" placement="top" :show-after="200">
+              <el-tag
+                :type="row.oaicsScanStatus === 'completed' && row.oaicsScanSuccess > 0 ? 'success' : row.oaicsScanStatus === 'failed' ? 'danger' : row.oaicsScanStatus === 'running' ? 'warning' : 'info'"
+                effect="plain"
+                round
+                style="white-space: pre-line"
+              >
+                {{ oaicsScanLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="手机号状态" width="128">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.accountType === 'plus'"
+              :type="row.phoneBound ? 'success' : 'warning'"
+              effect="plain"
+              round
+            >
+              {{ row.phoneBound ? '已接码' : '未接码' }}
+            </el-tag>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="优惠资格" width="145">
+          <template #default="{ row }">
+            <el-tooltip :content="promotionTooltip(row)">
+              <el-tag :type="promotionTagType(row)" effect="plain" round>
+                {{ promotionLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="全局优惠" width="145">
+          <template #default="{ row }">
+            <el-tooltip :content="globalPromotionTooltip(row)">
+              <el-tag :type="globalPromotionTagType(row)" effect="plain" round>
+                {{ globalPromotionLabel(row) }}
+              </el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="CHATGPT 密码" min-width="210">
+          <template #default="{ row }"><SecretCell :value="row.chatgptPassword" /></template>
+        </el-table-column>
+        <el-table-column label="TOTP 密钥" min-width="205">
+          <template #default="{ row }"><SecretCell :value="row.totpSecret" /></template>
+        </el-table-column>
+        <el-table-column label="AT 状态" width="158">
+          <template #default="{ row }">
+            <div class="at-status">
+              <el-tag
+                :type="accessTokenStatus(row) === 'valid' ? 'success' : accessTokenStatus(row) === 'expired' || accessTokenStatus(row) === 'pending' ? 'warning' : 'info'"
+                effect="plain"
+                round
+              >
+                {{ accessTokenStatus(row) === 'valid' ? '已提取' : accessTokenStatus(row) === 'expired' ? '已过期' : accessTokenStatus(row) === 'pending' ? '等待新 AT' : '未提取' }}
+              </el-tag>
+              <small v-if="row.accessTokenExpiresAt">{{ formatDate(row.accessTokenExpiresAt) }}</small>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="创建时间" width="145">
+          <template #default="{ row }"><span class="muted">{{ formatDate(row.createdAt) }}</span></template>
+        </el-table-column>
+        <el-table-column label="操作" width="292" fixed="right">
+          <template #default="{ row }">
+            <el-tooltip content="检测账号是否仍然有效">
+              <span>
+                <el-button
+                  text
+                  type="success"
+                  :icon="CircleCheck"
+                  aria-label="账号验活"
+                  :loading="aliveCheckingAccountIds.includes(row.id)"
+                  :disabled="!row.accessTokenConfigured || aliveChecking"
+                  @click="checkAlive([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="查询 Plus 试用资格">
+              <span>
+                <el-button
+                  text
+                  type="warning"
+                  :icon="MagicStick"
+                  aria-label="查询优惠资格"
+                  :loading="checkingAccountIds.includes(row.id)"
+                  :disabled="!hasValidAccessToken(row) || promotionChecking"
+                  @click="checkPromotions([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="单独检测账单类型">
+              <span>
+                <el-button
+                  text
+                  type="primary"
+                  :icon="CreditCard"
+                  aria-label="检测账单类型"
+                  :loading="checkoutTypeCheckingAccountIds.includes(row.id)"
+                  :disabled="!hasValidAccessToken(row) || checkoutTypeChecking"
+                  @click="checkCheckoutTypes([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="使用代理池全部可用代理检测 OAICS，并按国家统计成功率">
+              <span>
+                <el-button
+                  text
+                  type="warning"
+                  :icon="Search"
+                  aria-label="OAICS 全代理检测"
+                  :loading="oaicsStartingIds.includes(row.id) || row.oaicsScanStatus === 'running'"
+                  :disabled="!hasValidAccessToken(row) || row.oaicsScanStatus === 'running'"
+                  @click="checkOaicsAllProxies([row.id])"
+                />
+              </span>
+            </el-tooltip>
+            <el-tooltip content="打开接码 URL">
+              <span>
+                <el-button
+                  text
+                  type="primary"
+                  :icon="Link"
+                  :disabled="!row.emailAccessUrl"
+                  aria-label="打开接码 URL"
+                  @click="openMailbox(row)"
+                />
+              </span>
+            </el-tooltip>
+            <el-button text type="primary" @click="openExport('single', row)">导出</el-button>
+            <el-tooltip :content="hasValidAccessToken(row) ? '复制或下载已保存的 AT' : '该账号没有有效 AT'">
+              <span>
+                <el-button
+                  text
+                  type="success"
+                  :disabled="!hasValidAccessToken(row)"
+                  @click="openAccessTokenExport('single', row)"
+                >提取AT</el-button>
+              </span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div class="table-footer">
+        <span>共 {{ store.accountTotal }} 条 · 已选 {{ selectedIds.length }} 条 · 数据已持久化到 MongoDB</span>
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          background
+          layout="total, sizes, prev, pager, next"
+          :page-sizes="pageSizeOptions"
+          :total="store.accountTotal"
+          @size-change="handlePageSizeChange"
+        />
+      </div>
+    </div>
+
+    <ExportDialog
+      v-model="exportOpen"
+      :scope="exportScope"
+      :ids="exportIds"
+      :count="exportCount"
+      :initial-format="exportInitialFormat"
+      :format-locked="exportFormatLocked"
+    />
+    <AccessTokenGroupsDialog v-model="accessTokenGroupsOpen" />
+    <ImportDialog
+      v-model="importOpen"
+      kind="account"
+      :existing-keys="existingAccountKeys"
+      :submit-handler="submitAccountImport"
+      @imported="afterAccountImport"
+    />
+  </section>
+</template>
+
+<style scoped>
+.alive-status-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.account-email {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-email-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.account-email-line :deep(.el-tag) {
+  flex: 0 0 auto;
+  font-size: 9px;
+}
+
+.at-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.at-status small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.email-avatar {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  flex: 0 0 31px;
+  place-items: center;
+  border: 1px solid rgb(50 197 255 / 24%);
+  border-radius: 9px;
+  color: #aeeaff;
+  background: rgb(50 197 255 / 8%);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.account-email strong,
+.account-email small {
+  display: block;
+  overflow: hidden;
+  max-width: 190px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-email strong {
+  color: #e3ebf5;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.account-email small {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+</style>

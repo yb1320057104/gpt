@@ -1,0 +1,919 @@
+export interface AccountRecord {
+  id: string
+  email: string
+  chatgptPassword: string
+  totpSecret: string
+  emailAccessUrl: string
+  createdAt: string
+  accountType: AccountType
+  phoneBound: boolean | null
+  promotionEligible: boolean | null
+  accessTokenConfigured: boolean
+  accessTokenExpiresAt: string | null
+  accessTokenUpdatedAt: string | null
+  planCheckStatus?: 'running' | 'success' | 'failed' | null
+  planCheckedAt?: string | null
+  planCheckErrorCode?: string | null
+  planCheckHttpStatus?: number | null
+  planAccountId?: string | null
+  subscriptionPlan?: string | null
+  hasActiveSubscription?: boolean | null
+  planExpiresAt?: string | null
+  planRenewsAt?: string | null
+  promotionCampaignId?: string | null
+  promotionKind?: 'trial' | 'discount' | string | null
+  checkoutType?: 'oaics' | 'cs' | null
+  checkoutTypeDetail?: 'oaics' | 'stripe_cs_live' | 'stripe_cs_test' | 'stripe_checkout' | 'stripe_cs' | string | null
+  checkoutTypeCheckedAt?: string | null
+  checkoutTypeErrorCode?: string | null
+  checkoutTypeHttpStatus?: number | null
+  checkoutTypeCheckStatus?: 'running' | 'success' | 'failed' | null
+  registrationCountry?: string | null
+  rebindStatus?: string | null
+  previousEmail?: string | null
+  reboundEmail?: string | null
+  rebindProxy?: string | null
+  rebindProxyCountry?: string | null
+  aliveStatus?: 'running' | 'alive' | 'dead' | 'unknown' | null
+  aliveCheckedAt?: string | null
+  aliveErrorCode?: string | null
+  aliveHttpStatus?: number | null
+  alive15mVerifiedAt?: string | null
+  globalPromotionStatus?: 'pending' | 'running' | 'eligible' | 'ineligible' | 'failed' | null
+  globalPromotionEligible?: boolean | null
+  globalPromotionCheckedAt?: string | null
+  globalPromotionProxyCount?: number
+  globalPromotionCountries?: string[]
+  globalPromotionResults?: Array<{
+    proxyId: string
+    country: string
+    eligible: boolean | null
+    campaignId?: string | null
+    httpStatus?: number | null
+    latencyMs?: number | null
+    error?: string
+  }>
+  globalPromotionMessage?: string | null
+  oaicsScanStatus?: 'pending' | 'running' | 'completed' | 'failed' | null
+  oaicsScanCheckedAt?: string | null
+  oaicsScanTotal?: number
+  oaicsScanSuccess?: number
+  oaicsScanCountryStats?: Array<{
+    country: string
+    total: number
+    oaics: number
+    cs: number
+    failed: number
+    successRate: number
+  }>
+  oaicsScanResults?: Array<Record<string, unknown>>
+  oaicsScanMessage?: string | null
+}
+
+export interface AccountPlanCheckItem {
+  id: string
+  status: 'success' | 'failed' | 'skipped'
+  errorCode: string | null
+}
+
+export interface AccountPlanCheckResult {
+  requested: number
+  succeeded: number
+  failed: number
+  skipped: number
+  items: AccountPlanCheckItem[]
+}
+
+export type AccountCheckoutTypeCheckResult = AccountPlanCheckResult
+
+export interface AccountAliveCheckResult {
+  requested: number
+  alive: number
+  dead: number
+  failed: number
+  skipped: number
+  items: Array<{
+    id: string
+    status: 'alive' | 'dead' | 'failed' | 'skipped'
+    errorCode: string | null
+  }>
+}
+
+export type AccountType = 'plus' | 'free'
+
+export interface EmailRecord {
+  id: string
+  email: string
+  accessUrl: string
+  importedAt: string
+  sourceType?: 'manual' | 'mailcom_alias'
+  parentEmail?: string | null
+}
+
+export type EmailSource = 'all' | 'standard' | 'mailcom_alias'
+
+export type ProxyStatus = 'available' | 'unknown' | 'quarantined'
+export type ProxyScheme = 'http' | 'https' | 'socks5' | 'socks5h'
+
+export interface ProxyRecord {
+  id: string
+  host: string
+  port: number
+  username: string
+  password: string
+  enabled: boolean
+  status: ProxyStatus
+  latencyMs: number | null
+  lastCheckedAt: string | null
+  country: string
+  group: string
+  scheme: ProxyScheme
+}
+
+export interface ProxyCountrySummary {
+  country: string
+  total: number
+  enabled: number
+}
+
+export interface ProxyGroupSummary {
+  country: string
+  group: string
+  total: number
+  enabled: number
+  available: number
+  quarantined: number
+  schemes: ProxyScheme[]
+}
+
+export interface ProxyTestResult {
+  tested: number
+  available: number
+  failed: number
+  averageLatencyMs: number | null
+  countries: Array<{ country: string; count: number }>
+}
+
+export interface ParsedEmail {
+  email: string
+  accessUrl: string
+}
+
+export interface ParsedAccount {
+  email: string
+  chatgptPassword: string
+  totpSecret: string
+  emailAccessUrl: string
+}
+
+export interface ParsedProxy {
+  host: string
+  port: number
+  username: string
+  password: string
+  scheme: ProxyScheme
+}
+
+export interface ImportIssue {
+  line: number
+  reason: string
+  preview: string
+}
+
+export interface ImportPreview<T> {
+  total: number
+  accepted: T[]
+  duplicates: ImportIssue[]
+  errors: ImportIssue[]
+}
+
+export interface ImportResult {
+  total: number
+  imported: number
+  duplicateCount: number
+  errorCount: number
+}
+
+export type ProxySubscriptionProvider = 'easy-proxies' | 'resin'
+
+export interface ProxySubscriptionImportInput {
+  provider: ProxySubscriptionProvider
+  subscriptionUrl: string
+  managerUrl: string
+  adminToken: string
+  proxyToken: string
+  name: string
+  group?: string
+  probeTimeoutSeconds?: number
+}
+
+export interface ProxySubscriptionImportResult {
+  provider: ProxySubscriptionProvider
+  subscriptionName: string
+  nodeCount: number
+  generatedProxyCount: number
+  testedProxyCount: number
+  usableProxyCount: number
+  rejectedProxyCount: number
+  countries: Array<{ country: string; count: number; averageLatencyMs: number }>
+  importResult: ImportResult
+}
+
+export interface ExecutionSettings {
+  schemaVersion: 2
+  browserProvider: 'roxy' | 'ant'
+  browserExecutablePath: string
+  roxyApiKey: string
+  roxyApiPort: number
+  antBrowserExecutablePath: string
+  antApiKey: string
+  antApiPort: number
+  headless: boolean
+  requireRegistrationPassword: boolean
+  enableRegistrationTotp: boolean
+  proxyRetryCount: number
+  concurrency: number
+  taskTimeoutSeconds: number
+  updatedAt: string | null
+}
+
+export interface ExecutionSettingsInput {
+  browserProvider: 'roxy' | 'ant'
+  browserExecutablePath: string
+  roxyApiKey: string
+  roxyApiPort: number
+  antBrowserExecutablePath: string
+  antApiKey: string
+  antApiPort: number
+  headless: boolean
+  requireRegistrationPassword: boolean
+  enableRegistrationTotp: boolean
+  proxyRetryCount: number
+  concurrency: number
+  taskTimeoutSeconds: number
+}
+
+export type ExportFormat =
+  | 'credentials'
+  | 'password-mail-links'
+  | 'mail-links'
+  | 'mail-links-totp'
+  | 'access-tokens'
+export type ExportScope = 'single' | 'selected' | 'all'
+
+export interface AccountExport {
+  content: string
+  filename: string
+  count: number
+  format: ExportFormat
+  skippedMissingCount: number
+  skippedExpiredCount: number
+}
+
+export interface EmailExport {
+  content: string
+  filename: string
+  count: number
+}
+
+export interface PageResponse<T> {
+  items: T[]
+  total: number
+  page: number
+  pageSize: 10 | 20 | 50 | 100
+}
+
+export interface ResourceQuery {
+  page: number
+  pageSize: 10 | 20 | 50 | 100
+  q?: string
+  country?: string
+  promotion?: '' | 'untried_plus' | 'ineligible' | 'unchecked'
+  alive?: '' | 'alive' | 'dead' | 'unknown' | 'unchecked'
+  globalPromotion?: '' | 'eligible' | 'ineligible' | 'pending' | 'failed'
+  rebind?: '' | 'ready' | 'rebound'
+  rebindCountry?: string
+  source?: EmailSource
+}
+
+export interface OverviewStats {
+  accounts: {
+    total: number
+    today: number
+    totpComplete: number
+    plus: { total: number; bound: number; unbound: number }
+    free: { total: number; eligible: number; ineligible: number }
+  }
+  emails: { available: number; aliases: number }
+  proxies: { total: number; enabled: number; available: number; quarantined: number }
+}
+
+export interface MongoHealth {
+  status: 'online' | 'offline' | 'reconnecting'
+  database: string
+  error: string | null
+  nextRetrySeconds: number | null
+}
+
+export interface HealthResponse {
+  status: 'ok' | 'degraded'
+  mode: 'local'
+  mongodb: MongoHealth
+}
+
+export type RunStatus =
+  | 'idle'
+  | 'queued'
+  | 'running'
+  | 'waiting_for_database'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+export type RunKind = 'mock' | 'browser_probe'
+export type WorkerStatus =
+  | 'queued'
+  | 'running'
+  | 'success'
+  | 'partial_success'
+  | 'failed'
+  | 'cancelled'
+export type WorkerStage =
+  | 'queued'
+  | 'roxy_starting'
+  | 'proxy_check'
+  | 'login'
+  | 'email'
+  | 'verification'
+  | 'profile'
+  | 'access_token'
+  | 'cleanup'
+  | 'success'
+  | 'partial_success'
+  | 'failed'
+  | 'cancelled'
+export type RunLogLevel = 'info' | 'success' | 'warning' | 'error'
+export type RunLogDetailValue = string | number | boolean | null
+
+export interface RunLogEntry {
+  schemaVersion: 1
+  runId: string
+  timestamp: string
+  level: RunLogLevel
+  event: string
+  message: string
+  email?: string | null
+  sequence?: number | null
+  details?: Record<string, RunLogDetailValue>
+}
+
+export interface RunLogSummary {
+  runId: string
+  filename: string
+  startedAt: string
+  updatedAt: string
+  entryCount: number
+  lastEvent: string
+}
+
+export interface RunLogFile extends RunLogSummary {
+  entries: RunLogEntry[]
+}
+
+export interface RunExecutionState {
+  status: RunStatus
+  runId: string | null
+  kind: RunKind
+  requested: number
+  pending: number
+  processed: number
+  succeeded: number
+  failed: number
+  workerCount: number
+  activeWorkers: number
+  startedAt: string | null
+  updatedAt: string | null
+  finishedAt: string | null
+  logPersisted: boolean
+  cancelRequested: boolean
+  terminalReasonCode?: string | null
+  registrationCountry?: string | null
+  registrationProxyGroup?: string | null
+  emailSource?: EmailSource
+}
+
+export interface ExtractedAccessToken {
+  token: string
+  preview: string
+  email: string | null
+  accountId: string | null
+  planType: string | null
+  expiresAt: string | null
+  expired: boolean | null
+}
+
+export interface AccessTokenExtractResult {
+  count: number
+  items: ExtractedAccessToken[]
+}
+
+export type PaymentExtractorTaskStatus =
+  | 'queued'
+  | 'running'
+  | 'cancel_requested'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+
+export interface PaymentExtractorOption {
+  value: string
+  label: string
+  currency?: string | null
+  country?: string | null
+  resultKind?: string | null
+  enabled?: boolean
+}
+
+export interface PaymentExtractorDefaults {
+  country: string
+  forceCountry?: string | null
+  paymentMethod: string
+  checkoutProxy: string
+  updateProxy: string
+  applyCheckoutUpdate: boolean
+  concurrency: number
+  maxConcurrency: number
+  countries: PaymentExtractorOption[]
+  paymentMethods: PaymentExtractorOption[]
+}
+
+export interface PaymentExtractorConcurrency {
+  concurrency: number
+  maxConcurrency: number
+}
+
+export interface PaymentExtractorTaskInput {
+  accessToken: string
+  accountId?: string
+  checkoutProxy: string
+  updateProxy: string
+  stripeHcaptchaToken: string
+  country: string
+  paymentMethod: string
+  applyCheckoutUpdate: boolean
+  autoRetryCount?: number
+  rotateCheckoutProxy?: boolean
+  rotateUpdateProxy?: boolean
+  idealBank?: string
+  promoCampaignId?: string
+  checkoutUiMode?: 'auto' | 'hosted' | 'custom'
+  requireZero?: boolean
+  gopayBrowserFallback?: boolean
+}
+
+export interface PaymentExtractorAccountSource {
+  id: string
+  email: string
+  registrationCountry?: string | null
+  accessTokenExpiresAt: string
+  accountType?: AccountType | null
+}
+
+export interface PaymentExtractorProxyPoolResult {
+  proxies: string[]
+  count: number
+}
+
+export interface PaymentExtractorRetryInput {
+  checkoutProxy?: string
+  updateProxy?: string
+}
+
+export interface PaymentExtractorBilling {
+  name?: string
+  email?: string
+  phone?: string
+  country?: string
+  line1?: string
+  city?: string
+  state?: string
+  postalCode?: string
+}
+
+export interface PaymentExtractorResult {
+  checkoutSessionId?: string
+  sessionKind?: string
+  paymentMethod?: string
+  billingCountry?: string
+  currency?: string
+  amountDue?: number
+  amountDueMinor?: number
+  billing?: PaymentExtractorBilling
+  accountEmail?: string
+  paymentMethodId?: string
+  stripeRedirectUrl?: string
+  providerUrl?: string
+  paypalUrl?: string
+  gopayUrl?: string
+  gcashUrl?: string
+  idealUrl?: string
+  upiUrl?: string
+  pixUrl?: string
+  blikUrl?: string
+  twintUrl?: string
+  kakaoPayUrl?: string
+  momoUrl?: string
+  [key: string]: unknown
+}
+
+export interface PaymentExtractorTask {
+  taskId: string
+  status: PaymentExtractorTaskStatus
+  stage: string
+  progress: number
+  createdAt: string
+  startedAt?: string | null
+  finishedAt?: string | null
+  accountEmail?: string | null
+  paymentMethod: string
+  billingCountry: string
+  sessionKind?: string | null
+  retryOf?: string | null
+  attempt?: number
+  maxAttempts?: number
+  result?: PaymentExtractorResult | null
+  error?: string | null
+  networkError?: boolean
+  message?: string | null
+  logs?: PaymentExtractorTaskLog[]
+}
+
+export interface PaymentExtractorTaskLog {
+  timestamp: string
+  step: string
+  label: string
+  status: 'success' | 'warning' | 'error' | string
+  attempt: number
+  details: Record<string, unknown>
+}
+
+export interface PaymentExtractorTaskList {
+  tasks: PaymentExtractorTask[]
+}
+
+export interface PaymentExtractorProxyTestResult {
+  ok: boolean
+  ip?: string
+  country?: string
+  countryCode?: string
+  region?: string
+  regionCode?: string
+  city?: string
+}
+
+export interface PaymentExtractorProxySourceResult {
+  ok: boolean
+  proxies: string[]
+  count: number
+  uniqueCount: number
+}
+
+export interface PaymentExtractorDeleteResult {
+  ok: boolean
+  taskId?: string
+  status?: string
+}
+
+export interface PaymentExtractorBulkDeleteResult {
+  ok: boolean
+  deletedCount: number
+  taskIds: string[]
+}
+
+export interface PaymentExtractorBulkCancelResult {
+  ok: boolean
+  cancelledCount: number
+  taskIds: string[]
+}
+
+export type PaypalAgreementServiceStatus = 'online' | 'starting' | 'stopped' | 'failed' | 'conflict'
+
+export interface PaypalAgreementServiceState {
+  ok: boolean
+  status: PaypalAgreementServiceStatus
+  service: string
+  sourceCommit: string
+  host: string
+  port: number
+  uiPath: string
+  uiUrl: string
+  managed: boolean
+  pid?: number | null
+  error?: string
+}
+
+export type PipelineStage =
+  | 'eligible'
+  | 'extracting'
+  | 'extraction_failed'
+  | 'payment_ready'
+  | 'paying'
+  | 'payment_waiting_otp'
+  | 'payment_waiting_manual'
+  | 'payment_failed'
+  | 'paid'
+
+export interface PipelineError {
+  code: string
+  message: string
+}
+
+export type PipelineLogLevel = 'info' | 'success' | 'warning' | 'error'
+
+export interface PipelineLogEntry {
+  id: string
+  timestamp: string
+  level: PipelineLogLevel
+  event: string
+  message: string
+  code?: string | null
+  details: Record<string, string | number | boolean | null>
+}
+
+export interface PipelineLogResponse {
+  itemId: string
+  email: string
+  stage: PipelineStage
+  logs: PipelineLogEntry[]
+}
+
+export interface PipelineItem {
+  id: string
+  accountId: string
+  email: string
+  chatgptPassword: string
+  totpSecret: string
+  emailAccessUrl: string
+  accountCreatedAt: string | null
+  accountType: AccountType
+  promotionEligible: boolean
+  promotionCampaignId?: string | null
+  promotionKind?: 'trial' | 'discount' | string | null
+  planCheckedAt?: string | null
+  accessTokenConfigured: boolean
+  accessTokenExpiresAt: string | null
+  stage: PipelineStage
+  extractionStatus: string
+  extractionRetryCount: number
+  extractorTaskId?: string | null
+  extractionError?: PipelineError | null
+  billingCountry?: string | null
+  extractedAt?: string | null
+  checkoutType?: 'oaics' | 'cs' | null
+  checkoutTypeCheckedAt?: string | null
+  paymentLink?: string | null
+  paymentLinkConfigured: boolean
+  paymentLinkExpiresAt?: string | null
+  paymentLinkExpired?: boolean
+  paymentLinkRemainingSeconds?: number
+  paymentStatus: string
+  paymentRetryCount: number
+  paymentJobId?: string | null
+  paymentError?: PipelineError | null
+  paymentPhonePreview?: string | null
+  heroSmsManaged: boolean
+  heroSmsStatus?: string | null
+  heroSmsAttempt: number
+  heroSmsPrice?: number | null
+  heroSmsWaitDeadline?: string | null
+  heroSmsError?: PipelineError | null
+  paidAt?: string | null
+  paymentSummary?: {
+    status?: string | null
+    settlementStatus?: string | null
+    billingCountry?: string | null
+  } | null
+  exportCount: number
+  firstExportedAt?: string | null
+  lastExportedAt?: string | null
+  mailConfirmationStatus: 'unchecked' | 'waiting' | 'confirmed' | 'not_found' | 'review' | 'failed'
+  mailConfirmationSubject?: string | null
+  mailConfirmationReceivedAt?: string | null
+  mailConfirmationCheckedAt?: string | null
+  mailConfirmationError?: string | null
+  mailConfirmationOrderId?: string | null
+  mailConfirmationAttempt?: number
+  mailConfirmationStartedAt?: string | null
+  mailConfirmationDeadline?: string | null
+  mailConfirmationNextCheckAt?: string | null
+  smsReceiverState?: 'idle' | 'waiting' | 'queued' | 'running' | 'retry_wait' | 'paused' | 'completed' | 'ready' | 'failed' | 'stopped'
+  smsReceiverCredentialReady?: boolean
+  smsReceiverPhoneVerified?: boolean
+  smsReceiverPhoneNumber?: string | null
+  smsReceiverPhoneVerifiedAt?: string | null
+  smsReceiverTaskId?: string | null
+  smsReceiverSubmittedAt?: string | null
+  smsReceiverUpdatedAt?: string | null
+  smsReceiverRetryCount?: number
+  smsReceiverError?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface PipelineList {
+  items: PipelineItem[]
+  total: number
+  page: number
+  pageSize: number
+  counts: Record<string, number>
+}
+
+export interface PipelinePaidStats {
+  total: number
+  today: number
+  last7Days: number
+  terminalTotal: number
+  failed: number
+  successRate: number
+  averageHeroSmsPrice: number | null
+  exported: number
+  unexported: number
+  mailConfirmed: number
+  smsVerified?: number
+  smsUnverified?: number
+  daily: Array<{ date: string; count: number }>
+}
+
+export type PipelinePaidExportFormat = 'original' | 'password_totp' | 'sub2api' | 'sub2api_split' | 'codex_json'
+
+export interface PipelinePaidExport {
+  content: string
+  filename: string
+  count: number
+  skippedMissingUrlCount: number
+  format: PipelinePaidExportFormat
+  mimeType: string
+  encoding: 'utf-8' | 'base64'
+  contentBase64?: string | null
+  skippedMissingSecurityCount?: number
+  skippedMissingCredentialCount?: number
+  skippedReceiverAccountCount?: number
+}
+
+export interface PipelinePaidExportBatch {
+  formats: PipelinePaidExportFormat[]
+  exports: PipelinePaidExport[]
+  errors: Array<{
+    format: PipelinePaidExportFormat
+    code: string
+    message: string
+    statusCode?: number
+  }>
+  artifactCount: number
+  failedFormatCount: number
+  archive?: {
+    content: string
+    contentBase64?: string | null
+    encoding: 'base64'
+    mimeType: 'application/zip'
+    filename: string
+    count: number
+  } | null
+}
+
+export type PipelinePaidExportResponse = PipelinePaidExport | PipelinePaidExportBatch
+
+export interface PipelinePaidMailCheck {
+  requested: number
+  checked: number
+  confirmed: number
+  waiting?: number
+  review?: number
+  notFound: number
+  failed: number
+  items: Array<{ id: string; status: string }>
+}
+
+export interface SmsReceiverSettings {
+  enabled: boolean
+  autoSubmit: boolean
+  baseUrl: string
+  mailboxPublicBaseUrl: string
+  concurrency: number
+  failureRetries: number
+  retryBackoffSeconds: number
+  updatedAt: string | null
+}
+
+export interface SmsReceiverHeroSmsCountry {
+  id: number | string
+  name: string
+  flag?: string
+  popular?: boolean
+}
+
+export interface SmsReceiverHeroSmsCatalog {
+  countries: SmsReceiverHeroSmsCountry[]
+}
+
+export interface SmsReceiverHeroSmsSettings {
+  apiKey: string
+  countryIds: number[]
+  minPrice: number | null
+  maxPrice: number
+  preferredPrice: number | null
+  acquirePriority: 'country' | 'price' | 'price_high'
+  maxRetries: number
+  codeWaitSeconds: number
+  emailOtpWaitSeconds: number
+  emailOtpPollIntervalSeconds: number
+  emailOtpAttempts: number
+  reuseEnabled: boolean
+  credentialConfigured: boolean
+}
+
+export interface SmsReceiverBatchResult {
+  requested: number
+  processed: number
+  submitted?: number
+  queued?: number
+  skipped?: number
+  ready?: number
+  failed: number
+  items: Array<{ id: string; ok: boolean; state: string; error?: string }>
+}
+
+export interface PipelineSettings {
+  enabled: boolean
+  extractionConcurrency: number
+  paymentConcurrency: number
+  extractionFailureRetries: number
+  paymentFailureRetries: number
+  country: string
+  checkoutProxy: string
+  updateProxy: string
+  protocolProxy: string
+  checkoutProxyCountry: string
+  updateProxyCountry: string
+  protocolProxyCountry: string
+  checkoutProxyGroup: string
+  updateProxyGroup: string
+  protocolProxyGroup: string
+  applyCheckoutUpdate: boolean
+  heroSmsEnabled: boolean
+  autoPaymentEnabled: boolean
+  heroSmsMaxPrice: number
+  heroSmsChangeNumberRetries: number
+  heroSmsNumberWaitSeconds: number
+  heroSmsCountryId: number
+  agreementAutoSmsEnabled: boolean
+  heroSmsApiKeyConfigured: boolean
+  updatedAt?: string | null
+}
+
+export interface HeroSmsCountry {
+  id: number
+  name: string
+}
+
+export interface HeroSmsSettings {
+  apiKey?: string
+  enabled: boolean
+  countryId: number
+  maxPrice: number
+  changeNumberRetries: number
+  numberWaitSeconds: number
+  agreementAutoSmsEnabled: boolean
+  pipelineAutoPaymentEnabled: boolean
+  apiKeyConfigured: boolean
+  updatedAt?: string | null
+}
+
+export interface HeroSmsTestResult {
+  ok: boolean
+  configured: boolean
+  countryId: number
+  service: 'PayPal'
+  balance: number
+}
+
+export interface RunWorkerSnapshot {
+  workerId: string
+  sequence: number
+  status: WorkerStatus
+  stage: WorkerStage
+  stageElapsedMs: number
+  email: string
+  egressIp: string | null
+  errorCode: string | null
+  errorStage?: string | null
+  errorOperation?: string | null
+  errorKind?: string | null
+  errorHttpStatus?: number | null
+  errorApiCode?: number | null
+  errorRetryCount?: number | null
+  errorElapsedMs?: number | null
+  startedAt: string | null
+  updatedAt: string
+  finishedAt: string | null
+}
